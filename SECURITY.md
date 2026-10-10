@@ -171,15 +171,30 @@ receipt only at mode 0600 with exactly that one entry: allow, the read
 right alone, for the user's uid, not inherited and with no flags. Another
 account's or a group's entry, a deny entry, a second entry, or any other
 right or flag refuses. The app reads the list through acl(3) and sees
-every entry. The scripts and the root command read it through `ls -le`,
-which never prints the synchronize right, prints folder-only rights and
-the inherit flags only for folders, and skips an entry it cannot read; a
-receipt with one of those added can pass their check. They then ask
-`id -u` whether the entry's name is the user's uid. The two checks are not
-equivalent: such a receipt passes the scripts and the root command, and the
-app refuses it. The app also refuses the receipt when an acl(3) call on
-the list fails or gives an answer acl(3) does not document, rather than
-take it for the end of the list or for a flag that is clear.
+every entry. backstop.sh and uninstall.sh do not parse a list: they ask
+the installed app binary (`Insomnia --access-lists`), which reads the
+receipt's list and each folder's through acl(3) the same way and prints
+one word per path. They take only an answer that ended within its time
+limit, is no longer than its size limit, holds no NUL byte and has one
+expected word per path, with both exit statuses. install.sh and the root
+command still read lists through `ls -le` and `ls -lde`, which never
+print the synchronize right, print folder-only rights and the inherit
+flags only for folders, and skip an entry they cannot read; a receipt
+with one of those added can pass their check. They then ask `id -u`
+whether the entry's name is the user's uid. The two checks are not
+equivalent: such a receipt passes install.sh and the root command, and
+the app and the other scripts refuse it.
+
+A check that could not be made is not a refusal. When an acl(3) call
+fails or gives an answer acl(3) does not document, when lstat(2) fails
+other than for a missing path, or when the scripts get no answer they can
+take from the app binary, nothing shows whether the receipt can be
+trusted. The app and backstop.sh then decide nothing from it at any time:
+no pmset runs, and the start stays recorded with its claim and its sleep
+entry, as while the receipt is locked. uninstall.sh stops with nothing
+removed. When no app of this version is installed, so there is nothing
+to ask, it removes only its own folder's files and keeps the rule, the
+receipts folder and everything in it, running nothing as root.
 
 Beside it, install.sh makes `<uid>.released` through `sudo -n install`:
 the user's own file, mode 0600, 42 bytes, holding a nonce and `free` or
@@ -306,8 +321,8 @@ at once. A receipt that is missing, replaced, unreadable, of another size
 or shape or under a folder someone other than root could change is undone
 like an end once `expires` has passed. Before then it decides nothing
 (below), and neither does the predecessor after a dialog that may still
-be answered, nor, at any time, a receipt that stays locked or whose lock
-fails. A wrong
+be answered, nor, at any time, a receipt that stays locked, whose lock
+fails or whose checks could not be made. A wrong
 password never starts the command, so the receipt still holds the
 predecessor. A cancelled dialog never starts it either, and rolls back on
 its status alone.
@@ -331,8 +346,9 @@ A settlement knows of no dialog that is over, so a start whose `expires`
 has not passed and whose receipt still holds the predecessor stays
 journaled: its dialog can still be answered. So do the other receipts that
 decide nothing before `expires`, and, at any time, a receipt that stays
-locked or cannot be locked: a command for that start may hold it and still
-be in pmset. While a start stays journaled, new Starts in that Insomnia
+locked or cannot be locked, since a command for that start may hold it and
+still be in pmset, and one whose checks could not be made. While a start
+stays journaled, new Starts in that Insomnia
 folder are refused, its claim keeps Starts in every other folder of the
 user refused, an unexpired session of that start is ended rather than
 resumed, and no pmset runs for sleep, whatever an earlier session owes.
@@ -342,6 +358,9 @@ would then not hold. The rest of the undo (Low Power Mode, frozen
 processes, audio) still runs. A start whose receipt stays locked keeps
 that hold for as long as the lock is held, with no limit, so a command
 that never exits leaves sleep as it is with no restore from Insomnia.
+A receipt whose checks cannot be made (a list acl(3) cannot give whole,
+an app binary that does not answer) keeps that hold the same way, until
+a check can be made.
 Otherwise session.json goes first if its end is that start's deadline
 (that session never began, and is never resumed on a SleepDisabled 1
 someone else may have set). Then, while the
@@ -389,11 +408,19 @@ release file, or write the rule or the bundle, while it checks and removes
 them. That covers a rerun that finishes an earlier removal too, when there
 is no receipt to lock. In the standard folder that lock is its own
 recovery lock. Every holder takes them in one order: a folder's recovery
-lock, then the standard folder's, then the receipt's. It stops before
-removing anything, says why and exits 1 when the lock stays busy, a start
-claims the receipt, the release file shows another nonce, the receipt, the
-release file or a folder above them cannot be read or fails the checks, or
-one of the two files is there without the other. One lone release file is
+lock, then the standard folder's, then the receipt's. The app locks a
+recovery lock, and uninstall.sh the standard folder's, only as a regular
+file: a symbolic link, a folder or a FIFO at the path is refused and left
+as it is, and nothing unlinks or replaces a lock. install.sh, backstop.sh
+and uninstall.sh still open a folder's own recovery lock through a link.
+uninstall.sh stops before
+removing anything and says why when its folder's recovery lock or the
+standard folder's stays busy (exit 75), and with exit 1 when the
+receipt's lock stays busy, a start claims the receipt, the release file shows
+another nonce, the receipt, the release file or a folder above them
+cannot be read or fails the checks, or one of the two files is there
+without the other. With no app of this version to read the folders'
+lists, it removes only its own folder's files instead (above). One lone release file is
 let through: the one an uninstall of the same folder left when it stopped
 between removing the receipt and removing the release file. Under the
 receipt's lock, after the checks and before the LaunchAgent goes, it
@@ -454,8 +481,9 @@ trace.
 - When the receipt shows nothing once `expires` has passed (missing,
   replaced, unreadable, under a changed folder, or a later start's line
   that names another predecessor), the start is undone like an end, and a
-  1 another tool set is set to 0. A receipt that stays locked decides
-  nothing at any time, and the sleep undo waits for it (below).
+  1 another tool set is set to 0. A receipt that stays locked, or one
+  whose checks could not be made, decides nothing at any time, and the
+  sleep undo waits for it (below).
 - The receipt's line reaches the drive before pmset runs only on a drive
   that honours F_FULLFSYNC. On one that does not, a power loss can bring
   the receipt back with older content while pmset's 1 persists. That 1 is
@@ -642,10 +670,21 @@ trace.
   over the 45-byte receipt of earlier builds of this change, which
   install.sh refuses rather than convert. A start can stay unsettled, with
   Starts refused and its sleep undo held, for as long as its receipt stays
-  locked.
+  locked or its checks cannot be made.
 
-Closing the ownership gaps needs a sleep assertion owned by a process, or
-a pmset that compares before it sets, which this design does not have.
+Neither of the two changes that come to mind closes all of these gaps,
+and each costs something this design does not pay. A pmset that compares
+before it sets would close the window between the root command's second
+read and its `disablesleep 1`, but not a 1 another tool writes over
+Insomnia's during the session: the value is still 1 at the session's
+end, so a compare there still sets it to 0. A sleep assertion owned by a
+process (what `caffeinate` takes) has an owner, but macOS honours one
+against system sleep only on AC power, closing the lid still sleeps the
+Mac, which SleepDisabled prevents, and it ends when its process exits or
+crashes, so a session would end with that process rather than at its end
+time. Either
+would change what a session keeps awake and for how long. This design
+has neither, and makes no choice between them.
 
 The installer runs no pmset: right after writing the rule it confirms that `sudo -k -n -l` lists the
 three commands without a password, which catches a rule sudo does not read

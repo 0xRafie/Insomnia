@@ -195,8 +195,11 @@ current source. `v0.1.0` installs an older layout. Its app has no
 copy with `/bin/bash` without checking any code signature. The sealed script,
 the pinned code requirement and the refusal of an edited or re-signed bundle
 described below do not apply to it, and neither does the upgrade procedure.
-Its sudoers rule grants the same four commands. The `README.md` in its zip
-describes what it installs and its limits.
+Its sudoers rule grants four commands without a password: the three listed
+below and `/usr/bin/pmset -a disablesleep 1`, which turns sleep off. So under
+`v0.1.0` any process running as your user can keep the Mac awake without a
+password. A build of this source does not grant that command. The
+`README.md` in its zip describes what it installs and its limits.
 
 | Location | Purpose |
 | --- | --- |
@@ -341,8 +344,10 @@ anyone acted on one it could name another process.
    tool turned it off in the meantime. It does so at once for this
    start's `writing` or a later start's line. A missing, replaced or
    unreadable receipt waits for the answer window to end, since a command
-   for the start could still write until then. Until then, and for as long
-   as the receipt stays locked, nothing is decided: the start stays
+   for the start could still write until then. Until then, for as long as
+   the receipt stays locked, and at any time while a check of the receipt
+   or a folder above it cannot be made (an owner, a mode or an access
+   control list that cannot be read whole), nothing is decided: the start stays
    recorded with its claim, Start is refused, and sleep is left as it is,
    even when an earlier session still owes a restore. Insomnia's other
    changes (Low Power Mode, stopped processes, audio) are undone as usual.
@@ -757,7 +762,8 @@ installation scenarios still need [release validation](docs/release-validation.m
   wrote `writing` and then failed or was stopped, or a later start's line
   names another earlier code, and once the start's answer window has
   ended when the receipt is missing, replaced or unreadable. While the
-  receipt stays locked, nothing is set to 0. On a drive that ignores the
+  receipt stays locked, or a check of it cannot be made, nothing is set
+  to 0. On a drive that ignores the
   flush request, a
   power loss can bring back an older receipt while pmset's 1 persists;
   that 1 then reads as set by something else. And while Insomnia still
@@ -931,7 +937,18 @@ them again meanwhile. A
 start from another Insomnia folder of yours that is not settled, a lock
 that stays held, a receipt, `.released` file or folder it cannot read or
 that fails its checks, or one of the two files without the other stops it
-with nothing removed and a message. One case of a lone `.released` file
+with nothing removed and a message. Those checks read the access control
+lists of the receipts folder and the folders above it with the installed
+app's binary (`Insomnia --access-lists`). A list it cannot read whole, or
+an answer that is late, too long or garbled, stops it the same way. When
+no app of this version is installed (an earlier uninstall removed it, for
+example, before a later `--purge`), nothing can read those lists, so it
+removes only this folder's own files. It keeps the sudoers rule, the
+receipts folder with everything in it and any app bundle, runs nothing
+as root, says what it kept and why, and exits 1. To remove what it kept,
+install this version again and rerun, or run the `sudo rm` it prints once
+no Insomnia folder of yours has a start to settle and no other account on
+this Mac uses Insomnia. One case of a lone `.released` file
 is known: an uninstall of this folder that stopped after removing the
 receipt. Just before that removal it writes `.uninstall-receipt-removal`
 in the folder, and a rerun finishes the removal while that file still
