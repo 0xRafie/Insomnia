@@ -147,10 +147,17 @@ QUIT_WAIT_SECONDS=10
 # backstop.sh bounds its own commands. The commands of step 5 that run as
 # root are bounded too (as_root); sudo only ever gets SIGTERM.
 CALL_TIMEOUT_SECONDS=30
+# The app binary's --access-lists mode runs with backstop.sh's pipe_job and
+# take_answer (read_access_lists): CALL_TIMEOUT_SECONDS, then SIGTERM, and
+# SIGKILL KILL_GRACE_SECONDS after that.
+COMMAND_TIMEOUT_SECONDS="$CALL_TIMEOUT_SECONDS"
+KILL_GRACE_SECONDS=1
 APP="$HOME/Applications/Insomnia.app"
 # The installed bundle's binary, which reads access control lists
 # (read_access_lists) once $APP/Contents/Info.plist declares
-# InsomniaAccessListsVersion ACCESS_LISTS_VERSION.
+# InsomniaAccessListsVersion ACCESS_LISTS_VERSION. Step 5 removes it with
+# the bundle, so a later run (--purge, or a rerun after a stop) may have
+# none: check_shared then leaves everything every folder shares as it is.
 APP_BIN="$APP/Contents/MacOS/Insomnia"
 ACCESS_LISTS_VERSION=1
 SUDOERS=/etc/sudoers.d/insomnia
@@ -1588,22 +1595,61 @@ fi
 # (read_access_lists), which reads every entry, right and flag as the app's
 # own check does. ls(1) never prints synchronize, prints the rights and
 # flags only folders use only for a folder, and skips or stops at an entry
-# it cannot read, so no reading of its text shows those. A list the binary
-# could not read whole, or lists it could not be asked for, fail.
+# it cannot read, so no reading of its text shows those.
+# unsafe_unknown is 1, as for the app's SleepOffReceipts.Unknown, when no
+# check fails but one could not be made: stat failing other than for a
+# path that is not there, or printing other than one line per path; lists
+# the binary could not give (read_access_lists) or did not read whole
+# (unreadable, incomplete). Such a receipt is neither trusted nor shown to
+# be unsafe, and decides nothing (attempt_verdict). A path that is not
+# there, and an owner, mode, type or entry read whole that fails, is
+# unsafe, and that wins over a check that could not be made.
+STAT_LINE='^([0-9]+) ([0-7]+) ([0-9]+) ([0-9]+) (.+)$'
 receipt_unsafe() { # receipt uid
-  local f="$1" p="${1%/*}" listing k
-  local folders=()
-  unsafe_why=""
+  local f="$1" p="${1%/*}" listing status rest line err k=0 bad=0 unknown=""
+  local folders=() paths=()
+  local refused="$f is missing, is not the 82-byte file install.sh made, mode 600, or someone other than root can change it or a folder above it"
+  unsafe_why=""; unsafe_unknown=0
   while [[ -n "$p" ]]; do folders+=("$p"); p="${p%/*}"; done
   folders+=(/)
-  listing="$("$STAT" -f '%u %Lp %l %z %HT' "$f" "${folders[@]}" 2>/dev/null)" || listing=""
-  if ! printf '%s\n' "$listing" | /usr/bin/awk -v o="$RECEIPT_OWNER" -v n="$(( ${#folders[@]} + 1 ))" 'NR == 1 { k = NF == 6 && $5 == "Regular" && $6 == "File" && $3 == 1 && $4 == 82 && $2 == 600 }; NR > 1 { k = k && NF == 5 && $5 == "Directory" }; { k = k && ($1 == 0 || $1 == o) && $2 !~ /[2367].?$/ }; END { exit !(k && NR == n) }'; then
-    unsafe_why="$f is missing, is not the 82-byte file install.sh made, mode 600, or someone other than root can change it or a folder above it"
-    return 0
+  paths=("$f" "${folders[@]}")
+  # stat's status comes back with its output, so a stat that could not
+  # read a path is told apart from one that read every path.
+  listing="$("$STAT" -f '%u %Lp %l %z %HT' "${paths[@]}" 2>/dev/null; echo ".$?")"
+  status="${listing##*.}"
+  listing="${listing%.*}"
+  if [[ "$status" != 0 ]]; then
+    # As the app's lstat, only a path that is not there (ENOENT, ENOTDIR)
+    # fails; any other error leaves the check unmade.
+    for p in "${paths[@]}"; do
+      err="$("$STAT" -f '' "$p" 2>&1 >/dev/null)" || true
+      case "$err" in
+        *": No such file or directory"|*": Not a directory") unsafe_why="$refused"; return 0 ;;
+      esac
+    done
+    unknown="the owner, mode and type of $f and the folders above it could not be read (stat exit ${status:-none})"
+  else
+    rest="$listing"
+    while [[ -n "$rest" ]]; do
+      line="${rest%%$'\n'*}"
+      if [[ "$rest" == *$'\n'* ]]; then rest="${rest#*$'\n'}"; else rest=""; fi
+      if ! [[ "$line" =~ $STAT_LINE ]]; then k=-1; break; fi
+      if (( k == 0 )); then
+        [[ "${BASH_REMATCH[5]}" == "Regular File" && "${BASH_REMATCH[3]}" == 1 && "${BASH_REMATCH[4]}" == 82 && "${BASH_REMATCH[2]}" == 600 ]] || bad=1
+      else
+        [[ "${BASH_REMATCH[5]}" == Directory ]] || bad=1
+      fi
+      [[ "${BASH_REMATCH[1]}" == 0 || "${BASH_REMATCH[1]}" == "$RECEIPT_OWNER" ]] || bad=1
+      if [[ "${BASH_REMATCH[2]}" =~ [2367].?$ ]]; then bad=1; fi
+      k=$((k + 1))
+    done
+    if (( bad )); then unsafe_why="$refused"; return 0; fi
+    if (( k != ${#paths[@]} )); then unknown="stat did not print one line for each of $f and the folders above it"; fi
   fi
   read_access_lists "$f" "${folders[@]}"
   if [[ -n "$lists_why" ]]; then
-    unsafe_why="the access control lists of $f and the folders above it are unknown: $lists_why"
+    unsafe_unknown=1
+    unsafe_why="${unknown:-the access control lists of $f and the folders above it are unknown: $lists_why}"
     return 0
   fi
   for (( k = 1; k < ${#lists_words[@]}; k++ )); do
@@ -1613,15 +1659,18 @@ receipt_unsafe() { # receipt uid
         unsafe_why="the folder of $f or one above it (${folders[k-1]}) has an access control entry that allows changes"
         return 0 ;;
       *)
-        unsafe_why="the access control list of the folder of $f or one above it (${folders[k-1]}) could not be read whole (${lists_words[k]})"
-        return 0 ;;
+        [[ -n "$unknown" ]] || unknown="the access control list of the folder of $f or one above it (${folders[k-1]}) could not be read whole (${lists_words[k]})" ;;
     esac
   done
   case "${lists_words[0]}" in
     installed) ;;
-    none|denies|allows) unsafe_why="$f does not have exactly one access control entry, the one that lets uid $2 read it and nothing else" ;;
-    *) unsafe_why="the access control list of $f could not be read whole (${lists_words[0]})" ;;
+    none|denies|allows) unsafe_why="$f does not have exactly one access control entry, the one that lets uid $2 read it and nothing else"; return 0 ;;
+    *) [[ -n "$unknown" ]] || unknown="the access control list of $f could not be read whole (${lists_words[0]})" ;;
   esac
+  if [[ -n "$unknown" ]]; then
+    unsafe_unknown=1
+    unsafe_why="$unknown"
+  fi
 }
 
 # Sets lists_words from the answer $1 of --access-lists for $2 paths, which
@@ -1655,29 +1704,90 @@ lists_from_answer() { # answer count status
   fi
 }
 
+# backstop.sh's job_running, wait_for_job, signal_job, pipe_job and
+# take_answer, which say more (a test keeps them in step): the app binary
+# runs as a job of the pipeline that reads its answer, and only that job is
+# signalled, by job, never by a pid that may have been reused.
+job_running() { # pid
+  local p
+  for p in $(jobs -rp); do
+    [[ "$p" == "$1" ]] && return 0
+  done
+  return 1
+}
+wait_for_job() { # pid seconds
+  local deadline=$(( SECONDS + $2 )) polls=0
+  while job_running "$1" && (( SECONDS <= deadline )); do
+    if (( polls < 20 )); then sleep 0.01; else sleep 0.1; fi
+    polls=$((polls + 1))
+  done
+  ! job_running "$1"
+}
+signal_job() { # signal pid
+  [[ "$(jobs -p %+)" == "$2" ]] || return 1
+  kill -"$1" %+
+}
+pipe_job() { # command args...
+  local cpid rc=0
+  "$@" </dev/null &
+  cpid=$!
+  if wait_for_job "$cpid" "$COMMAND_TIMEOUT_SECONDS"; then
+    wait "$cpid" || rc=$?
+    return "$rc"
+  fi
+  signal_job TERM "$cpid" || true
+  if wait_for_job "$cpid" "$KILL_GRACE_SECONDS"; then
+    wait "$cpid" || true
+    return 124
+  fi
+  signal_job KILL "$cpid" || true
+  if wait_for_job "$cpid" "$KILL_GRACE_SECONDS"; then
+    wait "$cpid" || true
+    return 125
+  fi
+  return 126
+}
+take_answer() { # max-bytes seconds
+  local LC_ALL=C got="" rc=0 start=$SECONDS
+  IFS= read -r -d '' -n "$(( $1 + 1 ))" -t "$2" got || rc=$?
+  if (( rc == 0 )); then
+    (( ${#got} > $1 )) && return 3
+    return 2
+  fi
+  (( rc == 1 && ${#got} > 0 && SECONDS - start <= $2 )) || return 4
+  printf '%s' "$got"
+}
+
 # Reads the access control lists of the paths $@ with the --access-lists
 # mode (AccessListsCommand.swift) of APP_BIN, the installed bundle's binary,
 # into lists_words (lists_from_answer), or says in lists_why why they are
-# unknown. As backstop.sh's: the binary runs only once the bundle's
+# unknown, as backstop.sh's: the binary runs only once the bundle's
 # Info.plist, read from a private copy once per run (lists_gate), declares
 # InsomniaAccessListsVersion ACCESS_LISTS_VERSION, since an older build has
-# no such mode and would open the menu bar app instead. bounded() gives it
-# the time limit of every other call here, and it ends itself a little
-# after that if this run is gone. bounded() drops the answer's last
-# newline, which is given back here. Nothing reads the lists after step 5
-# has removed the bundle. lists_unavailable is 1 once the binary was missing
-# or not run because of its version, so the stop can say how to go on.
+# no such mode and would open the menu bar app instead, and only while it
+# is the file it was then (lists_gate_bin); its answer and both statuses
+# come back through a pipe, with CALL_TIMEOUT_SECONDS as its limit and a
+# lifetime of its own a little longer, so nothing is written for it.
+# Nothing reads the lists after step 5 has removed the bundle.
+# lists_unavailable is 1 once the binary was missing or not run because of
+# the bundle's version: check_shared then removes only this folder's own
+# files, and a stop says how to go on.
 lists_gate=""
+lists_gate_bin=""
+lists_gate_version=0
 lists_unavailable=0
 read_access_lists() { # path...
-  local rc=0 info_rc=0 declared=""
+  local info_rc=0 declared="" found="" got="" rc="" take=""
   lists_words=(); lists_why=""
-  if [[ ! -x "$APP_BIN" ]]; then
+  found="$("$STAT" -L -f '%HT %d:%i' "$APP_BIN" 2>/dev/null)" || found=""
+  if [[ "$found" != "Regular File "?* || ! -x "$APP_BIN" ]]; then
     lists_why="the app binary that reads them, $APP_BIN, is missing or not executable"
     lists_unavailable=1
     return 0
   fi
+  found="${found##* }"
   if [[ -z "$lists_gate" ]]; then
+    lists_gate_bin="$found"
     if [[ -f "$APP/Contents/Info.plist" ]]; then
       copy_private "$APP/Contents/Info.plist" lists.info.plist || info_rc=$?
       if (( info_rc == 0 )); then
@@ -1691,20 +1801,42 @@ read_access_lists() { # path...
       lists_gate=ok
     elif [[ -z "$lists_gate" ]]; then
       lists_gate="$APP/Contents/Info.plist does not declare InsomniaAccessListsVersion $ACCESS_LISTS_VERSION ('$declared': an older or newer build), so the app binary was not run"
+      lists_gate_version=1
     fi
   fi
   if [[ "$lists_gate" != ok ]]; then
     lists_why="$lists_gate"
-    lists_unavailable=1
+    (( ! lists_gate_version )) || lists_unavailable=1
     return 0
   fi
-  bounded "$APP_BIN" --access-lists "$(( CALL_TIMEOUT_SECONDS + 3 ))" "$@" || rc=$?
-  if (( rc == 124 )); then
-    lists_why="'$APP_BIN --access-lists' did not answer within ${CALL_TIMEOUT_SECONDS}s"
-  elif (( ! BOUNDED_WHOLE )); then
-    lists_why="the answer of '$APP_BIN --access-lists' could not be read whole"
+  if [[ "$found" != "$lists_gate_bin" ]]; then
+    lists_why="the app binary $APP_BIN is not the file it was when $APP/Contents/Info.plist was read, so it was not run"
+    return 0
+  fi
+  # The answer, then ".<binary status>.<take_answer status>".
+  got="$( { pipe_job "$APP_BIN" --access-lists "$(( CALL_TIMEOUT_SECONDS + 3 ))" "$@"; } 2>/dev/null \
+    | take_answer "$(( $# * 24 ))" "$(( COMMAND_TIMEOUT_SECONDS + 2 * KILL_GRACE_SECONDS + 4 ))"
+    echo ".${PIPESTATUS[0]}.${PIPESTATUS[1]}" )" || got=""
+  if [[ "$got" == *.*.* ]]; then
+    take="${got##*.}"; got="${got%.*}"
+    rc="${got##*.}"; got="${got%.*}"
+  fi
+  if ! [[ "$rc" =~ ^[0-9]{1,3}$ && "$take" =~ ^[0-9]{1,3}$ ]]; then
+    lists_why="'$APP_BIN --access-lists' could not be run and read (no status came back)"
+  elif (( rc == 124 )); then
+    lists_why="'$APP_BIN --access-lists' did not answer within ${CALL_TIMEOUT_SECONDS}s; sent SIGTERM, and it ended"
+  elif (( rc == 125 )); then
+    lists_why="'$APP_BIN --access-lists' did not answer within ${CALL_TIMEOUT_SECONDS}s and was still running ${KILL_GRACE_SECONDS}s after SIGTERM; sent SIGKILL, and it ended"
+  elif (( rc == 126 )); then
+    lists_why="'$APP_BIN --access-lists' did not answer within ${CALL_TIMEOUT_SECONDS}s and has not exited ${KILL_GRACE_SECONDS}s after SIGKILL; it runs no further code, and it keeps the recovery lock until the kernel ends it"
+  elif (( take == 2 )); then
+    lists_why="the answer of '$APP_BIN --access-lists' holds a NUL byte (exit $rc)"
+  elif (( take == 3 )); then
+    lists_why="the app binary's answer is not one word for each of the $# paths (exit $rc, more than $(( $# * 24 )) bytes)"
+  elif (( take != 0 )); then
+    lists_why="'$APP_BIN --access-lists' gave no answer, or none that ended within $(( COMMAND_TIMEOUT_SECONDS + 2 * KILL_GRACE_SECONDS + 4 ))s (exit $rc)"
   else
-    lists_from_answer "$BOUNDED_OUTPUT"$'\n' "$#" "$rc"
+    lists_from_answer "$got" "$#" "$rc"
   fi
 }
 
@@ -1712,12 +1844,13 @@ read_access_lists() { # path...
 # (SleepOffReceipts.lock), exactly as backstop.sh's lock_receipt: only the
 # lstat type before the lock, every other check under it. Sets
 # receipt_locked, or receipt_lock_why and, for a receipt that stayed locked
-# or a lockf that failed, receipt_lock_busy=1, and for a regular file that
-# could not be opened, receipt_unopened. unlock_receipt closes fd 7.
+# or a lockf that failed, receipt_lock_busy=1, for a regular file that
+# could not be opened, receipt_unopened, and for a locked file a check
+# could not be made for, receipt_unknown. unlock_receipt closes fd 7.
 receipt_locked=""
 lock_receipt() {
   local f="$RECEIPTS/$UID_NUM" why rc=0 found opened
-  receipt_locked=""; receipt_lock_why=""; receipt_lock_busy=0; receipt_read=0; receipt_unopened=""
+  receipt_locked=""; receipt_lock_why=""; receipt_lock_busy=0; receipt_read=0; receipt_unopened=""; receipt_unknown=""
   found="$("$STAT" -f '%HT %d:%i' "$f" 2>/dev/null)" || found=""
   if [[ "$found" != "Regular File "?* ]]; then
     receipt_lock_why="$f is missing, is not the 82-byte file install.sh made, mode 600, or someone other than root can change it or a folder above it"
@@ -1752,6 +1885,7 @@ lock_receipt() {
     if [[ -n "$why" ]]; then
       exec 7<&-
       receipt_lock_why="$why"
+      (( unsafe_unknown )) && receipt_unknown="$opened"
       return 0
     fi
   fi
@@ -1859,6 +1993,10 @@ attempt_verdict() { # nonce predecessor identity expires now has-marker
     verdict=undecided; verdict_why="$receipt_lock_why; a command for that start may hold its lock"
     return 0
   fi
+  if [[ -n "$receipt_unknown" && "$receipt_unknown" == "$3" ]]; then
+    verdict=undecided; verdict_why="$receipt_lock_why; nothing shows whether the receipt can be trusted, so it decides nothing"
+    return 0
+  fi
   if [[ -z "$receipt_locked" ]]; then
     verdict_why="$receipt_lock_why"
   elif [[ "$receipt_locked" != "$3" ]]; then
@@ -1919,9 +2057,15 @@ folders_problem() { # folder
 }
 
 # Stops the uninstall with the start still journaled. No pmset has run.
+# Without an app binary of this version to read the receipt's lists
+# (lists_unavailable), the receipt's checks cannot be made here or by a
+# backstop, so the message says so.
 settle_stop() { # why what-was-done
   unlock_receipt
   echo "The unfinished start is still journaled: $1." >&2
+  if (( lists_unavailable )); then
+    echo "The receipt's checks read access control lists with $APP_BIN, which is missing or not this version, and Insomnia's recovery agent runs the backstop.sh in that bundle: install this version again (install.sh) and open Insomnia, or let its recovery agent run." >&2
+  fi
   if [[ -n "${2:-}" ]]; then
     echo "$2; nothing else was, and no pmset ran. Then rerun." >&2
   else
@@ -2052,7 +2196,9 @@ settle_attempt() {
   now="$("$DATE" -u +%s 2>/dev/null)" || now=0
   [[ "$now" =~ ^[0-9]+$ ]] || now=0
   attempt_verdict "$nonce" "$pred" "$receipt" "$expires" "$now" "$has_marker"
-  if [[ "$verdict" == undecided ]]; then
+  if [[ "$verdict" == undecided && -n "$receipt_unknown" ]]; then
+    settle_stop "it is not settled yet ($verdict_why). It can be settled once the receipt's checks can be made"
+  elif [[ "$verdict" == undecided ]]; then
     settle_stop "it is not settled yet ($verdict_why). Wait for that to pass: a start's password dialog can be answered for about two minutes after it was shown, and a command it started holds the receipt until pmset exits"
   fi
   if [[ -z "$receipt_locked" ]]; then
@@ -2407,11 +2553,21 @@ record_removal() {
 # need what step 5 removes, or to nothing. With a receipt that passes the
 # checks, fd 7 stays locked (receipt_locked) when shared_why is empty.
 # Records what the check saw in shared_seen and release_seen, which
-# shared_unchanged compares against.
+# shared_unchanged compares against. shared_seen is "unchecked", with
+# folders_why saying why, when the folders could not be checked because
+# there is no app binary of this version to read their lists
+# (lists_unavailable): step 5 then removes only this folder's own files and
+# keeps everything every folder shares (keep_shared), since what the
+# folders hold, and so whether a start still needs the rule, is unknown.
 check_shared() {
   shared_why=""; shared_seen=none; release_seen=""; receipt_lock_why=""
   if [[ ! -e "$RECEIPTS" && ! -L "$RECEIPTS" ]]; then return 0; fi
+  lists_unavailable=0
   folders_problem "$RECEIPTS"
+  if [[ -n "$folders_why" ]] && (( lists_unavailable )); then
+    shared_seen=unchecked
+    return 0
+  fi
   shared_why="$folders_why"
   [[ -z "$shared_why" ]] || return 0
   if [[ -L "$RECEIPT" || -L "$RELEASED" ]] || { [[ -e "$RECEIPT" ]] && [[ ! -f "$RECEIPT" ]]; } || { [[ -e "$RELEASED" ]] && [[ ! -f "$RELEASED" ]]; }; then
@@ -2516,22 +2672,41 @@ shared_unchanged() {
 # so a command left running keeps it too, after this run is gone. The
 # folder and the lock file are made when they are missing, as install.sh
 # makes them: whichever opens the path first creates the file, and both
-# then lock that one file. When fd 9 is that same file (this is the
-# standard folder, or this folder's lock is a link to its lock), fd 6 is
-# closed: a second lock of one file through another descriptor would wait
-# on this run's own. Sets standard_lock, or returns 1 with standard_why and
-# standard_rc (75 when it stayed locked).
+# then lock that one file. Only a regular file is opened and locked, as the
+# app's RecoveryLock does: a symbolic link, a folder, a FIFO or another
+# type at the path stops the run before the open, and is left as it is
+# (nothing here unlinks or replaces the lock). Bash opens with neither
+# O_NOFOLLOW nor O_NONBLOCK, so the descriptor is then checked to be a
+# regular file that is the one the path names without following a link;
+# one swapped in between the check and the open is closed and refused. A
+# FIFO swapped in there is still opened read-write, which does not wait
+# for a writer. When fd 9 is that same file (this is the standard folder,
+# or this folder's lock is a link to its lock), fd 6 is closed: a second
+# lock of one file through another descriptor would wait on this run's
+# own. Sets standard_lock, or returns 1 with standard_why and standard_rc
+# (75 when it stayed locked).
 STANDARD_LOCK="$STANDARD_HOME/.recovery.lock"
 lock_standard() {
-  local own ours rc=0
+  local own ours named opened rc=0
   standard_lock=""; standard_why=""; standard_rc=1
+  if [[ -L "$STANDARD_LOCK" ]] || { [[ -e "$STANDARD_LOCK" ]] && [[ ! -f "$STANDARD_LOCK" ]]; }; then
+    standard_why="$STANDARD_LOCK is not a regular file (a symbolic link, a folder or another type), so it was neither opened nor locked; install.sh never makes one, so remove it yourself"
+    return 1
+  fi
   if ! "$MKDIR" -p "$STANDARD_HOME" 2>/dev/null || ! { exec 6<>"$STANDARD_LOCK"; } 2>/dev/null; then
     standard_why="$STANDARD_LOCK could not be opened"
     return 1
   fi
-  ours="$("$STAT" -f '%d:%i' <&6 2>/dev/null)" || ours=""
+  opened="$("$STAT" -f '%d:%i %HT' <&6 2>/dev/null)" || opened=""
+  named="$("$STAT" -f '%d:%i %HT' "$STANDARD_LOCK" 2>/dev/null)" || named=""
+  if [[ -z "$opened" || "$opened" != "$named" || "$opened" != *" Regular File" ]]; then
+    exec 6<&-
+    standard_why="$STANDARD_LOCK changed while it was opened, or is not a regular file, so it was not locked"
+    return 1
+  fi
+  ours="${opened%% *}"
   own="$("$STAT" -f '%d:%i' <&9 2>/dev/null)" || own=""
-  if [[ -z "$ours" || -z "$own" ]]; then
+  if [[ -z "$own" ]]; then
     exec 6<&-
     standard_why="$STANDARD_LOCK or $LOCK could not be identified"
     return 1
@@ -2553,8 +2728,8 @@ lock_standard() {
     return 1
   fi
   # install.sh opens the lock by its path, so the path must still name the
-  # file locked here.
-  if [[ "$("$STAT" -L -f '%d:%i' "$STANDARD_LOCK" 2>/dev/null)" != "$ours" ]]; then
+  # file locked here, itself and not through a link.
+  if [[ "$("$STAT" -f '%d:%i' "$STANDARD_LOCK" 2>/dev/null)" != "$ours" ]]; then
     exec 6<&-
     standard_why="$STANDARD_LOCK was replaced while it was locked"
     return 1
@@ -2793,17 +2968,11 @@ If no other Insomnia folder of yours has a start to settle, remove the
 receipt and its release file by hand (sudo rm -f $RECEIPT $RELEASED)
 once no Insomnia password dialog is open, then rerun.
 MSG
-  if (( lists_unavailable )); then
-    "$CAT" >&2 <<MSG
-The checks read access control lists with $APP_BIN, which this
-run could not use. Install this version again (install.sh) and rerun, or
-remove the two files by hand as above.
-MSG
-  fi
   exit 1
 fi
 case "$shared_seen" in
   none) echo "no $RECEIPTS" ;;
+  unchecked) echo "kept for another Insomnia folder of this user: $folders_why, so the folders of $RECEIPTS could not be checked; $SUDOERS, $RECEIPTS and everything in it stay as they are, and step 5 removes only this folder's own files" ;;
   absent) echo "no receipt of this user in $RECEIPTS" ;;
   finishing*) echo "$RECEIPT is gone and $RELEASED is as this folder's uninstall left it when it began removing them ($PROGRESS); step 5 finishes the removal" ;;
   *) echo "no start claims $RECEIPT; it stays locked until the rule, the receipt and the bundle are gone" ;;
@@ -2814,10 +2983,14 @@ esac
 # the bundle is gone, or to the end of the run when the shared files stay.
 keep_shared=0
 kept_why=""
+if [[ "$shared_seen" == unchecked ]]; then
+  keep_shared=1
+  kept_why="the folders of $RECEIPTS could not be checked ($folders_why)"
+fi
 read_owed_power
 if [[ -n "$owed_why" ]]; then
   keep_shared=1
-  kept_why="$owed_why"
+  kept_why="${kept_why:+$kept_why, and }$owed_why"
   echo "kept for another Insomnia folder of this user: $owed_why, so a restore the sudoers rule runs may still be owed; $SUDOERS, the receipt and $APP stay"
 else
   echo "sleep is not off and Low Power Mode is not on for battery, so neither is owed a restore now; the App Nap, audio and brightness entries in the journal of another Insomnia folder of this user cannot be seen from here"
@@ -3244,11 +3417,28 @@ Once no account uses Insomnia any more, remove it yourself: sudo rm -f $SUDOERS
 MSG
 fi
 if (( keep_shared )); then
+  app_kept=""
+  if [[ -e "$APP" || -L "$APP" ]]; then app_kept=", and $APP"; fi
+  # Unchecked, the receipt may be gone already (an earlier run removed it)
+  # and the folder may hold other accounts' receipts.
+  kept_what="the receipt and its release file in"
+  if [[ "$shared_seen" == unchecked ]]; then kept_what="whatever is in"; fi
   "$CAT" >&2 <<MSG
 
-Done with this folder, but $SUDOERS, the receipt and its release file in
-$RECEIPTS, and $APP were kept: $kept_why.
+Done with this folder, but $SUDOERS, $kept_what
+$RECEIPTS$app_kept were kept: $kept_why.
 MSG
+  if [[ "$shared_seen" == unchecked ]]; then
+    "$CAT" >&2 <<MSG
+Their checks read the access control lists of $RECEIPTS and the folders
+above it with $APP_BIN, which is missing or not this version, so nothing
+there was removed as root, whichever account or Insomnia folder it is for.
+To remove them, install this version again (install.sh) and rerun this
+script; or, once no Insomnia folder of yours has a start to settle and no
+other account on this Mac uses Insomnia, remove them yourself:
+sudo rm -f $RECEIPT $RELEASED $SUDOERS
+MSG
+  fi
   if [[ -n "$owed_why" ]]; then
     "$CAT" >&2 <<MSG
 Another Insomnia folder of this user may still owe that restore, and its

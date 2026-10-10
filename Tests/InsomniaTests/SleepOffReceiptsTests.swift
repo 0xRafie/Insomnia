@@ -177,8 +177,8 @@ final class SleepOffReceiptsTests: XCTestCase {
     /// path stays the one the start claimed. Round 28 F3: every refused
     /// list of entries (TestReceipts.refusedLists) is a fixed list the
     /// receipts read, so none changes a real list. Round 30 F6: so are the
-    /// allow entries on the receipt and on its folder. Round 36: so are
-    /// the lists that cannot be read, and no real list is read at all.
+    /// allow entries on the receipt and on its folder. No real list is
+    /// read at all (round 36). A list that cannot be read is in unmade().
     private func untrusted() -> [(name: String, startable: Bool, claimed: Bool, says: String, damage: () throws -> Void, repair: () throws -> Void)] {
         let write = AccessEntry(allows: true, principal: .user(getuid()), rights: ["write"], flags: [])
         let file = receipts.file
@@ -205,14 +205,6 @@ final class SleepOffReceiptsTests: XCTestCase {
             ("an allow entry on the folder", false, true, "has an access control entry that allows changes", {
                 self.receipts = TestReceipts.with(self.receipts, folder: folder, list: .entries([write]))
             }, {}),
-            ("the receipt's list cannot be had", false, true, "the access control list of \(file) could not be read: Input/output error",
-             { self.receipts = TestReceipts.with(self.receipts, receipt: .unreadable(EIO)) }, {}),
-            ("an entry of the receipt's list cannot be read", false, true, "the access control list of \(file) could not be read whole",
-             { self.receipts = TestReceipts.with(self.receipts, receipt: .incomplete) }, {}),
-            ("the folder's list cannot be had", false, true, "the access control list of \(folder) could not be read: Permission denied",
-             { self.receipts = TestReceipts.with(self.receipts, folder: folder, list: .unreadable(EACCES)) }, {}),
-            ("an entry of the list of a folder above it cannot be read", false, true, "the access control list of / could not be read whole",
-             { self.receipts = TestReceipts.with(self.receipts, folder: "/", list: .incomplete) }, {}),
             ("a lower-case nonce", true, true, "does not hold two nonces and writing or refused", { TestReceipts.write(file, nonce: self.nonce.lowercased(), predecessor: self.predecessor, word: "refused") }, {}),
             ("a lower-case predecessor", true, true, "does not hold two nonces and writing or refused", { TestReceipts.write(file, nonce: self.nonce, predecessor: self.predecessor.lowercased(), word: "refused") }, {}),
             ("another word", true, true, "does not hold two nonces and writing or refused", { TestReceipts.write(file, nonce: self.nonce, predecessor: self.predecessor, word: "written") }, {}),
@@ -223,6 +215,25 @@ final class SleepOffReceiptsTests: XCTestCase {
                 : "has an access control entry other than the one that lets uid \(getuid()) read it: \(list.entries[0].text)"
             return (list.name, false, true, says, { self.receipts = TestReceipts.with(self.receipts, entries: list.entries) }, {})
         }
+    }
+
+    /// Round 39 (P1 4236972947): each way a check of the receipt or a
+    /// folder above it can go unmade under the lock (a list acl(3) cannot
+    /// give whole), with what the checks say, in the shape of untrusted().
+    /// Like those, they are fixed lists the receipts read (round 36).
+    private func unmade() -> [(name: String, startable: Bool, claimed: Bool, says: String, damage: () throws -> Void, repair: () throws -> Void)] {
+        let file = receipts.file
+        let folder = receipts.folder
+        return [
+            ("the receipt's list cannot be had", false, true, "the access control list of \(file) could not be read: Input/output error",
+             { self.receipts = TestReceipts.with(self.receipts, receipt: .unreadable(EIO)) }, {}),
+            ("an entry of the receipt's list cannot be read", false, true, "the access control list of \(file) could not be read whole",
+             { self.receipts = TestReceipts.with(self.receipts, receipt: .incomplete) }, {}),
+            ("the folder's list cannot be had", false, true, "the access control list of \(folder) could not be read: Permission denied",
+             { self.receipts = TestReceipts.with(self.receipts, folder: folder, list: .unreadable(EACCES)) }, {}),
+            ("an entry of the list of a folder above it cannot be read", false, true, "the access control list of / could not be read whole",
+             { self.receipts = TestReceipts.with(self.receipts, folder: "/", list: .incomplete) }, {}),
+        ]
     }
 
     /// A receipt or folder the checks do not trust shows nothing:
@@ -260,12 +271,55 @@ final class SleepOffReceiptsTests: XCTestCase {
         }
     }
 
+    /// Round 39 (P1 4236972947). A check that could not be made shows
+    /// neither that the receipt can be trusted nor that it cannot. A start
+    /// cannot begin with it (identity throws), and the start that claimed
+    /// it is undecided whatever its line holds (the predecessor, this
+    /// start's refused or writing, a later start's), whatever the time and
+    /// with its dialog over or not: its expiry neither settles it as one
+    /// that never wrote nor undoes a SleepDisabled 1 that may not be its
+    /// own. A check that fails beside it decides, as without it.
+    func testAReceiptWhoseChecksCouldNotBeMadeDecidesNothing() async throws {
+        let file = receipts.file
+        let lines = [(predecessor, other, "refused"), (nonce, predecessor, "refused"), (nonce, predecessor, "writing"), (later, other, "writing")]
+        for c in unmade() {
+            receipts = try TestReceipts.make(in: home.root)
+            TestReceipts.write(file, nonce: nonce, predecessor: predecessor, word: "refused")
+            let identity = try receipts.identity()
+            let control = await verdict(attempt(identity), now: expires - 1)
+            XCTAssertEqual(control, .neverWrote, "\(c.name): the control")
+            try c.damage()
+
+            XCTAssertThrowsError(try receipts.identity(), c.name) { error in
+                XCTAssertTrue(error.localizedDescription.contains(c.says), "\(c.name): \(error.localizedDescription)")
+            }
+            for line in lines {
+                TestReceipts.write(file, nonce: line.0, predecessor: line.1, word: line.2)
+                for (now, dialogOver) in [(expires - 1, false), (expires, false), (expires + 3600, true)] {
+                    let v = await verdict(attempt(identity), now: now, dialogOver: dialogOver)
+                    let why = try XCTUnwrap(undecided(v), "\(c.name), \(line), \(now - expires) s from expires: \(v)")
+                    XCTAssertTrue(why.hasSuffix("; nothing shows whether the receipt can be trusted, so it decides nothing"), "\(c.name): \(why)")
+                    XCTAssertTrue(why.contains(c.says), "\(c.name): \(why)")
+                }
+            }
+            XCTAssertEqual(chmod(receipts.folder, 0o775), 0)
+            let failed = await verdict(attempt(identity), now: expires)
+            let reason = try XCTUnwrap(mayHaveWritten(failed), "\(c.name), a writable folder too: \(failed)")
+            XCTAssertTrue(reason.contains("can be changed by its group or by others"), "\(c.name): \(reason)")
+            XCTAssertEqual(chmod(receipts.folder, 0o755), 0)
+
+            try c.repair()
+            unlink(file)
+        }
+    }
+
     /// R35-4 (round 36). Nothing about the file decides a start while
     /// something holds its lock, as a root command for that start holds it
     /// until its pmset exits: every untrusted receipt or folder above,
     /// still the file the start claimed, is undecided at any time, even
     /// with its dialog over, and says it stayed locked, not what the
-    /// checks would find. Once the lock is let go the same receipt shows
+    /// checks would find, whether a check of it would fail or could not be
+    /// made (unmade()). Once the lock is let go the same receipt shows
     /// what it shows with no holder (the control). A receipt that is
     /// gone from its path, or is another file there, cannot show a lock
     /// held on the file the start claimed: those decide as before (only
@@ -273,7 +327,7 @@ final class SleepOffReceiptsTests: XCTestCase {
     /// does that under its lock).
     func testAHeldLockDecidesNothingWhateverTheFileShows() async throws {
         let file = receipts.file
-        for c in untrusted() {
+        for (c, isUnmade) in untrusted().map({ ($0, false) }) + unmade().map({ ($0, true) }) {
             receipts = try TestReceipts.make(in: home.root)
             TestReceipts.write(file, nonce: nonce, predecessor: predecessor, word: "refused")
             let identity = try receipts.identity()
@@ -298,8 +352,13 @@ final class SleepOffReceiptsTests: XCTestCase {
             }
             XCTAssertEqual(close(holder), 0, c.name)
             let late = await verdict(attempt(identity), now: expires)
-            let reason = try XCTUnwrap(mayHaveWritten(late), "\(c.name), the control once let go")
-            XCTAssertTrue(reason.contains(c.says), "\(c.name): \(reason)")
+            if isUnmade {
+                let why = try XCTUnwrap(undecided(late), "\(c.name), the control once let go")
+                XCTAssertTrue(why.contains(c.says), "\(c.name): \(why)")
+            } else {
+                let reason = try XCTUnwrap(mayHaveWritten(late), "\(c.name), the control once let go")
+                XCTAssertTrue(reason.contains(c.says), "\(c.name): \(reason)")
+            }
 
             try c.repair()
             unlink(file)

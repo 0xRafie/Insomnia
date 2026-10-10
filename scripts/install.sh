@@ -111,7 +111,22 @@ LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
 LABEL="com.insomnia.backstop"
 PLIST="$LAUNCH_AGENTS/$LABEL.plist"
 SUDOERS=/etc/sudoers.d/insomnia
-UID_NUM="$(id -u)"
+# The one account this install is for: its uid, and the name the sudoers
+# rule and the receipt's entry give. $USER is the caller's environment and
+# decides nothing. The name is the one id gives for this uid, checked to
+# map back to it, before anything is changed or asked for. chmod +a takes a
+# name, which the directory maps to the account's UUID, and ls -le prints it
+# back; sudo matches the rule's name against the account it runs for. A
+# name with any byte but a letter, a digit, '_', '.' or '-', or one that
+# starts with '.' or '-', stops the install: chmod would split one with a
+# space or a colon, and sudoers would read other bytes as its syntax.
+account_name_ok() { local LC_ALL=C; [[ -n "$1" && "$1" != [.-]* && "$1" != *[!A-Za-z0-9_.-]* ]]; }
+UID_NUM="$("$ID" -u 2>/dev/null)" || UID_NUM=""
+USER_NAME="$("$ID" -un 2>/dev/null)" || USER_NAME=""
+if [[ -z "$UID_NUM" || "$UID_NUM" == *[!0-9]* ]] || ! account_name_ok "$USER_NAME" || [[ "$("$ID" -u -- "$USER_NAME" 2>/dev/null)" != "$UID_NUM" ]]; then
+  echo "Install stopped before changing anything: the account name of uid ${UID_NUM:-unknown} (${USER_NAME:-none}) is empty, holds a byte other than a letter, a digit, '_', '.' or '-', starts with '.' or '-', or is not this uid's, so neither the sudoers rule nor the receipt can name it." >&2
+  exit 1
+fi
 # The folder of the root-owned receipts (SleepOffReceipts.swift) and the one
 # owner besides root it may have: none, as uid 0 is root. Tests patch both
 # lines in a private copy, for a folder in their temporary directory.
@@ -673,9 +688,9 @@ step "Writing $SUDOERS"
 TMP_SUDOERS="$("$MKTEMP")"
 "$CAT" > "$TMP_SUDOERS" <<SUDO
 # Installed by Insomnia install.sh. Exactly three commands, nothing else.
-$USER ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0
-$USER ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 1
-$USER ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 0
+$USER_NAME ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0
+$USER_NAME ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 1
+$USER_NAME ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 0
 SUDO
 # What a stop says about a sudo call made here that did not answer in time.
 sudo_stalled_note() { # rc what
@@ -975,14 +990,8 @@ receipt_still_locked() {
   [[ "$now" == "$receipt_line.0" ]] || receipt_stop "$RECEIPT changed while it was locked, or could not be read again"
 }
 step "Creating the receipt $RECEIPT"
-# The account name the receipt's entry gives read access to. chmod +a
-# takes a name, which the directory maps to the account's UUID, and ls -le
-# prints it back. A name with a space or a colon, which chmod would split,
-# or one that is not this uid's, stops the install.
-USER_NAME="$("$ID" -un 2>/dev/null)" || USER_NAME=""
-if [[ -z "$USER_NAME" || "$USER_NAME" == *[\ :]* ]] || [[ "$("$ID" -u -- "$USER_NAME" 2>/dev/null)" != "$UID_NUM" ]]; then
-  receipt_stop "the account name of uid $UID_NUM (${USER_NAME:-none}) is empty, holds a space or a colon, or is not this uid's, so the receipt cannot be given an entry for it"
-fi
+# The receipt's entry gives read access to USER_NAME, the account checked at
+# the top, as the rule does.
 problem="$(folders_problem "${RECEIPTS%/*}")"
 [[ -z "$problem" ]] || receipt_stop "$problem"
 if [[ ! -e "$RECEIPTS" && ! -L "$RECEIPTS" ]]; then

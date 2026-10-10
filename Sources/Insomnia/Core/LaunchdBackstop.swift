@@ -195,8 +195,10 @@ struct LaunchdBackstop: BackstopScheduling {
     }
 
     /// The transaction's own lock when it already is the agent lock's file
-    /// (the standard folder, or a folder whose lock is a link to it): a
-    /// second flock of one file in this process would wait on the first.
+    /// (the standard folder, or an agent lock path that is a link to it;
+    /// the transaction's own lock is never a link, which RecoveryLock
+    /// refuses): a second flock of one file in this process would wait on
+    /// the first.
     /// Otherwise the agent lock, within `agentLockTimeout`, made with its
     /// folder when missing as uninstall.sh's lock_standard makes it, and
     /// checked to still be the file its path names, which is what

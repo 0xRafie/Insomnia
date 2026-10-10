@@ -187,7 +187,8 @@ enum SleepOffVerdict: Equatable, Sendable {
 /// and until then it stays journaled (`SleepOffVerdict.undecided`). So
 /// does a receipt that stays locked or cannot be locked, or that is the
 /// file the start journaled but cannot be opened to be locked, whenever it
-/// is read.
+/// is read; and that file, locked, when a list or a path its checks need
+/// cannot be read (`Unknown`): a check that did not run proves neither.
 ///
 /// The release file beside it (`releaseFile`) keeps those lines from
 /// being overwritten while a start is not settled: see `claimable`.
@@ -269,6 +270,25 @@ struct SleepOffReceipts: Sendable {
         var errorDescription: String? { "\(file) could not be opened to be locked: \(String(cString: strerror(errno)))" }
     }
 
+    /// Under the lock, something the checks need could not be read: an
+    /// access control list acl(3) could not give whole, or a path whose
+    /// lstat(2) failed other than by finding nothing there. Nothing shows
+    /// whether the file can be trusted, or that it cannot, so it decides
+    /// nothing (`verdict`). `identity` is "device:inode" of the locked
+    /// file.
+    struct Unknown: Error, LocalizedError {
+        let detail: String
+        let identity: String
+        var errorDescription: String? { detail }
+    }
+
+    /// What `inspect` throws for `Unknown`, before `lock` adds the locked
+    /// file's identity.
+    private struct Unread: Error, LocalizedError {
+        let detail: String
+        var errorDescription: String? { detail }
+    }
+
     /// The release file shows another start's claim.
     struct Claimed: Error, LocalizedError {
         let nonce: String
@@ -336,9 +356,11 @@ struct SleepOffReceipts: Sendable {
     /// Opens the receipt read-only and locks it, trying every `pollEvery`
     /// for up to `timeout`, then checks it. Throws `Busy` when it stays
     /// locked, `LockFailed` when flock(2) fails another way, `Unopened`
-    /// when the file at the path cannot be opened, and `Problem` when the
-    /// receipt is missing or not a regular file before the lock, or once
-    /// locked, fails the checks or is not the file at its path.
+    /// when the file at the path cannot be opened, `Unknown` when, once
+    /// locked, a list or a path the checks need cannot be read, and
+    /// `Problem` when the receipt is missing or not a regular file before
+    /// the lock, or once locked, fails the checks or is not the file at its
+    /// path.
     ///
     /// Only what opening needs comes before the lock: a plain folder path
     /// and a regular file at it, by lstat, so a FIFO or a device put there
@@ -390,6 +412,9 @@ struct SleepOffReceipts: Sendable {
             guard FileIdentity(try check()).text == held.identity else {
                 throw Problem(detail: "\(file) was replaced while it was locked")
             }
+        } catch let error as Unread {
+            held.release()
+            throw Unknown(detail: error.detail, identity: held.identity)
         } catch {
             held.release()
             throw error
@@ -430,7 +455,12 @@ struct SleepOffReceipts: Sendable {
     /// and the claimed file still at the path but one that cannot be opened
     /// to lock it decide nothing: a command may hold that lock. Every check
     /// of the file itself comes after the lock (`lock`), so a file that
-    /// fails one decides only once no command holds it.
+    /// fails one decides only once no command holds it. The file the start
+    /// claimed, locked, whose checks could not be read (`Unknown`), decides
+    /// nothing whatever the time: a check that failed to run shows neither
+    /// that its line can be trusted nor that it cannot, so it neither
+    /// settles the start as one that never wrote nor lets its expiry undo
+    /// a SleepDisabled someone else may have set.
     func verdict(for attempt: SleepOffAttempt, lock outcome: Result<Guard, Error>, now: Int, dialogOver: Bool = false) -> SleepOffVerdict {
         // Nothing ran as root for a start that never showed its dialog.
         guard attempt.marker != nil else { return .neverWrote }
@@ -444,6 +474,8 @@ struct SleepOffReceipts: Sendable {
             return .undecided(error.localizedDescription)
         case let .failure(error as Unopened) where error.identity == attempt.receipt:
             return .undecided("\(error.localizedDescription); a command for that start may hold its lock")
+        case let .failure(error as Unknown) where error.identity == attempt.receipt:
+            return .undecided("\(error.localizedDescription); nothing shows whether the receipt can be trusted, so it decides nothing")
         case let .failure(error):
             return over ? .mayHaveWritten(error.localizedDescription) : .undecided("\(error.localizedDescription); a command for that start could still write \(until)")
         }
@@ -559,19 +591,27 @@ struct SleepOffReceipts: Sendable {
     /// permission for group or others. Each folder has no access control
     /// entry that allows anything. The receipt itself must also be a
     /// regular file with one link, `size` bytes and mode 0600, whose list
-    /// is exactly `AccessEntry.installed(for: user)`.
+    /// is exactly `AccessEntry.installed(for: user)`. A path or a list that
+    /// cannot be read does not stop the checks of the others: a check that
+    /// fails anywhere throws `Problem`, and only when none does, the first
+    /// that could not be read throws `Unread`.
     private func check() throws -> stat {
         try checkFolderPath()
-        let info = try inspect(file, directory: false)
-        guard info.st_nlink == 1 else { throw Problem(detail: "\(file) has \(info.st_nlink) links") }
-        guard info.st_size == off_t(Self.size) else { throw Problem(detail: "\(file) is \(info.st_size) bytes, not \(Self.size)") }
+        var unread: Unread?
+        let info = try inspect(file, directory: false, unread: &unread)
+        if let info {
+            guard info.st_nlink == 1 else { throw Problem(detail: "\(file) has \(info.st_nlink) links") }
+            guard info.st_size == off_t(Self.size) else { throw Problem(detail: "\(file) is \(info.st_size) bytes, not \(Self.size)") }
+        }
         var dir = folder
         while true {
-            _ = try inspect(dir, directory: true)
+            _ = try inspect(dir, directory: true, unread: &unread)
             if dir == "/" { break }
             let cut = dir.lastIndex(of: "/")!
             dir = cut == dir.startIndex ? "/" : String(dir[..<cut])
         }
+        if let unread { throw unread }
+        guard let info else { throw Problem(detail: "\(file) could not be checked") }
         return info
     }
 
@@ -583,10 +623,19 @@ struct SleepOffReceipts: Sendable {
         }
     }
 
-    private func inspect(_ path: String, directory: Bool) throws -> stat {
+    /// Throws `Problem` for a check `path` fails, one that is not there
+    /// among them. A path whose lstat(2) fails another way, or whose list
+    /// acl(3) cannot give whole, is not known to pass or to fail them: that
+    /// is kept in `unread` when it holds nothing yet, and the stat is nil
+    /// for a path that could not be read at all.
+    private func inspect(_ path: String, directory: Bool, unread: inout Unread?) throws -> stat? {
         var info = stat()
         guard lstat(path, &info) == 0 else {
-            throw Problem(detail: "\(path): \(String(cString: strerror(errno)))")
+            let err = errno
+            let detail = "\(path): \(String(cString: strerror(err)))"
+            if err == ENOENT || err == ENOTDIR { throw Problem(detail: detail) }
+            if unread == nil { unread = Unread(detail: detail) }
+            return nil
         }
         let type = info.st_mode & S_IFMT
         guard type == (directory ? S_IFDIR : S_IFREG) else {
@@ -606,9 +655,11 @@ struct SleepOffReceipts: Sendable {
         case let .entries(found):
             entries = found
         case let .unreadable(err):
-            throw Problem(detail: "the access control list of \(path) could not be read: \(String(cString: strerror(err)))")
+            if unread == nil { unread = Unread(detail: "the access control list of \(path) could not be read: \(String(cString: strerror(err)))") }
+            return info
         case .incomplete:
-            throw Problem(detail: "the access control list of \(path) could not be read whole")
+            if unread == nil { unread = Unread(detail: "the access control list of \(path) could not be read whole") }
+            return info
         }
         if directory {
             guard !entries.contains(where: \.allows) else {

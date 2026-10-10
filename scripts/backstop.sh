@@ -943,9 +943,8 @@ supervise_command() { # base command args...
   log info "'$*' (pid $cpid), left running after SIGTERM, has exited (wait status $rc); its supervisor now lets go of the recovery lock, and the next run will retry"
 }
 
-# Run one of the app binary's one-shot modes, --resume-frozen (see
-# resume_via_app) or --access-lists (see read_access_lists), with the same
-# time limit, standard input from app_answer_dir/in and standard output to
+# Run the app binary's --resume-frozen mode (see resume_via_app) with a time
+# limit, standard input from app_answer_dir/in and standard output to
 # app_answer_dir/out. This shell starts the binary as its own background
 # job and is the only process that signals it; no supervisor stands between
 # them. Bash reaps a finished child on its own (in its SIGCHLD handler), so a
@@ -962,10 +961,11 @@ supervise_command() { # base command args...
 # recovery lock stays held for as long as it runs, also after this shell is
 # gone: a run killed mid-call leaves no helper that could resume a process a
 # later session froze while the lock was free.
-# The binary ends itself after its lifetime argument (both callers pass
-# COMMAND_TIMEOUT_SECONDS + KILL_GRACE_SECONDS), so such a helper frees the
-# lock on its own. Returns the binary's exit status, or 124 when it did not
-# finish in time. The function's stderr is /dev/null because bash reports a
+# The binary ends itself after its lifetime argument (resume_via_app and
+# read_access_lists pass COMMAND_TIMEOUT_SECONDS + KILL_GRACE_SECONDS), so
+# such a helper frees the lock on its own. Returns the binary's exit
+# status, or 124 when it did not finish in time. The function's stderr is
+# /dev/null because bash reports a
 # job that a signal ended ("Terminated: 15") on its own stderr; the log says
 # what happened instead.
 app_answer_dir=""
@@ -1015,6 +1015,55 @@ run_app_bounded() { # command args...
   fi
   return 124
 } 2>/dev/null
+
+# Runs the app binary's --access-lists mode as run_app_bounded runs
+# --resume-frozen, with the same limits, signals and reaping, but with
+# standard input from /dev/null and standard output to the caller's pipe
+# (read_access_lists), so no file or folder has to be made for it. Returns
+# the binary's exit status; 124 when it did not end in time and ended after
+# SIGTERM, 125 after SIGKILL, 126 when it was still there KILL_GRACE_SECONDS
+# after SIGKILL. It logs nothing: it runs in a pipeline whose stderr is
+# /dev/null, and the caller says what happened.
+pipe_job() { # command args...
+  local cpid rc=0
+  "$@" </dev/null &
+  cpid=$!
+  if wait_for_job "$cpid" "$COMMAND_TIMEOUT_SECONDS"; then
+    wait "$cpid" || rc=$?
+    return "$rc"
+  fi
+  signal_job TERM "$cpid" || true
+  if wait_for_job "$cpid" "$KILL_GRACE_SECONDS"; then
+    wait "$cpid" || true
+    return 124
+  fi
+  signal_job KILL "$cpid" || true
+  if wait_for_job "$cpid" "$KILL_GRACE_SECONDS"; then
+    wait "$cpid" || true
+    return 125
+  fi
+  return 126
+}
+
+# Reads standard input to its end, for at most $2 seconds, and prints it
+# when it is at most $1 bytes and holds no NUL byte. Bash's read keeps
+# nothing of a NUL byte or what follows it, and keeps what it read at the
+# end of its input, so the read stops at a NUL byte, after $1 + 1 bytes, at
+# the end, or after $2 seconds, and only the end prints. Returns 0 when it
+# printed, 2 at a NUL byte, 3 for more than $1 bytes, 4 when nothing came,
+# or nothing that ended within $2 seconds. At its limit bash 3.2's read -t
+# returns 1 and keeps nothing it read; a later bash returns more than 128
+# and keeps it, which is also 4.
+take_answer() { # max-bytes seconds
+  local LC_ALL=C got="" rc=0 start=$SECONDS
+  IFS= read -r -d '' -n "$(( $1 + 1 ))" -t "$2" got || rc=$?
+  if (( rc == 0 )); then
+    (( ${#got} > $1 )) && return 3
+    return 2
+  fi
+  (( rc == 1 && ${#got} > 0 && SECONDS - start <= $2 )) || return 4
+  printf '%s' "$got"
+}
 
 # End this run right after a timed-out undo command that is still alive:
 # nothing else is undone, the journal and session stay exactly as read, and
@@ -1488,8 +1537,10 @@ session_shape_problems() { # file
 #     missing, replaced, unsafe or damaged.
 #   - "undecided": the receipt stays locked or cannot be locked, or the
 #     file the start journaled cannot be opened, so its lock cannot be
-#     seen; or expires has not passed and the receipt shows nothing yet:
-#     the dialog may still be answered.
+#     seen; or that file is locked but a check of it could not be made
+#     (receipt_unsafe's unsafe_unknown), so it is neither trusted nor
+#     shown to be unsafe, whatever the time; or expires has not passed and
+#     the receipt shows nothing yet: the dialog may still be answered.
 # Decided, the start never finished, so its session never began:
 # session.json goes when its end is the attempt's deadline, so that session
 # is never resumed (a SleepDisabled 1 someone else set would read as still
@@ -1509,9 +1560,10 @@ session_shape_problems() { # file
 # journal write that fails) keeps the record, the sleep entry and the
 # claim. The session is then ended rather than resumed, as --force would,
 # and the run exits 1. The undo below follows attempt_hold: no pmset runs
-# for the sleep entry while it says why (the receipt stays locked or the
-# dialog can still be answered, so a command for that start may still act,
-# whatever the time and whatever an earlier session owes; or the receipt
+# for the sleep entry while it says why (the receipt stays locked, a check
+# of it could not be made, or the dialog can still be answered, so a
+# command for that start may have acted or still act, whatever the time
+# and whatever an earlier session owes; or the receipt
 # shows "never" and no earlier restore is owed); otherwise sleep is
 # restored and the entry stays with the record. A settled record that
 # cannot be finished holds nothing back and keeps the entry for nothing;
@@ -1531,22 +1583,61 @@ session_shape_problems() { # file
 # (read_access_lists), which reads every entry, right and flag as the app's
 # own check does. ls(1) never prints synchronize, prints the rights and
 # flags only folders use only for a folder, and skips or stops at an entry
-# it cannot read, so no reading of its text shows those. A list the binary
-# could not read whole, or lists it could not be asked for, fail.
+# it cannot read, so no reading of its text shows those.
+# unsafe_unknown is 1, as for the app's SleepOffReceipts.Unknown, when no
+# check fails but one could not be made: stat failing other than for a
+# path that is not there, or printing other than one line per path; lists
+# the binary could not give (read_access_lists) or did not read whole
+# (unreadable, incomplete). Such a receipt is neither trusted nor shown to
+# be unsafe, and decides nothing (attempt_verdict). A path that is not
+# there, and an owner, mode, type or entry read whole that fails, is
+# unsafe, and that wins over a check that could not be made.
+STAT_LINE='^([0-9]+) ([0-7]+) ([0-9]+) ([0-9]+) (.+)$'
 receipt_unsafe() { # receipt uid
-  local f="$1" p="${1%/*}" listing k
-  local folders=()
-  unsafe_why=""
+  local f="$1" p="${1%/*}" listing status rest line err k=0 bad=0 unknown=""
+  local folders=() paths=()
+  local refused="$f is missing, is not the 82-byte file install.sh made, mode 600, or someone other than root can change it or a folder above it"
+  unsafe_why=""; unsafe_unknown=0
   while [[ -n "$p" ]]; do folders+=("$p"); p="${p%/*}"; done
   folders+=(/)
-  listing="$("$STAT" -f '%u %Lp %l %z %HT' "$f" "${folders[@]}" 2>/dev/null)" || listing=""
-  if ! printf '%s\n' "$listing" | /usr/bin/awk -v o="$RECEIPT_OWNER" -v n="$(( ${#folders[@]} + 1 ))" 'NR == 1 { k = NF == 6 && $5 == "Regular" && $6 == "File" && $3 == 1 && $4 == 82 && $2 == 600 }; NR > 1 { k = k && NF == 5 && $5 == "Directory" }; { k = k && ($1 == 0 || $1 == o) && $2 !~ /[2367].?$/ }; END { exit !(k && NR == n) }'; then
-    unsafe_why="$f is missing, is not the 82-byte file install.sh made, mode 600, or someone other than root can change it or a folder above it"
-    return 0
+  paths=("$f" "${folders[@]}")
+  # stat's status comes back with its output, so a stat that could not
+  # read a path is told apart from one that read every path.
+  listing="$("$STAT" -f '%u %Lp %l %z %HT' "${paths[@]}" 2>/dev/null; echo ".$?")"
+  status="${listing##*.}"
+  listing="${listing%.*}"
+  if [[ "$status" != 0 ]]; then
+    # As the app's lstat, only a path that is not there (ENOENT, ENOTDIR)
+    # fails; any other error leaves the check unmade.
+    for p in "${paths[@]}"; do
+      err="$("$STAT" -f '' "$p" 2>&1 >/dev/null)" || true
+      case "$err" in
+        *": No such file or directory"|*": Not a directory") unsafe_why="$refused"; return 0 ;;
+      esac
+    done
+    unknown="the owner, mode and type of $f and the folders above it could not be read (stat exit ${status:-none})"
+  else
+    rest="$listing"
+    while [[ -n "$rest" ]]; do
+      line="${rest%%$'\n'*}"
+      if [[ "$rest" == *$'\n'* ]]; then rest="${rest#*$'\n'}"; else rest=""; fi
+      if ! [[ "$line" =~ $STAT_LINE ]]; then k=-1; break; fi
+      if (( k == 0 )); then
+        [[ "${BASH_REMATCH[5]}" == "Regular File" && "${BASH_REMATCH[3]}" == 1 && "${BASH_REMATCH[4]}" == 82 && "${BASH_REMATCH[2]}" == 600 ]] || bad=1
+      else
+        [[ "${BASH_REMATCH[5]}" == Directory ]] || bad=1
+      fi
+      [[ "${BASH_REMATCH[1]}" == 0 || "${BASH_REMATCH[1]}" == "$RECEIPT_OWNER" ]] || bad=1
+      if [[ "${BASH_REMATCH[2]}" =~ [2367].?$ ]]; then bad=1; fi
+      k=$((k + 1))
+    done
+    if (( bad )); then unsafe_why="$refused"; return 0; fi
+    if (( k != ${#paths[@]} )); then unknown="stat did not print one line for each of $f and the folders above it"; fi
   fi
   read_access_lists "$f" "${folders[@]}"
   if [[ -n "$lists_why" ]]; then
-    unsafe_why="the access control lists of $f and the folders above it are unknown: $lists_why"
+    unsafe_unknown=1
+    unsafe_why="${unknown:-the access control lists of $f and the folders above it are unknown: $lists_why}"
     return 0
   fi
   for (( k = 1; k < ${#lists_words[@]}; k++ )); do
@@ -1556,15 +1647,18 @@ receipt_unsafe() { # receipt uid
         unsafe_why="the folder of $f or one above it (${folders[k-1]}) has an access control entry that allows changes"
         return 0 ;;
       *)
-        unsafe_why="the access control list of the folder of $f or one above it (${folders[k-1]}) could not be read whole (${lists_words[k]})"
-        return 0 ;;
+        [[ -n "$unknown" ]] || unknown="the access control list of the folder of $f or one above it (${folders[k-1]}) could not be read whole (${lists_words[k]})" ;;
     esac
   done
   case "${lists_words[0]}" in
     installed) ;;
-    none|denies|allows) unsafe_why="$f does not have exactly one access control entry, the one that lets uid $2 read it and nothing else" ;;
-    *) unsafe_why="the access control list of $f could not be read whole (${lists_words[0]})" ;;
+    none|denies|allows) unsafe_why="$f does not have exactly one access control entry, the one that lets uid $2 read it and nothing else"; return 0 ;;
+    *) [[ -n "$unknown" ]] || unknown="the access control list of $f could not be read whole (${lists_words[0]})" ;;
   esac
+  if [[ -n "$unknown" ]]; then
+    unsafe_unknown=1
+    unsafe_why="$unknown"
+  fi
 }
 
 # Sets lists_words from the answer $1 of --access-lists for $2 paths, which
@@ -1602,21 +1696,30 @@ lists_from_answer() { # answer count status
 # --access-lists mode (AccessListsCommand.swift) into lists_words
 # (lists_from_answer), or says in lists_why why they are unknown. The binary
 # is INSOMNIA_BIN, the one in the bundle this copy came from with
-# --own-bundle, and it runs as resume_via_app runs it: only once
-# INSOMNIA_INFO, read from a private copy once per run (lists_gate),
-# declares InsomniaAccessListsVersion ACCESS_LISTS_VERSION, since an older
-# build has no such mode and would open the menu bar app instead; with the
-# same time limit (run_app_bounded); and with an empty file as its standard
-# input, in a fresh private directory that also takes its answer.
+# --own-bundle. It runs only once INSOMNIA_INFO, read from a private copy
+# once per run (lists_gate), declares InsomniaAccessListsVersion
+# ACCESS_LISTS_VERSION, since an older build has no such mode and would open
+# the menu bar app instead, and only while INSOMNIA_BIN, followed through
+# any link (stat -L), is the regular file it was when that was read
+# (lists_gate_bin). It runs with the time limit
+# of resume_via_app (pipe_job), its standard input /dev/null and its
+# answer read from a pipe (take_answer), whose two statuses come back with
+# the answer, so nothing is written for it: a full disk or a folder that
+# cannot be made changes nothing. Every lists_why means the lists are
+# unknown, never that they allow something (receipt_unsafe).
 lists_gate=""
+lists_gate_bin=""
 read_access_lists() { # path...
-  local rc=0 info_rc=0 declared="" size="" answer="" read_rc=0 opened=0
+  local info_rc=0 declared="" found="" got="" rc="" take=""
   lists_words=(); lists_why=""
-  if [[ ! -x "$INSOMNIA_BIN" ]]; then
+  found="$("$STAT" -L -f '%HT %d:%i' "$INSOMNIA_BIN" 2>/dev/null)" || found=""
+  if [[ "$found" != "Regular File "?* || ! -x "$INSOMNIA_BIN" ]]; then
     lists_why="the app binary that reads them, $INSOMNIA_BIN, is missing or not executable"
     return 0
   fi
+  found="${found##* }"
   if [[ -z "$lists_gate" ]]; then
+    lists_gate_bin="$found"
     if [[ -f "$INSOMNIA_INFO" ]]; then
       copy_private "$INSOMNIA_INFO" Info.plist || info_rc=$?
       if (( info_rc == 0 )); then
@@ -1636,38 +1739,39 @@ read_access_lists() { # path...
     lists_why="$lists_gate"
     return 0
   fi
-  "$RM" -rf "$APP_SUPPORT"/.backstop-lists.* 2>/dev/null || true
-  if ! app_answer_dir="$("$MKTEMP" -d "$APP_SUPPORT/.backstop-lists.XXXXXX" 2>/dev/null)"; then
-    app_answer_dir=""
-    lists_why="a private directory for the app binary's answer could not be made in $APP_SUPPORT"
+  if [[ "$found" != "$lists_gate_bin" ]]; then
+    lists_why="the app binary $INSOMNIA_BIN is not the file it was when $INSOMNIA_INFO was read, so it was not run"
     return 0
   fi
-  if ! printf '' 2>/dev/null > "$app_answer_dir/in"; then
-    lists_why="the app binary's empty input could not be written in $app_answer_dir"
-  else
-    run_app_bounded "$INSOMNIA_BIN" --access-lists "$((COMMAND_TIMEOUT_SECONDS + KILL_GRACE_SECONDS))" "$@" || rc=$?
-    size="$("$STAT" -f %z "$app_answer_dir/out" 2>/dev/null)" || size=""
-    if (( rc == 124 )); then
-      lists_why="the app binary did not answer within ${COMMAND_TIMEOUT_SECONDS}s"
-    elif ! [[ "$size" =~ ^[0-9]+$ ]]; then
-      lists_why="the app binary's answer could not be read whole"
-    elif (( 10#$size > $# * 24 )); then
-      # Longer than a valid answer can be ("unreadable <errno>" is under 24
-      # bytes), so it is not read into memory.
-      lists_why="the app binary's answer is not one word for each of the $# paths (exit $rc, $size bytes)"
-    else
-      { opened=1; IFS= read -r -d '' answer || read_rc=$?; } 2>/dev/null < "$app_answer_dir/out" || true
-      if (( ! opened || read_rc != 1 )) || ! byte_count_is "$answer" "$size"; then
-        lists_why="the app binary's answer could not be read whole"
-      fi
-    fi
+  # The answer, then ".<binary status>.<take_answer status>"; a "." and
+  # digits that are not both statuses mean the pipeline did not run whole.
+  got="$( { pipe_job "$INSOMNIA_BIN" --access-lists "$((COMMAND_TIMEOUT_SECONDS + KILL_GRACE_SECONDS))" "$@"; } 2>/dev/null \
+    | take_answer "$(( $# * 24 ))" "$(( COMMAND_TIMEOUT_SECONDS + 2 * KILL_GRACE_SECONDS + 4 ))"
+    echo ".${PIPESTATUS[0]}.${PIPESTATUS[1]}" )" || got=""
+  if [[ "$got" == *.*.* ]]; then
+    take="${got##*.}"; got="${got%.*}"
+    rc="${got##*.}"; got="${got%.*}"
   fi
-  "$RM" -rf "$app_answer_dir" 2>/dev/null || true
-  app_answer_dir=""
-  [[ -n "$lists_why" ]] || lists_from_answer "$answer" "$#" "$rc"
+  if ! [[ "$rc" =~ ^[0-9]{1,3}$ && "$take" =~ ^[0-9]{1,3}$ ]]; then
+    lists_why="the app binary could not be run and read (no status came back)"
+  elif (( rc == 124 )); then
+    lists_why="the app binary did not answer within ${COMMAND_TIMEOUT_SECONDS}s; sent SIGTERM, and it ended"
+  elif (( rc == 125 )); then
+    lists_why="the app binary did not answer within ${COMMAND_TIMEOUT_SECONDS}s and was still running ${KILL_GRACE_SECONDS}s after SIGTERM; sent SIGKILL, and it ended"
+  elif (( rc == 126 )); then
+    lists_why="the app binary did not answer within ${COMMAND_TIMEOUT_SECONDS}s and has not exited ${KILL_GRACE_SECONDS}s after SIGKILL; it runs no further code, and it keeps the recovery lock until the kernel ends it"
+  elif (( take == 2 )); then
+    lists_why="the app binary's answer holds a NUL byte (exit $rc)"
+  elif (( take == 3 )); then
+    # Longer than a valid answer can be ("unreadable <errno>" is under 24
+    # bytes), so no more of it is read.
+    lists_why="the app binary's answer is not one word for each of the $# paths (exit $rc, more than $(( $# * 24 )) bytes)"
+  elif (( take != 0 )); then
+    lists_why="the app binary gave no answer, or none that ended within $(( COMMAND_TIMEOUT_SECONDS + 2 * KILL_GRACE_SECONDS + 4 ))s (exit $rc)"
+  else
+    lists_from_answer "$got" "$#" "$rc"
+  fi
 }
-# True when $1 is $2 bytes long.
-byte_count_is() { local LC_ALL=C; (( ${#1} == $2 )); }
 
 # Opens the receipt read-only on fd 7 and locks it as the root command does
 # (SleepOffReceipts.lock). Before the lock only what the open needs: the
@@ -1682,8 +1786,11 @@ byte_count_is() { local LC_ALL=C; (( ${#1} == $2 )); }
 # decides nothing whenever it happens. A regular file that cannot be opened
 # sets receipt_unopened to its device:inode: when that is the file the
 # start journaled, its lock cannot be seen, and attempt_verdict decides
-# nothing either. Unlike the app, the shell opens with neither O_NOFOLLOW
-# nor O_NONBLOCK: a link put in the receipt's place after the lstat fails
+# nothing either. So does a locked file a check could not be made for
+# (receipt_unsafe's unsafe_unknown): receipt_unknown is then its
+# device:inode, and fd 7 is closed as for a file that fails. Unlike the
+# app, the shell opens with neither O_NOFOLLOW nor O_NONBLOCK: a link put
+# in the receipt's place after the lstat fails
 # the identity check, but a FIFO put there stalls the open until something
 # writes to it. Only someone who can write the receipt's folder can put
 # either there, and the checks under the lock refuse such a folder. fd 7
@@ -1691,7 +1798,7 @@ byte_count_is() { local LC_ALL=C; (( ${#1} == $2 )); }
 receipt_locked=""
 lock_receipt() {
   local f="$RECEIPTS/$UID" why rc=0 found opened
-  receipt_locked=""; receipt_lock_why=""; receipt_lock_busy=0; receipt_read=0; receipt_unopened=""
+  receipt_locked=""; receipt_lock_why=""; receipt_lock_busy=0; receipt_read=0; receipt_unopened=""; receipt_unknown=""
   found="$("$STAT" -f '%HT %d:%i' "$f" 2>/dev/null)" || found=""
   if [[ "$found" != "Regular File "?* ]]; then
     receipt_lock_why="$f is missing, is not the 82-byte file install.sh made, mode 600, or someone other than root can change it or a folder above it"
@@ -1726,6 +1833,7 @@ lock_receipt() {
     if [[ -n "$why" ]]; then
       exec 7<&-
       receipt_lock_why="$why"
+      (( unsafe_unknown )) && receipt_unknown="$opened"
       return 0
     fi
   fi
@@ -1842,6 +1950,10 @@ attempt_verdict() { # nonce predecessor identity expires now has-marker
   fi
   if [[ -n "$receipt_unopened" && "$receipt_unopened" == "$3" ]]; then
     verdict=undecided; verdict_why="$receipt_lock_why; a command for that start may hold its lock"
+    return 0
+  fi
+  if [[ -n "$receipt_unknown" && "$receipt_unknown" == "$3" ]]; then
+    verdict=undecided; verdict_why="$receipt_lock_why; nothing shows whether the receipt can be trusted, so it decides nothing"
     return 0
   fi
   if [[ -z "$receipt_locked" ]]; then
