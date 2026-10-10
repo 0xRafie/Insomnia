@@ -242,6 +242,10 @@ KILL_GRACE_SECONDS=3
 # Longest a single read (plutil, cat, cp, stat, ps) may run before it is
 # stopped and counts as failed; see bounded.
 READ_TIMEOUT_SECONDS=30
+# Longest this run waits for one change it makes itself (a log line, a
+# move, a removal) before it takes the change for one whose outcome is not
+# known; see change.
+CHANGE_TIMEOUT_SECONDS=30
 
 force=0
 for arg in "$@"; do
@@ -264,9 +268,27 @@ STATE="$APP_SUPPORT/state.json"
 LOCK="$APP_SUPPORT/.recovery.lock"
 LOG="$LOG_DIR/insomnia.log"
 
-# A log path that is not a regular file is not opened: an append to a FIFO
-# with no reader would block, and this run may hold the recovery lock.
+# One line in the log. log_line writes it in a process of its own (see
+# change), so a log on a stalled disk cannot hold this run, which may hold
+# the recovery lock. A line not written within CHANGE_TIMEOUT_SECONDS ends
+# the logging for the rest of the run (LOG_STALLED), and the run goes on:
+# an undo does not wait for its log line, and a line still being written
+# keeps the lock until it is done. A log that cannot be written does not
+# stop the run either. A log path that is not a regular file is not opened:
+# an append to a FIFO with no reader would block.
+LOG_STALLED=0
 log() { # level message
+  local was=$CHANGE_UNSETTLED
+  (( ! LOG_STALLED )) || return 0
+  if ! change log_line "$1" "$2" && (( ! CHANGE_SETTLED )); then
+    LOG_STALLED=1
+    echo "backstop: a line to $LOG did not finish within ${CHANGE_TIMEOUT_SECONDS}s; the rest of this run is not logged" >&2
+  fi
+  # A log line still being written changes nothing the run goes on to use.
+  CHANGE_UNSETTLED=$was
+  return 0
+}
+log_line() { # level message
   "$MKDIR" -p "$LOG_DIR"
   [[ ! -e "$LOG" || -f "$LOG" ]] || return 0
   printf '%s [%s] backstop: %s\n' "$("$DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" >> "$LOG"
@@ -639,6 +661,77 @@ take_output() { # deadline
   READ_HEAD="$head"
   return "$status"
 }
+# A change made in this shell itself (a log line, a move, a removal) has no
+# limit: on a stalled disk it can wait without end, and so hold the
+# recovery lock. change makes the command in a process of its own instead,
+# started as a supervisor is (a process substitution starts it with `&`
+# and settles it, see settle), and waits for it no longer than
+# CHANGE_TIMEOUT_SECONDS: "settled" with its exit status, then the end of
+# the pipe. It returns that status, with CHANGE_SETTLED=1; or 124, with
+# CHANGE_SETTLED=0, when that did not all come in time, and whether the
+# change took place is then not known. Nothing signals the command, since a
+# removal or a move cut short can leave files half changed. It ignores
+# SIGTERM, SIGHUP and SIGPIPE, as a supervisor does (SIGINT and SIGQUIT are
+# ignored already in a background job of a script), and keeps fd 9, so a
+# change that has not finished keeps the recovery lock until it ends, also
+# once this run has exited. Its standard input is /dev/null, and its
+# standard output goes to standard error, which it shares with this run, so
+# what it says shows where this run's own messages do. CHANGE_UNSETTLED is
+# 1 from the start of a change until the change is seen to finish, and
+# stays 1 after one that was not: the run then changes nothing more (see
+# change_or_stop and tidy). change takes fd 5, so no caller makes one while
+# it reads another pipe there.
+CHANGE_SETTLED=1
+CHANGE_UNSETTLED=0
+change() { # command args...
+  local was=$CHANGE_UNSETTLED rc=124 status form='^settled ([0-9]{1,3})$'
+  local deadline=$(( SECONDS + CHANGE_TIMEOUT_SECONDS ))
+  CHANGE_SETTLED=0
+  CHANGE_UNSETTLED=1
+  if exec 5< <(exec </dev/null; trap '' TERM HUP PIPE; "$@" >&2 & settle "$!"); then
+    if pipe_field "$deadline" && [[ "$FIELD" =~ $form ]]; then
+      status=$(( 10#${BASH_REMATCH[1]} ))
+      if pipe_ends "$deadline"; then
+        rc=$status
+        CHANGE_SETTLED=1
+        CHANGE_UNSETTLED=$was
+      fi
+    fi
+    exec 5<&-
+  fi
+  return "$rc"
+}
+# change, and the end of the run when the change was not seen to finish:
+# stop_unsettled, which each script defines, says what it was and exits 1.
+# Returns the change's status otherwise.
+change_or_stop() { # what command args...
+  local what="$1" rc=0
+  shift
+  change "$@" || rc=$?
+  (( CHANGE_SETTLED )) || stop_unsettled "$what" "$@"
+  return "$rc"
+}
+# A command with its standard error sent to /dev/null, for a change whose
+# own message is not shown (the run says what failed instead).
+quietly() { # command args...
+  "$@" 2>/dev/null
+}
+# One step of the cleanup at exit, made with change, and skipped once a
+# change has not been seen to finish (CHANGE_UNSETTLED): that one may still
+# use what the step would remove. The path of a step skipped, or not seen
+# to finish, goes to LEFT_BEHIND for the run to name. A step that fails is
+# not reported: it leaves things as a step not made would.
+LEFT_BEHIND=()
+tidy() { # path command args...
+  local path="$1"
+  shift
+  if (( ! CHANGE_UNSETTLED )); then
+    change "$@" || true
+    (( ! CHANGE_SETTLED )) || return 0
+  fi
+  LEFT_BEHIND+=("$path")
+  return 0
+}
 # Notes of reads that failed. A read made inside $(...) has to reach this
 # shell, so each note goes to a file in WORK as well, NOTES_FILE, which
 # notes_reset names afresh (notes.<n>, counted in this shell, which alone
@@ -896,7 +989,13 @@ if ! WORK="$("$MKTEMP" -d "${TMPDIR:-/tmp}/insomnia-backstop.XXXXXX" 2>/dev/null
   log error "could not create a private folder for this run's reads in ${TMPDIR:-/tmp}; nothing read or undone, will retry"
   exit 1
 fi
-trap '"$RM" -rf "$WORK" 2>/dev/null || true' EXIT
+# At exit the folder goes as a change of its own (see tidy), unless a
+# change this run made was not seen to finish.
+at_exit() {
+  tidy "$WORK" quietly "$RM" -rf "$WORK"
+  (( ${#LEFT_BEHIND[@]} == 0 )) || log warn "left $WORK in place: a change this run made was not seen to finish and may still use it"
+}
+trap at_exit EXIT
 notes_reset
 # The file for the app binary's answer (see run_app_bounded), made and
 # pinned here, before this run takes the recovery lock, so that no file is
@@ -1105,12 +1204,15 @@ is_positive_int() {
 bounded_calls=0
 command_alive=0
 bounded_output=0   # 1: read back what the next bounded command prints
+remove_old_status_files() {
+  "$RM" -f "$APP_SUPPORT"/.backstop.*.pid "$APP_SUPPORT"/.backstop.*.rc
+}
 run_bounded() { # command args...
   local status="" rc cpid="" answer_within deadline took=0
   local status_form='^(exit [0-9]{1,3}|term|alive)$'
   bounded_calls=$((bounded_calls + 1))
   if (( bounded_calls == 1 && ! lock_shared )); then
-    "$RM" -f "$APP_SUPPORT"/.backstop.*.pid "$APP_SUPPORT"/.backstop.*.rc
+    change_or_stop "removing the status files older builds left in $APP_SUPPORT" remove_old_status_files || true
   fi
   BOUNDED_READ=2
   READ_TEXT=""
@@ -1131,9 +1233,7 @@ run_bounded() { # command args...
   fi
   case "$status" in
     "exit "*) rc=$(( 10#${status#exit } )) ;;
-    term)
-      log error "'$*' did not finish within ${COMMAND_TIMEOUT_SECONDS}s; terminated with SIGTERM (pid ${cpid:-?})"
-      rc=124 ;;
+    term) rc=124 ;;
     alive)
       exec 5<&-
       log error "'$*' (pid ${cpid:-?}) did not finish within ${COMMAND_TIMEOUT_SECONDS}s and did not stop on SIGTERM. It is not killed, because that could leave a root pmset running outside the transaction. It keeps the recovery lock until it ends, so Insomnia cannot start and recovery cannot run until then; stop it by hand (sudo kill ${cpid:-<pid>}, after 'ps -p ${cpid:-<pid>}' shows that pid is still this command) and the next run will retry"
@@ -1156,6 +1256,10 @@ run_bounded() { # command args...
     pipe_settles "$(( SECONDS + READ_GRACE_SECONDS ))" || took=3
   fi
   exec 5<&-
+  # Logged only now: a log line is a change, which takes fd 5 (see change).
+  if [[ "$status" == term ]]; then
+    log error "'$*' did not finish within ${COMMAND_TIMEOUT_SECONDS}s; terminated with SIGTERM (pid ${cpid:-?})"
+  fi
   if (( took == 3 )); then
     log error "'$*' (pid ${cpid:-?}) reported '$status', but its supervisor then sent something else or did not finish within ${READ_GRACE_SECONDS}s, so what it may still do is not known. Nothing is signaled from here; while the supervisor runs it keeps the recovery lock. The journal is kept and the next run will retry"
     command_alive=1
@@ -1393,6 +1497,15 @@ run_app_bounded() { # command args...
 # the lock stays with the live command's supervisor.
 stop_transaction() { # what
   log error "recovery stopped after '$1' (still running); no further undo this run, journal and session kept unchanged until it ends"
+  exit 1
+}
+# End this run after a change it made was not seen to finish (see change):
+# nothing more is changed, and the change keeps the lock until it ends.
+stop_unsettled() { # what command args...
+  local what="$1"
+  shift
+  [[ "$1" != quietly ]] || shift
+  log error "recovery stopped: $what ('$*') did not finish within ${CHANGE_TIMEOUT_SECONDS}s, so whether it took place is not known; nothing more is changed this run, and it keeps the recovery lock until it ends; the next run will retry"
   exit 1
 }
 
@@ -1934,7 +2047,7 @@ quarantine_session() {
   base="$SESSION.unreadable-$("$DATE" -u +%Y%m%dT%H%M%SZ)"
   dest="$base"; n=0
   while [[ -e "$dest" || -L "$dest" ]]; do n=$((n + 1)); dest="$base-$n"; done
-  if "$MV" -n "$SESSION" "$dest" 2>/dev/null && [[ ! -e "$SESSION" && ! -L "$SESSION" ]] && [[ -e "$dest" || -L "$dest" ]]; then
+  if change_or_stop "moving $SESSION to $dest" quietly "$MV" -n "$SESSION" "$dest" && [[ ! -e "$SESSION" && ! -L "$SESSION" ]] && [[ -e "$dest" || -L "$dest" ]]; then
     log warn "$what; moved to $dest and treated as no session"
     return 0
   fi
@@ -1976,7 +2089,7 @@ if [[ "$journal_state" != dirty ]]; then
       log info "$session_note; journal already clean"
     fi
     [[ -n "$refused_note" ]] && log info "$refused_note"
-    "$RM" -f "$SESSION"
+    change_or_stop "removing $SESSION" "$RM" -f "$SESSION"
   fi
   exit 0
 fi
@@ -2044,10 +2157,10 @@ prepare_low_power_off() {
     still_json "$tmp" || ok=0
   fi
   if (( ok == 1 )); then
-    "$MV" -f "$tmp" "$STATE" || ok=0
+    change_or_stop "publishing $tmp as $STATE" "$MV" -f "$tmp" "$STATE" || ok=0
   fi
   if (( ok == 0 )); then
-    "$RM" -f "$tmp"
+    change_or_stop "removing $tmp" "$RM" -f "$tmp" || true
     return 1
   fi
   # The journal published at the end starts from the copy read at the
@@ -2121,6 +2234,9 @@ app_args=()
 # timeout included, keeps every entry of the call unsignaled by this run. The
 # binary may have resumed some of them before it went wrong; the next run
 # finds those running and clears them.
+remove_old_resume_folders() {
+  "$RM" -rf "$APP_SUPPORT"/.backstop-resume.*
+}
 resume_via_app() {
   local n=${#app_pid[@]} k rc=0 read_rc valid=1 settled=1 expected=0 line word excerpt="" p rest declared unknown
   local -a words
@@ -2167,7 +2283,7 @@ resume_via_app() {
   # passes the input, and takes the answer back, through files with no name
   # in WORK. Older builds kept them in a folder in APP_SUPPORT; any such
   # folder left by a run that was itself killed mid-call is removed.
-  "$RM" -rf "$APP_SUPPORT"/.backstop-resume.*
+  change_or_stop "removing the folders older builds left in $APP_SUPPORT" remove_old_resume_folders
   run_app_bounded "$INSOMNIA_BIN" --resume-frozen "$((COMMAND_TIMEOUT_SECONDS + KILL_GRACE_SECONDS))" || rc=$?
   # The answer counts only when it was read back whole: one with a NUL byte,
   # or one that could not be read back, is not valid. The excerpt for the
@@ -2456,10 +2572,10 @@ if (( changed == 1 )); then
     still_json "$tmp" || publish_ok=0
   fi
   if (( publish_ok == 1 )); then
-    "$MV" -f "$tmp" "$STATE" || publish_ok=0
+    change_or_stop "publishing $tmp as $STATE" "$MV" -f "$tmp" "$STATE" || publish_ok=0
   fi
   if (( publish_ok == 0 )); then
-    "$RM" -f "$tmp"
+    change_or_stop "removing $tmp" "$RM" -f "$tmp" || true
     log error "could not publish the updated journal to $STATE; previous journal kept, will retry"
     exit 1
   fi
@@ -2479,6 +2595,6 @@ else
 fi
 case "$session_state" in
   malformed|unreadable) quarantine_session || exit 1 ;;
-  *)                    "$RM" -f "$SESSION" ;;
+  *)                    change_or_stop "removing $SESSION" "$RM" -f "$SESSION" ;;
 esac
 exit 0

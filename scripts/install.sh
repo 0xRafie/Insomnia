@@ -96,6 +96,10 @@ CALL_TIMEOUT_SECONDS=30
 # Longest backstop.sh may run in step 5 before it is sent SIGTERM (see
 # run_backstop).
 BACKSTOP_TIMEOUT_SECONDS=300
+# Longest this run waits for one move, removal or write it makes itself
+# under the recovery lock (and for each step of its cleanup) before it takes
+# that change for one whose outcome is not known and stops; see change.
+CHANGE_TIMEOUT_SECONDS=30
 
 # What a prebuilt bundle (--app) must be, and the bundle id that makes a
 # running process this app (find_insomnia).
@@ -653,6 +657,77 @@ take_output() { # deadline
   READ_HEAD="$head"
   return "$status"
 }
+# A change made in this shell itself (a log line, a move, a removal) has no
+# limit: on a stalled disk it can wait without end, and so hold the
+# recovery lock. change makes the command in a process of its own instead,
+# started as a supervisor is (a process substitution starts it with `&`
+# and settles it, see settle), and waits for it no longer than
+# CHANGE_TIMEOUT_SECONDS: "settled" with its exit status, then the end of
+# the pipe. It returns that status, with CHANGE_SETTLED=1; or 124, with
+# CHANGE_SETTLED=0, when that did not all come in time, and whether the
+# change took place is then not known. Nothing signals the command, since a
+# removal or a move cut short can leave files half changed. It ignores
+# SIGTERM, SIGHUP and SIGPIPE, as a supervisor does (SIGINT and SIGQUIT are
+# ignored already in a background job of a script), and keeps fd 9, so a
+# change that has not finished keeps the recovery lock until it ends, also
+# once this run has exited. Its standard input is /dev/null, and its
+# standard output goes to standard error, which it shares with this run, so
+# what it says shows where this run's own messages do. CHANGE_UNSETTLED is
+# 1 from the start of a change until the change is seen to finish, and
+# stays 1 after one that was not: the run then changes nothing more (see
+# change_or_stop and tidy). change takes fd 5, so no caller makes one while
+# it reads another pipe there.
+CHANGE_SETTLED=1
+CHANGE_UNSETTLED=0
+change() { # command args...
+  local was=$CHANGE_UNSETTLED rc=124 status form='^settled ([0-9]{1,3})$'
+  local deadline=$(( SECONDS + CHANGE_TIMEOUT_SECONDS ))
+  CHANGE_SETTLED=0
+  CHANGE_UNSETTLED=1
+  if exec 5< <(exec </dev/null; trap '' TERM HUP PIPE; "$@" >&2 & settle "$!"); then
+    if pipe_field "$deadline" && [[ "$FIELD" =~ $form ]]; then
+      status=$(( 10#${BASH_REMATCH[1]} ))
+      if pipe_ends "$deadline"; then
+        rc=$status
+        CHANGE_SETTLED=1
+        CHANGE_UNSETTLED=$was
+      fi
+    fi
+    exec 5<&-
+  fi
+  return "$rc"
+}
+# change, and the end of the run when the change was not seen to finish:
+# stop_unsettled, which each script defines, says what it was and exits 1.
+# Returns the change's status otherwise.
+change_or_stop() { # what command args...
+  local what="$1" rc=0
+  shift
+  change "$@" || rc=$?
+  (( CHANGE_SETTLED )) || stop_unsettled "$what" "$@"
+  return "$rc"
+}
+# A command with its standard error sent to /dev/null, for a change whose
+# own message is not shown (the run says what failed instead).
+quietly() { # command args...
+  "$@" 2>/dev/null
+}
+# One step of the cleanup at exit, made with change, and skipped once a
+# change has not been seen to finish (CHANGE_UNSETTLED): that one may still
+# use what the step would remove. The path of a step skipped, or not seen
+# to finish, goes to LEFT_BEHIND for the run to name. A step that fails is
+# not reported: it leaves things as a step not made would.
+LEFT_BEHIND=()
+tidy() { # path command args...
+  local path="$1"
+  shift
+  if (( ! CHANGE_UNSETTLED )); then
+    change "$@" || true
+    (( ! CHANGE_SETTLED )) || return 0
+  fi
+  LEFT_BEHIND+=("$path")
+  return 0
+}
 # The InsomniaResumeFrozenVersion an installed app's Info.plist declares,
 # read before the recovery lock (step 5) for the backstop, which hands
 # frozen entries to the app binary only when the value is the
@@ -849,18 +924,40 @@ if [[ "${INSOMNIA_LID_SIMULATION:-}" == 1 && -n "$PREBUILT" ]]; then
   exit 2
 fi
 
+# Ends this run after a change it made under the recovery lock was not
+# seen to finish (see change): nothing more is changed, and the cleanup at
+# exit leaves what it would remove (see tidy). The change keeps the lock
+# until it ends. What it leaves is what an install stopped at that point
+# leaves, which a rerun repairs under the lock.
+stop_unsettled() { # what command args...
+  local what="$1" shown=""
+  shift
+  [[ "$1" != quietly ]] || shift
+  [[ "$1" != /* ]] || shown=" ($(command_line "$@"))"
+  # printf, not a here-document: bash writes each of those to a temporary
+  # file first.
+  printf '\nInstall stopped: %s%s did not finish within %ss, so whether it took place\n' "$what" "$shown" "$CHANGE_TIMEOUT_SECONDS" >&2
+  printf '%s\n' "is not known. Nothing more was changed. It keeps the recovery lock until it" \
+    "ends, so until then the app cannot start a session and the LaunchAgent's" \
+    "backstop cannot undo one. Installed so far: $SUDOERS." \
+    "Rerun this script once it has ended; the rerun repairs what a stopped install" \
+    "leaves." >&2
+  exit 1
+}
+
 # Moves a bundle with one rename. Every path passed here is inside $APP_DIR,
 # one filesystem, so a rename that fails leaves both paths as they were.
 # Refuses when something is at the destination: mv would move the bundle
 # into it instead. Each caller handles a failure itself; under set -e an
 # unhandled one would exit with the previous job unloaded and let cleanup
-# delete the staged build.
+# delete the staged build. The rename is a change (see change): one not
+# seen to finish stops the run.
 move_bundle() { # from to
   if [[ -e "$2" || -L "$2" ]]; then
     echo "not moving $1: $2 already exists" >&2
     return 1
   fi
-  "$MV" "$1" "$2"
+  change_or_stop "moving $1 to $2" "$MV" "$1" "$2"
 }
 
 # Whether sudo grants the four pmset commands of the rule without a
@@ -1510,15 +1607,21 @@ $(root_functions r_die r_stat r_file r_root r_acl_reader r_acl r_dirs r_guard r_
 r_replace \"\$@\"" insomnia-sudoers-replace "$1" "$SUDOERS" "${2-}"
 }
 
+# Each step of the cleanup at exit is a change of its own (see tidy), and
+# all of them are skipped once a change was not seen to finish.
+remove_work() {
+  "$RM" -f "$WORK"/call.* 2>/dev/null || true
+  "$RMDIR" "$WORK" 2>/dev/null
+}
 cleanup() {
-  if [[ -n "$TMP_SUDOERS" ]]; then "$RM" -f "$TMP_SUDOERS"; fi
-  if [[ -n "$CANDIDATE" ]]; then "$RM" -f "$CANDIDATE"; fi
-  if [[ -n "$CANDIDATE_DIR" ]]; then "$RMDIR" "$CANDIDATE_DIR" 2>/dev/null || true; fi
-  if [[ -n "$STAGE" ]]; then "$RM" -rf "$STAGE"; fi
-  if [[ -n "$BUILD_DIR" ]]; then "$RM" -rf "$BUILD_DIR"; fi
-  if [[ -n "$WORK" ]]; then
-    "$RM" -f "$WORK"/call.* 2>/dev/null || true
-    "$RMDIR" "$WORK" 2>/dev/null || true
+  if [[ -n "$TMP_SUDOERS" ]]; then tidy "$TMP_SUDOERS" "$RM" -f "$TMP_SUDOERS"; fi
+  if [[ -n "$CANDIDATE" ]]; then tidy "$CANDIDATE" "$RM" -f "$CANDIDATE"; fi
+  if [[ -n "$CANDIDATE_DIR" ]]; then tidy "$CANDIDATE_DIR" quietly "$RMDIR" "$CANDIDATE_DIR"; fi
+  if [[ -n "$STAGE" ]]; then tidy "$STAGE" "$RM" -rf "$STAGE"; fi
+  if [[ -n "$BUILD_DIR" ]]; then tidy "$BUILD_DIR" "$RM" -rf "$BUILD_DIR"; fi
+  if [[ -n "$WORK" ]]; then tidy "$WORK" remove_work; fi
+  if (( ${#LEFT_BEHIND[@]} > 0 )); then
+    echo "Left in place, since a change this run made was not seen to finish and may still use them: ${LEFT_BEHIND[*]}" >&2
   fi
 }
 trap cleanup EXIT
@@ -1965,7 +2068,7 @@ for dir in "$APP_DIR"/.Insomnia.app.staging.*; do
   if "$KILL" -0 "${BASH_REMATCH[1]}" 2>/dev/null; then
     continue
   fi
-  "$RM" -rf "$dir"
+  change_or_stop "removing $dir, the staging folder of an install that is gone" "$RM" -rf "$dir"
 done
 
 # Whether the plist on disk, the one launchd loads at the next login, pins
@@ -2223,7 +2326,7 @@ FAIL
   else
     # $APP is what the plist pins (the interrupted run got as far as
     # publishing it), or nothing pins either: the set-aside copy is spare.
-    "$RM" -rf "$PREVIOUS_APP"
+    change_or_stop "removing $PREVIOUS_APP" "$RM" -rf "$PREVIOUS_APP"
     echo "removed the bundle an interrupted run had set aside; $APP stays"
   fi
 fi
@@ -2251,17 +2354,23 @@ fi
 step "Installing LaunchAgent $LABEL"
 CANDIDATE_DIR="$LAUNCH_AGENTS/.$LABEL.staging"
 CANDIDATE="$CANDIDATE_DIR/$LABEL.candidate-$$.plist"
-"$MKDIR" -p "$CANDIDATE_DIR"
+change_or_stop "making $CANDIDATE_DIR" "$MKDIR" -p "$CANDIDATE_DIR"
 # Leftovers of earlier attempts, including an older build's candidates in
 # $LAUNCH_AGENTS itself (those make launchd's login load report an error).
-"$RM" -f "$CANDIDATE_DIR/$LABEL.candidate-"* "$LAUNCH_AGENTS/$LABEL.candidate-"*
+remove_candidates() {
+  "$RM" -f "$CANDIDATE_DIR/$LABEL.candidate-"* "$LAUNCH_AGENTS/$LABEL.candidate-"*
+}
+change_or_stop "removing the LaunchAgent candidates earlier attempts left" remove_candidates
 
 before="$(loaded_state)"
 
 # shellcheck disable=SC2016  # the $1/$2/$HOME/$r below are for the agent's shell, not this one
 AGENT_PROGRAM='r="$(/usr/bin/codesign --verify --strict "-R=$1" "$2" 2>&1)" && exec /bin/bash "$2/Contents/Resources/backstop.sh"; mkdir -p "$HOME/Library/Logs/Insomnia"; printf "%s [error] backstop agent: %s does not satisfy the pinned code requirement; backstop.sh not run. Reinstall Insomnia (scripts/install.sh). codesign: %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" "$(printf %s "$r" | tr "\n" " ")" >> "$HOME/Library/Logs/Insomnia/insomnia.log"; exit 1'
 xml_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
-cat > "$CANDIDATE" <<PLIST
+# Written as a change (see change), like every other file this run writes
+# under the lock.
+write_candidate() {
+  cat > "$CANDIDATE" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -2284,6 +2393,8 @@ cat > "$CANDIDATE" <<PLIST
 </dict>
 </plist>
 PLIST
+}
+change_or_stop "writing the new LaunchAgent plist $CANDIDATE" write_candidate
 # Under the recovery lock, so bounded like every other call here.
 lint_rc=0
 bounded "$PLUTIL" -lint "$CANDIDATE" || lint_rc=$?
@@ -2358,7 +2469,7 @@ if (( swapped )); then
   # A bootstrap that has not ended may still load the new job, whatever
   # print says now.
   if (( bootstrap_rc == 125 )); then after="unknown:125"; else after="$(loaded_state)"; fi
-  if (( bootstrap_rc == 0 )) && [[ "$after" == yes ]] && "$MV" -f "$CANDIDATE" "$PLIST"; then
+  if (( bootstrap_rc == 0 )) && [[ "$after" == yes ]] && change_or_stop "publishing $CANDIDATE as $PLIST" "$MV" -f "$CANDIDATE" "$PLIST"; then
     published=1
   fi
 fi
@@ -2366,7 +2477,7 @@ fi
 if (( published )); then
   echo "LaunchAgent $LABEL loaded (launchctl print confirms); $PLIST published"
   if (( set_aside )); then
-    if "$RM" -rf "$PREVIOUS_APP"; then
+    if change_or_stop "removing $PREVIOUS_APP" "$RM" -rf "$PREVIOUS_APP"; then
       echo "replaced the previous $APP"
     else
       echo "replaced the previous $APP, but its copy at $PREVIOUS_APP could not be removed; the next run of this script removes it" >&2
@@ -2375,7 +2486,7 @@ if (( published )); then
   # Installs before this layout ran a writable copy from $APP_SUPPORT. The
   # agent just loaded runs the sealed one, so that copy goes now, not before.
   if [[ -e "$APP_SUPPORT/backstop.sh" ]]; then
-    "$RM" -f "$APP_SUPPORT/backstop.sh"
+    change_or_stop "removing $APP_SUPPORT/backstop.sh" "$RM" -f "$APP_SUPPORT/backstop.sh"
     echo "removed the previous install's $APP_SUPPORT/backstop.sh (the agent now runs the copy sealed in the bundle)"
   fi
 else

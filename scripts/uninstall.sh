@@ -119,6 +119,10 @@ CALL_TIMEOUT_SECONDS=30
 # Longest backstop.sh may run in step 3 before it is sent SIGTERM (see
 # run_backstop).
 BACKSTOP_TIMEOUT_SECONDS=300
+# Longest this run waits for one removal it makes itself under the recovery
+# lock (and for its cleanup at exit) before it takes that removal for one
+# whose outcome is not known and stops; see change.
+CHANGE_TIMEOUT_SECONDS=30
 APP="$HOME/Applications/Insomnia.app"
 SUDOERS=/etc/sudoers.d/insomnia
 # Held, as root, by install.sh and uninstall.sh around each compare and
@@ -184,11 +188,6 @@ UID_NUM="$("$ID" -u)"
 ACCOUNT="$("$ID" -un)"
 
 step() { printf '\n==> %s\n' "$*"; }
-
-# Scratch space for bounded() and for the private copies of the journal the
-# checks in step 4 read: this run's own directory, emptied on exit.
-WORK="$("$MKTEMP" -d "${TMPDIR:-/tmp}/insomnia-uninstall.XXXXXX")"
-trap '"$RM" -f "$WORK"/call.* "$WORK"/notes.* "$WORK"/*.json 2>/dev/null; "$RMDIR" "$WORK" 2>/dev/null || true' EXIT
 
 # Run one external call with a time limit. Its exit status is returned, or
 # 124 when it did not finish within CALL_TIMEOUT_SECONDS and was stopped, or
@@ -694,6 +693,77 @@ take_output() { # deadline
   READ_HEAD="$head"
   return "$status"
 }
+# A change made in this shell itself (a log line, a move, a removal) has no
+# limit: on a stalled disk it can wait without end, and so hold the
+# recovery lock. change makes the command in a process of its own instead,
+# started as a supervisor is (a process substitution starts it with `&`
+# and settles it, see settle), and waits for it no longer than
+# CHANGE_TIMEOUT_SECONDS: "settled" with its exit status, then the end of
+# the pipe. It returns that status, with CHANGE_SETTLED=1; or 124, with
+# CHANGE_SETTLED=0, when that did not all come in time, and whether the
+# change took place is then not known. Nothing signals the command, since a
+# removal or a move cut short can leave files half changed. It ignores
+# SIGTERM, SIGHUP and SIGPIPE, as a supervisor does (SIGINT and SIGQUIT are
+# ignored already in a background job of a script), and keeps fd 9, so a
+# change that has not finished keeps the recovery lock until it ends, also
+# once this run has exited. Its standard input is /dev/null, and its
+# standard output goes to standard error, which it shares with this run, so
+# what it says shows where this run's own messages do. CHANGE_UNSETTLED is
+# 1 from the start of a change until the change is seen to finish, and
+# stays 1 after one that was not: the run then changes nothing more (see
+# change_or_stop and tidy). change takes fd 5, so no caller makes one while
+# it reads another pipe there.
+CHANGE_SETTLED=1
+CHANGE_UNSETTLED=0
+change() { # command args...
+  local was=$CHANGE_UNSETTLED rc=124 status form='^settled ([0-9]{1,3})$'
+  local deadline=$(( SECONDS + CHANGE_TIMEOUT_SECONDS ))
+  CHANGE_SETTLED=0
+  CHANGE_UNSETTLED=1
+  if exec 5< <(exec </dev/null; trap '' TERM HUP PIPE; "$@" >&2 & settle "$!"); then
+    if pipe_field "$deadline" && [[ "$FIELD" =~ $form ]]; then
+      status=$(( 10#${BASH_REMATCH[1]} ))
+      if pipe_ends "$deadline"; then
+        rc=$status
+        CHANGE_SETTLED=1
+        CHANGE_UNSETTLED=$was
+      fi
+    fi
+    exec 5<&-
+  fi
+  return "$rc"
+}
+# change, and the end of the run when the change was not seen to finish:
+# stop_unsettled, which each script defines, says what it was and exits 1.
+# Returns the change's status otherwise.
+change_or_stop() { # what command args...
+  local what="$1" rc=0
+  shift
+  change "$@" || rc=$?
+  (( CHANGE_SETTLED )) || stop_unsettled "$what" "$@"
+  return "$rc"
+}
+# A command with its standard error sent to /dev/null, for a change whose
+# own message is not shown (the run says what failed instead).
+quietly() { # command args...
+  "$@" 2>/dev/null
+}
+# One step of the cleanup at exit, made with change, and skipped once a
+# change has not been seen to finish (CHANGE_UNSETTLED): that one may still
+# use what the step would remove. The path of a step skipped, or not seen
+# to finish, goes to LEFT_BEHIND for the run to name. A step that fails is
+# not reported: it leaves things as a step not made would.
+LEFT_BEHIND=()
+tidy() { # path command args...
+  local path="$1"
+  shift
+  if (( ! CHANGE_UNSETTLED )); then
+    change "$@" || true
+    (( ! CHANGE_SETTLED )) || return 0
+  fi
+  LEFT_BEHIND+=("$path")
+  return 0
+}
 # Notes of reads that failed. A read made inside $(...) has to reach this
 # shell, so each note goes to a file in WORK as well, NOTES_FILE, which
 # notes_reset names afresh (notes.<n>, counted in this shell, which alone
@@ -900,6 +970,20 @@ snapshot() { # file copy
   BOUNDED_NEW_FILE="$2" bounded "$CP" -X "$1" "$2" || rc=$?
   return "$rc"
 }
+# Scratch space for bounded() and for the private copies of the journal the
+# checks in step 4 read: this run's own directory, emptied on exit as a
+# change of its own (see tidy), unless a change this run made was not seen
+# to finish.
+WORK="$("$MKTEMP" -d "${TMPDIR:-/tmp}/insomnia-uninstall.XXXXXX")"
+remove_work() {
+  "$RM" -f "$WORK"/call.* "$WORK"/notes.* "$WORK"/*.json 2>/dev/null || true
+  "$RMDIR" "$WORK" 2>/dev/null
+}
+at_exit() {
+  tidy "$WORK" remove_work
+  (( ${#LEFT_BEHIND[@]} == 0 )) || echo "Left $WORK in place, since a change this run made was not seen to finish and may still use it." >&2
+}
+trap at_exit EXIT
 notes_reset
 # How a bounded call's exit status reads in a message.
 call_result() { # status
@@ -1553,16 +1637,29 @@ collect_moved_aside_sessions() {
   return 0
 }
 
+# Ends this run after a removal it made under the recovery lock was not seen
+# to finish (see change): nothing more is removed, and the removal keeps the
+# lock until it ends. A rerun then finds what an uninstall stopped at that
+# point leaves, and goes on from there.
+stop_unsettled() { # what command args...
+  local what="$1"
+  shift
+  [[ "$1" != quietly ]] || shift
+  echo "Uninstall stopped: $what ('$*') did not finish within ${CHANGE_TIMEOUT_SECONDS}s, so whether it took place is not known. Nothing more was removed. It keeps the recovery lock until it ends, so until then the app cannot start a session. Rerun this script once it has ended." >&2
+  exit 1
+}
+
 # Removes files Insomnia wrote, one path per argument. Only a regular file
 # is removed. Anything else at one of these paths is not something Insomnia
 # wrote; it is left and named, so a stray directory never stops the run
 # halfway. A removal that fails is named and counted, and the rest go on.
+# One not seen to finish stops the run (see change_or_stop).
 remove_failures=0
 remove_owned() { # path...
   local f
   for f in "$@"; do
     if [[ -f "$f" && ! -L "$f" ]]; then
-      if ! "$RM" -f "$f"; then
+      if ! change_or_stop "removing $f" "$RM" -f "$f"; then
         echo "Could not remove $f; left in place." >&2
         remove_failures=$((remove_failures + 1))
       fi
@@ -2723,7 +2820,9 @@ if (( print_rc != 113 )); then
   echo "Nothing was removed. Run 'launchctl bootout gui/$UID_NUM $PLIST' yourself, then rerun." >&2
   exit 1
 fi
-"$RM" -f "$PLIST"
+# Each removal from here on is a change (see change), and one not seen to
+# finish stops the run (stop_unsettled).
+change_or_stop "removing the LaunchAgent plist" "$RM" -f "$PLIST"
 # Candidate plists install.sh and the app write before a load and rename
 # into place after it: in the staging directory beside the plist, and in
 # $LAUNCH_AGENTS itself for older builds. Only files with the label's
@@ -2731,9 +2830,9 @@ fi
 # goes only once empty.
 CANDIDATE_DIR="$LAUNCH_AGENTS/.$LABEL.staging"
 for candidate in "$CANDIDATE_DIR/$LABEL.candidate-"* "$LAUNCH_AGENTS/$LABEL.candidate-"*; do
-  if [[ -f "$candidate" && ! -L "$candidate" ]]; then "$RM" -f "$candidate"; fi
+  if [[ -f "$candidate" && ! -L "$candidate" ]]; then change_or_stop "removing $candidate" "$RM" -f "$candidate"; fi
 done
-if [[ -d "$CANDIDATE_DIR" && ! -L "$CANDIDATE_DIR" ]]; then "$RMDIR" "$CANDIDATE_DIR" 2>/dev/null || true; fi
+if [[ -d "$CANDIDATE_DIR" && ! -L "$CANDIDATE_DIR" ]]; then change_or_stop "removing $CANDIDATE_DIR" quietly "$RMDIR" "$CANDIDATE_DIR" || true; fi
 
 # Every sudo call here runs under the recovery lock, so each is `sudo -n`
 # (the password was asked before the lock) and bounded: one that does not
@@ -2800,7 +2899,7 @@ if (( sudoers_present )); then
 fi
 
 step "Removing app bundle"
-"$RM" -rf "$APP"
+change_or_stop "removing the app bundle" "$RM" -rf "$APP"
 # install.sh's leftovers beside the bundle, by the exact names it gives them.
 # An upgrade sets the previous bundle aside at .Insomnia.app.previous during
 # its swap and assembles the new one in .Insomnia.app.staging.<pid>.<six
@@ -2812,7 +2911,7 @@ step "Removing app bundle"
 APP_DIR="$(dirname "$APP")"
 PREVIOUS_APP="$APP_DIR/.Insomnia.app.previous"
 if [[ -d "$PREVIOUS_APP" && ! -L "$PREVIOUS_APP" ]]; then
-  "$RM" -rf "$PREVIOUS_APP"
+  change_or_stop "removing $PREVIOUS_APP" "$RM" -rf "$PREVIOUS_APP"
   echo "removed $PREVIOUS_APP, the previous bundle an interrupted install set aside"
 fi
 staging_re='^\.Insomnia\.app\.staging\.([0-9]+)\.[A-Za-z0-9]{6}$'
@@ -2824,7 +2923,7 @@ for dir in "$APP_DIR"/.Insomnia.app.staging.*; do
     echo "kept $dir: the install.sh run that made it (pid $owner) is still running"
     continue
   fi
-  "$RM" -rf "$dir"
+  change_or_stop "removing $dir" "$RM" -rf "$dir"
   echo "removed $dir, left by an install.sh run that is gone"
 done
 
@@ -2851,8 +2950,8 @@ if (( PURGE == 1 )); then
   # launched after the check above) waits on this inode. Unlinking it would
   # let the next opener create a second lock nobody else sees. A leftover
   # empty lock file and its directory are the accepted cost.
-  "$RMDIR" "$LOG_DIR" 2>/dev/null || true
-  (( OWN_LAUNCH_AGENTS_DIR == 1 )) && { "$RMDIR" "$LAUNCH_AGENTS" 2>/dev/null || true; }
+  change_or_stop "removing $LOG_DIR" quietly "$RMDIR" "$LOG_DIR" || true
+  (( OWN_LAUNCH_AGENTS_DIR == 1 )) && { change_or_stop "removing $LAUNCH_AGENTS" quietly "$RMDIR" "$LAUNCH_AGENTS" || true; }
   echo "Kept $LOCK (the recovery lock is never unlinked; delete $APP_SUPPORT by hand if you want it gone)."
   [[ -d "$LOG_DIR" ]] && echo "Kept $LOG_DIR: it still holds files Insomnia did not create."
 else

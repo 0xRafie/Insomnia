@@ -11894,7 +11894,8 @@ final class RecoveryScriptTests: XCTestCase {
     /// read back what a bounded call printed through the same text (from
     /// the comment on it to take_output) and keep the recovery lock for a
     /// privileged command that outlives its supervisor with the same keeper
-    /// (keep_lock and pid_gone), and
+    /// (keep_lock and pid_gone) and make each change of their own with a
+    /// deadline through the same text (from the comment on change to tidy), and
     /// install.sh and uninstall.sh run the backstop and every other bounded
     /// call, report a call whose output could not be read, and judge whose
     /// the rule is the same way.
@@ -11933,6 +11934,195 @@ final class RecoveryScriptTests: XCTestCase {
             XCTAssertEqual(try Self.shellFunction(name, in: install, "install.sh"), keeper, name)
             XCTAssertEqual(try Self.shellFunction(name, in: uninstall, "uninstall.sh"), keeper, name)
         }
+        func changeBlock(_ t: String, _ script: String) throws -> String {
+            let start = try XCTUnwrap(t.range(of: "# A change made in this shell itself"), script)
+            let tidy = try XCTUnwrap(t.range(of: "\ntidy() { # path command args...\n", range: start.upperBound..<t.endIndex), script)
+            let end = try XCTUnwrap(t.range(of: "\n}\n", range: tidy.upperBound..<t.endIndex), script)
+            return String(t[start.lowerBound..<end.upperBound])
+        }
+        let changes = try changeBlock(backstop, "backstop.sh")
+        for name in ["change() {", "change_or_stop() {", "quietly() {", "tidy() {"] {
+            XCTAssertTrue(changes.contains("\n\(name)"), name)
+        }
+        XCTAssertEqual(try changeBlock(install, "install.sh"), changes)
+        XCTAssertEqual(try changeBlock(uninstall, "uninstall.sh"), changes)
+    }
+
+    // MARK: - A change of a script's own that does not finish in time
+
+    /// The backstop's rename of the updated journal over state.json takes
+    /// longer than CHANGE_TIMEOUT_SECONDS. The run stops there without
+    /// signalling the mv and changes nothing more: the session stays, and
+    /// its work folder is left, since the mv may still use it. The mv keeps
+    /// the recovery lock until it ends, so a second run in the meantime
+    /// finds the lock held. Once it ends the lock is free, the journal is
+    /// the one the stopped run published, and the next run finishes.
+    func testBackstopStopsWhenItsJournalRenameDoesNotFinishInTime() throws {
+        try fx.writeBackstopCopy(extraConstants: ["CHANGE_TIMEOUT_SECONDS": "2"])
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        let dirty = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#
+        try fx.writeState(dirty)
+        try fx.hold("mv", "*/.state.json.backstop.*|\(fx.state.path)")
+        let tmp = try fx.privateTmp()
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        let log = fx.log()
+        XCTAssertTrue(log.contains("recovery stopped: publishing "), log)
+        XCTAssertTrue(log.contains("did not finish within 2s, so whether it took place is not known"), log)
+        XCTAssertTrue(log.contains("in place: a change this run made was not seen to finish"), log)
+        XCTAssertFalse(log.contains("journal cleared"), log)
+        let calls = fx.calls()
+        XCTAssertEqual(calls.first, "sudo -n \(fx.fakePmset) -a disablesleep 0", "\(calls)")
+        XCTAssertTrue(calls.contains("mv FD9-OPEN"), "the held mv has the recovery lock: \(calls)")
+        XCTAssertTrue(calls.last?.hasPrefix("mv HELD \(fx.home.path)/.state.json.backstop.") == true, "nothing after the held rename: \(calls)")
+        XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), dirty, "the rename has not happened yet")
+        XCTAssertTrue(fx.exists(fx.session), "the session goes only after the journal is published")
+        XCTAssertEqual(try fx.contents(of: tmp).filter { $0.hasPrefix("insomnia-backstop.") }.count, 1, "the work folder is left")
+        XCTAssertFalse(try fx.lockIsFree(), "the held mv keeps the recovery lock")
+        let mv = try XCTUnwrap(fx.hungPid("mv", within: 5), "\(calls)")
+        XCTAssertNil(fx.commandEnded(), "nothing signalled the mv")
+
+        let blocked = try fx.run(fx.backstop)
+        XCTAssertEqual(blocked.status, 75, "no new transaction while the mv runs: \(blocked.stderr)")
+        XCTAssertNil(fx.commandEnded())
+
+        fx.releaseCommand()
+        try assertLockHeldUntilGone(mv, within: 10)
+        XCTAssertEqual(fx.commandEnded(), "released")
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false, "the held rename took place once it was let go")
+        let after = try fx.run(fx.backstop)
+        XCTAssertEqual(after.status, 0, after.stderr + fx.log())
+        XCTAssertFalse(fx.exists(fx.session), "the next run removes the session")
+    }
+
+    /// A backstop log line that takes longer than CHANGE_TIMEOUT_SECONDS
+    /// (its date stamp is held) does not stop the undo: the run says on
+    /// standard error that the rest of it is not logged and goes on, and
+    /// its work folder goes, since nothing it uses is still in use. The
+    /// line's process keeps the recovery lock until it ends, and then
+    /// writes the line.
+    func testBackstopGoesOnUnloggedWhenALogLineDoesNotFinishInTime() throws {
+        try fx.writeBackstopCopy(extraConstants: ["CHANGE_TIMEOUT_SECONDS": "2"])
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try fx.hold("date", "log line")
+        let tmp = try fx.privateTmp()
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertTrue(r.stderr.contains("did not finish within 2s; the rest of this run is not logged"), r.stderr)
+        XCTAssertEqual(fx.calls(), [
+            "date FD9-OPEN",
+            "date HELD -u +%Y-%m-%dT%H:%M:%SZ",
+            "sudo -n \(fx.fakePmset) -a disablesleep 0",
+        ])
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try fx.contents(of: tmp).filter { $0.hasPrefix("insomnia-backstop.") }, [], "the work folder goes")
+        XCTAssertEqual(fx.log(), "", "the held line is not written yet")
+        XCTAssertFalse(try fx.lockIsFree(), "the held line keeps the recovery lock")
+        let line = try XCTUnwrap(fx.hungPid("date", within: 5))
+        XCTAssertNil(fx.commandEnded())
+
+        fx.releaseCommand()
+        try assertLockHeldUntilGone(line, within: 10)
+        XCTAssertEqual(fx.commandEnded(), "released")
+        let lines = fx.log().split(separator: "\n")
+        XCTAssertEqual(lines.count, 1, fx.log())
+        XCTAssertTrue(lines.first?.hasSuffix("restoring from journal") == true, fx.log())
+    }
+
+    /// install.sh's rename of the new LaunchAgent plist into place takes
+    /// longer than CHANGE_TIMEOUT_SECONDS. The install stops there without
+    /// signalling the mv: it removes neither the set-aside bundle nor its
+    /// own scratch files, says what it left, and the mv keeps the recovery
+    /// lock until it ends. A rerun after that installs as usual and removes
+    /// what the stopped run left.
+    func testInstallStopsWhenItsPlistRenameDoesNotFinishInTime() throws {
+        try fx.writeInstallCopies(extraConstants: ["CHANGE_TIMEOUT_SECONDS": "2"])
+        try fx.prepareInstall()
+        try fx.writePreviousApp()
+        try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("launchctl", "loaded")
+        try fx.hold("mv", "*/com.insomnia.backstop.candidate-*|\(fx.plist.path)")
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": ScriptFixture.account])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stderr.contains("Install stopped: publishing "), r.stderr)
+        XCTAssertTrue(r.stderr.contains("did not finish within 2s, so whether it took place"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Left in place, since a change this run made was not seen to finish"), r.stderr)
+        XCTAssertFalse(r.stdout.contains("replaced the previous"), r.stdout)
+        let calls = fx.calls()
+        XCTAssertTrue(calls.contains("mv FD9-OPEN"), "the held mv has the recovery lock: \(calls)")
+        XCTAssertTrue(calls.last?.hasPrefix("mv HELD ") == true && calls.last?.hasSuffix(" \(fx.plist.path)") == true,
+                      "nothing after the held rename: \(calls)")
+        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "trusted", "the rename has not happened yet")
+        let previous = fx.appsDir.appendingPathComponent(".Insomnia.app.previous", isDirectory: true)
+        XCTAssertTrue(fx.exists(previous), "the set-aside bundle is not removed")
+        XCTAssertFalse(try fx.lockIsFree(), "the held mv keeps the recovery lock")
+        let mv = try XCTUnwrap(fx.hungPid("mv", within: 5), "\(calls)")
+        XCTAssertNil(fx.commandEnded(), "nothing signalled the mv")
+        let stopped = fx.lastPid
+
+        fx.releaseCommand()
+        try assertLockHeldUntilGone(mv, within: 10)
+        XCTAssertEqual(fx.commandEnded(), "released")
+        XCTAssertEqual(try fx.plistOnDisk()["StartInterval"] as? Int, 60, "the held rename took place once it was let go")
+
+        fx.setMode("kill.fail", "\(stopped)")   // the fake kill: the stopped run is gone
+        let again = try fx.run(fx.installRedirected, extraEnvironment: ["USER": ScriptFixture.account])
+        XCTAssertEqual(again.status, 0, again.stderr + again.stdout)
+        XCTAssertEqual(try fx.installedBinaryFirstLine(), "#!/bin/bash")
+        XCTAssertEqual(try fx.contents(of: fx.appsDir), ["Insomnia.app"], "the set-aside bundle and the stopped run's staging folder are gone")
+        XCTAssertEqual(try fx.contents(of: fx.plist.deletingLastPathComponent()), ["com.insomnia.backstop.plist"])
+        XCTAssertTrue(try fx.lockIsFree())
+    }
+
+    /// uninstall.sh's removal of the app bundle takes longer than
+    /// CHANGE_TIMEOUT_SECONDS. The run stops there without signalling the
+    /// rm and removes nothing more: the journal and its work folder stay.
+    /// The rm keeps the recovery lock until it ends. A rerun after that
+    /// finishes the uninstall.
+    func testUninstallStopsWhenItsBundleRemovalDoesNotFinishInTime() throws {
+        try fx.writeUninstallCopy(extraConstants: ["RM": fx.bin.appendingPathComponent("rm").path, "CHANGE_TIMEOUT_SECONDS": "2"])
+        try fx.installMachinery()
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try fx.hold("rm", fx.app.path)
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(r.stderr.contains("Uninstall stopped: removing the app bundle ("), r.stderr)
+        XCTAssertTrue(r.stderr.contains("did not finish within 2s, so whether it took place is not known"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("in place, since a change this run made was not seen to finish"), r.stderr)
+        let calls = fx.calls()
+        XCTAssertTrue(calls.contains("sudo -n \(fx.fakePmset) -a disablesleep 0"), "\(calls)")
+        XCTAssertTrue(calls.contains("rm FD9-OPEN"), "the held rm has the recovery lock: \(calls)")
+        XCTAssertEqual(calls.last, "rm HELD \(fx.app.path)", "nothing after the held removal: \(calls)")
+        XCTAssertTrue(fx.exists(fx.app), "the held removal has not run yet")
+        XCTAssertTrue(fx.exists(fx.state), "the journal goes only after the bundle")
+        XCTAssertFalse(fx.exists(fx.plist))
+        XCTAssertFalse(fx.exists(fx.sudoers))
+        XCTAssertFalse(try fx.lockIsFree(), "the held rm keeps the recovery lock")
+        let rm = try XCTUnwrap(fx.hungPid("rm", within: 5), "\(calls)")
+        XCTAssertNil(fx.commandEnded(), "nothing signalled the rm")
+
+        fx.releaseCommand()
+        try assertLockHeldUntilGone(rm, within: 10)
+        XCTAssertEqual(fx.commandEnded(), "released")
+        XCTAssertFalse(fx.exists(fx.app), "the held removal took place once it was let go")
+
+        let again = try fx.run(fx.uninstall)
+        XCTAssertEqual(again.status, 0, again.stderr + again.stdout)
+        XCTAssertFalse(fx.exists(fx.state))
+        XCTAssertTrue(fx.exists(fx.config), "config.json survives without --purge")
+        XCTAssertTrue(try fx.lockIsFree())
     }
 
     // MARK: - A process named Insomnia whose owner cannot be read
@@ -12550,22 +12740,7 @@ private final class ScriptFixture {
 
     private func writeScriptCopies() throws {
         let src = Self.productionScripts
-        try Self.patch(try parsedScript("backstop.sh"), [
-            "PMSET": fakePmset,
-            "SUDO": bin.appendingPathComponent("sudo").path,
-            "PS": bin.appendingPathComponent("ps").path,
-            "KILL": bin.appendingPathComponent("kill").path,
-            "SYSCTL": bin.appendingPathComponent("sysctl").path,
-            "CHMOD": bin.appendingPathComponent("chmod").path,
-            "INSOMNIA_BIN": fakeInsomnia.path,
-            "INSOMNIA_INFO": appInfo.path,
-            "DEFAULTS": bin.appendingPathComponent("defaults").path,
-            "DATE": bin.appendingPathComponent("date").path,
-            "MV": bin.appendingPathComponent("mv").path,
-            "LOCK_TIMEOUT_SECONDS": "1",
-            "COMMAND_TIMEOUT_SECONDS": "1",
-            "KILL_GRACE_SECONDS": "1",
-        ]).write(to: backstop, atomically: true, encoding: .utf8)
+        try writeBackstopCopy(extraConstants: [:])
 
         try writeUninstallCopy(extraConstants: [:])
 
@@ -12584,6 +12759,29 @@ private final class ScriptFixture {
         try SharedFakes.link(shared, to: repoScripts.appendingPathComponent("build-app.sh"))
 
         try writeInstallCopies(extraConstants: [:])
+    }
+
+    /// backstop.sh: pmset, sudo, ps, kill and the other tools that change
+    /// or ask the system are fakes, and so are MV and DATE; RM and MKDIR
+    /// are the real tools. A test that needs another constant (a shorter
+    /// CHANGE_TIMEOUT_SECONDS) rewrites the copy with it.
+    func writeBackstopCopy(extraConstants: [String: String]) throws {
+        try Self.patch(try parsedScript("backstop.sh"), [
+            "PMSET": fakePmset,
+            "SUDO": bin.appendingPathComponent("sudo").path,
+            "PS": bin.appendingPathComponent("ps").path,
+            "KILL": bin.appendingPathComponent("kill").path,
+            "SYSCTL": bin.appendingPathComponent("sysctl").path,
+            "CHMOD": bin.appendingPathComponent("chmod").path,
+            "INSOMNIA_BIN": fakeInsomnia.path,
+            "INSOMNIA_INFO": appInfo.path,
+            "DEFAULTS": bin.appendingPathComponent("defaults").path,
+            "DATE": bin.appendingPathComponent("date").path,
+            "MV": bin.appendingPathComponent("mv").path,
+            "LOCK_TIMEOUT_SECONDS": "1",
+            "COMMAND_TIMEOUT_SECONDS": "1",
+            "KILL_GRACE_SECONDS": "1",
+        ].merging(extraConstants) { $1 }).write(to: backstop, atomically: true, encoding: .utf8)
     }
 
     /// uninstall.sh: every tool that changes or asks the system is a fake,
@@ -13073,8 +13271,11 @@ private final class ScriptFixture {
         // refused rename, and both paths stay as they were. A line of
         // mv.killed in the same form makes the move and then ends this mv by
         // SIGTERM, logging "mv KILLED <from> <to>": a rename done by an mv
-        // that did not live to say so.
+        // that did not live to say so. A line of mv.hold in the same form
+        // holds the move until releaseCommand and then makes it (see
+        // holdHere): a rename that takes longer than its script waits.
         try writeFake("mv", """
+        \(holdHere("mv"))
         args=(); for a in "$@"; do [[ "$a" == -* ]] || args+=("$a"); done
         from="${args[0]:-}"; to="${args[1]:-}"
         if [[ -f "\(r)/mv.fail" ]]; then
@@ -13096,6 +13297,14 @@ private final class ScriptFixture {
             fi
           done < "\(r)/mv.killed"
         fi
+        if [[ -f "\(r)/mv.hold" && ! -e "\(r)/mv.hung.pid" ]]; then
+          while IFS='|' read -r f t || [[ -n "$f" ]]; do
+            if [[ -n "$f" && "$from" == $f && "$to" == $t ]]; then
+              hold_here "$from $to"
+              break
+            fi
+          done < "\(r)/mv.hold"
+        fi
         exec /bin/mv "$@"
         """)
         // rm, rmdir, mktemp, mkdir: install.sh's RM, RMDIR, MKTEMP and MKDIR.
@@ -13103,9 +13312,22 @@ private final class ScriptFixture {
         // tell a file removed or created through the fixed-path variable from
         // one handled by a bare name. (Its CHMOD is the chmod fake below.)
         // An rm of a path that matches the bash glob in rm.killed removes it
-        // and then ends by SIGTERM, logging "rm KILLED <path>".
+        // and then ends by SIGTERM, logging "rm KILLED <path>". One of a
+        // path that matches the glob in rm.hold waits for releaseCommand
+        // first (see holdHere). uninstall.sh's RM is the real rm unless a
+        // test patches in this one.
         for (tool, real) in [("rm", "/bin/rm"), ("rmdir", "/bin/rmdir"), ("mktemp", "/usr/bin/mktemp"), ("mkdir", "/bin/mkdir")] {
             let killed = tool != "rm" ? "" : """
+            \(holdHere("rm"))
+            if [[ -f "\(r)/rm.hold" && ! -e "\(r)/rm.hung.pid" ]]; then
+              IFS= read -r pattern < "\(r)/rm.hold" || true
+              for a in "$@"; do
+                if [[ -n "$pattern" && "$a" != -* && "$a" == $pattern ]]; then
+                  hold_here "$a"
+                  break
+                fi
+              done
+            fi
             if [[ -f "\(r)/rm.killed" ]]; then
               IFS= read -r pattern < "\(r)/rm.killed" || true
               for a in "$@"; do
@@ -13544,10 +13766,16 @@ private final class ScriptFixture {
         // date: the real tool, except that with date.mode present the stamp
         // a moved-aside session.json is named after (`-u +%Y%m%dT%H%M%SZ`)
         // is the mode's text, so a test can take that exact name first.
-        // Not logged: it changes nothing.
+        // Not logged: it changes nothing. With date.hold present the stamp
+        // of a backstop log line (`-u +%Y-%m-%dT%H:%M:%SZ`) waits for
+        // releaseCommand first (see holdHere), the way a log line stalls.
         try writeFake("date", """
+        \(holdHere("date"))
         if [[ "$*" == "-u +%Y%m%dT%H%M%SZ" && -f "\(r)/date.mode" ]]; then
           cat "\(r)/date.mode"; echo; exit 0
+        fi
+        if [[ "$*" == "-u +%Y-%m-%dT%H:%M:%SZ" && -f "\(r)/date.hold" && ! -e "\(r)/date.hung.pid" ]]; then
+          hold_here "$*"
         fi
         exec /bin/date "$@"
         """)
@@ -13900,6 +14128,14 @@ private final class ScriptFixture {
         try? value.write(to: root.appendingPathComponent("\(name).mode"), atomically: true, encoding: .utf8)
     }
 
+    /// Holds the first change the fake `tool` makes that `pattern`
+    /// matches until releaseCommand (see holdHere): for mv a
+    /// "<from>|<to>" pair of bash globs, for rm one glob for a path, for
+    /// date any text (it holds the stamp of a backstop log line).
+    func hold(_ tool: String, _ pattern: String) throws {
+        try "\(pattern)\n".write(to: root.appendingPathComponent("\(tool).hold"), atomically: true, encoding: .utf8)
+    }
+
     /// Makes one bounded call end without a status: the fake call whose
     /// "<name> <arguments>" matches the bash glob `pattern`, once `skip`
     /// such calls have gone by, SIGKILLs its supervisor, logs "<name>
@@ -13980,6 +14216,29 @@ private final class ScriptFixture {
           echo $$ > "\(root.path)/\(tool).hung.pid"
           trap '' TERM
           exec /bin/sleep 60
+        }
+        """
+    }
+
+    /// Shell function for a fake: `hold_here <what>` holds a change the
+    /// fake is about to make until the test calls releaseCommand (or the
+    /// fixture goes, or a 60 s watchdog), then returns so the fake makes
+    /// it. It notes an inherited fd 9 as "<tool> FD9-OPEN", logs "<tool>
+    /// HELD <what>", records its pid in `<tool>.hung.pid` once the
+    /// watchdog's deadline is in place, and writes command.ended, as
+    /// hang_on_term does. It holds once per fixture: a fake that finds
+    /// `<tool>.hung.pid` already there makes its change at once. Like
+    /// hang_on_term, its wait reads SECONDS and runs no `$(...)`.
+    func holdHere(_ tool: String) -> String {
+        """
+        hold_here() {
+          if { : >&9; } 2>/dev/null; then echo '\(tool) FD9-OPEN' >> "\(callsLog.path)"; fi
+          echo "\(tool) HELD $1" >> "\(callsLog.path)"
+          deadline=$(( SECONDS + 60 ))
+          echo $$ > "\(root.path)/\(tool).hung.pid"
+          while [[ ! -e "\(root.path)/release" && -d "\(root.path)" ]] && (( SECONDS < deadline )); do /bin/sleep 0.1; done
+          if [[ -e "\(root.path)/release" ]]; then echo released > "\(root.path)/command.ended"
+          elif [[ -d "\(root.path)" ]]; then echo watchdog > "\(root.path)/command.ended"; fi
         }
         """
     }
