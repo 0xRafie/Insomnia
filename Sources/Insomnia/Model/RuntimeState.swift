@@ -223,9 +223,12 @@ struct RuntimeState: Codable, Equatable, Sendable {
     /// undo: it counts neither as dirty nor as an undo entry, backstop.sh
     /// keeps it as it is, and the app clears it when it removes
     /// session.json. A value the app does not write decodes as nil here
-    /// (`decodeSessionCutoffs`), so the app records its own over it; the
-    /// agent's reader answers `foreign` for it and enforces the strictest
-    /// cutoffs.
+    /// (`decodeSessionCutoffs`), so the app records its own over it. The
+    /// agent's reader answers `foreign` for it, and backstop.sh counts that
+    /// as no record, as the app reads it: the app's defaults while
+    /// config.json is missing, cannot be read or is rejected, and the
+    /// strictest cutoffs only while config.json is there and read neither by
+    /// the app's binary nor by backstop.sh.
     var sessionCutoffs: AgentCutoffs? = nil
 
     /// Bare pids of every journaled freeze, for display and de-duplication.

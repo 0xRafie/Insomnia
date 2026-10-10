@@ -20,6 +20,8 @@ final class LogEndRecordTests: XCTestCase {
     var h: Harness!
     var agent: PatchedBackstop!
     let acls = OwnedACLs()
+    /// Settled before the home goes, also when the test stopped early.
+    var logWriters: PatchedBackstop.LogWriters?
 
     override func setUp() async throws {
         h = Harness()
@@ -28,6 +30,9 @@ final class LogEndRecordTests: XCTestCase {
     }
 
     override func tearDown() async throws {
+        if let logWriters {
+            do { try await logWriters.settle() } catch { XCTFail("\(error)") }
+        }
         Store.lockRecordWriteLimitForTesting = nil
         acls.removeGiven()
         unpinAll()
@@ -413,7 +418,7 @@ final class LogEndRecordTests: XCTestCase {
         let alive = AppAliveLock(url: h.home.paths.appAliveFile)
         XCTAssertTrue(try alive.tryAcquire())
         defer { alive.release() }
-        agent.clearCalls()
+        try agent.clearCalls()
         try await runAgent(expecting: 1)
         XCTAssertTrue(logText().contains("already ended (recorded in \(rotatedLog.path))"), logText())
         XCTAssertFalse(agent.calls.contains("pmset -g batt"))
@@ -560,7 +565,7 @@ final class LogEndRecordTests: XCTestCase {
         let alive = AppAliveLock(url: h.home.paths.appAliveFile)
         XCTAssertTrue(try alive.tryAcquire())
         defer { alive.release() }
-        agent.clearCalls()
+        try agent.clearCalls()
         try await runAgent(expecting: 1)
         XCTAssertTrue(logText().contains("already ended (recorded in \(logFile.path))"), logText())
         XCTAssertFalse(agent.calls.contains("pmset -g batt"))
@@ -575,7 +580,7 @@ final class LogEndRecordTests: XCTestCase {
         XCTAssertFalse(sleepHeldAgain(since: before), "\(h.guardFake.calls)")
         XCTAssertTrue(logText().contains(endedInLogLine()), logText())
         XCTAssertNil(try h.store.loadSession())
-        agent.clearCalls()
+        try agent.clearCalls()
         try await runAgent(expecting: 0)
         XCTAssertFalse(agent.calls.contains(agent.restoreCall), "nothing left to restore: \(agent.calls)")
     }
@@ -795,7 +800,7 @@ final class LogEndRecordTests: XCTestCase {
         XCTAssertEqual(count(record, in: logFile), 1)
         XCTAssertEqual(h.store.sessionEndRecordedInLog(), "insomnia.log")
 
-        agent.clearCalls()
+        try agent.clearCalls()
         try await runAgent(expecting: 1)
         XCTAssertFalse(agent.calls.contains("pmset -g batt"), "still ended for the next run")
         XCTAssertEqual(count(record, in: logFile), 1, "used again, not appended again")
@@ -838,10 +843,13 @@ final class LogEndRecordTests: XCTestCase {
         let record = line(of: try sessionBytes())
         try agent.refuseRecordsAside()
         try agent.refuseLockRecord()
-        try agent.holdTheLogAtEveryRecordCheck(log: logFile)
+        let writers = try agent.holdTheLogAtEveryRecordCheck(log: logFile)
+        logWriters = writers
 
         try await runAgent(expecting: 1)
-        try await waitUntilNoWriterHoldsTheLog()
+        let statuses = try await writers.settle()
+        XCTAssertGreaterThanOrEqual(statuses.count, 2)
+        XCTAssertEqual(Set(statuses), [0], "each writer took the lock and let go")
 
         let recorded = "its end is recorded in the log file \(logFile.path) instead"
         XCTAssertTrue(logText().contains("held short\n\(record)\nheld short\n"), logText())
@@ -885,25 +893,12 @@ final class LogEndRecordTests: XCTestCase {
         XCTAssertTrue(lines.contains { $0.contains("the recovery lock file \(lockFile.path), or the log file \(logFile.path). Sleep is restored anyway") }, agent.lastStderr)
 
         holder.release()
-        agent.clearCalls()
+        try agent.clearCalls()
         try await runAgent(expecting: 1)
         XCTAssertTrue(logText().hasPrefix(before + "\n"), "the line cut short stays as it was: \(logText())")
         XCTAssertEqual(count(record, in: logFile), 1)
         XCTAssertTrue(logText().contains("its end is recorded in the log file \(logFile.path) instead"), logText())
         XCTAssertEqual(h.store.sessionEndRecordedInLog(), "insomnia.log")
-    }
-
-    /// Waits, at most 10 s, until no writer holds the log's lock, so every
-    /// writer a fake started has let go.
-    private func waitUntilNoWriterHoldsTheLog() async throws {
-        let fd = open(logFile.path, O_RDONLY | O_CLOEXEC)
-        guard fd >= 0 else { return XCTFail("could not open \(logFile.path)") }
-        defer { close(fd) }
-        for _ in 0..<500 {
-            if flock(fd, LOCK_EX | LOCK_NB) == 0 { return }
-            try await Task.sleep(for: .milliseconds(20))
-        }
-        XCTFail("another writer still holds \(logFile.path) after 10 s")
     }
 
     // MARK: Other sessions and ordinary ends

@@ -295,7 +295,7 @@ final class CutoffAgreementTests: XCTestCase {
     /// it. Ends a session the agent kept, so a test can run several texts.
     private func assertBothRead(_ text: String, as expected: AgentCutoffs, battery: Int = 25, critical: Bool = false, end: Bool,
                                 file: StaticString = #filePath, line: UInt = #line) async throws {
-        agent.clearCalls()
+        try agent.clearCalls()
         let bytes = Data(text.utf8)
         try bytes.write(to: h.home.paths.configFile)
         XCTAssertEqual(try h.store.loadConfig()?.agentCutoffs, expected, "the app's decoder on \(text)", file: file, line: line)
@@ -1169,7 +1169,7 @@ final class CutoffAgreementTests: XCTestCase {
         return PolicyCase(run: run, label: label, journal: journal, ends: ends, logs: why + logs, record: record ?? nil)
     }
 
-    /// Runs the cases, at most eight at a time, and checks each: the exit
+    /// Runs the cases, at most sixteen at a time, and checks each: the exit
     /// status, whether session.json is gone, that sleep is restored only
     /// with it and only when the journal holds the sleep hold, that the
     /// record the app reads in a journal it loads is the one there before
@@ -1373,7 +1373,7 @@ final class CutoffAgreementTests: XCTestCase {
             (oversized, "it holds more than \(AgentCutoffsCommand.maxInputBytes) bytes, which is not read here", [tooLarge] + binaryBreaks),
             (stopping, "on which the app's decoder stops the app", [stops, binaryBreaks[0]]),
         ]
-        let strictest = "nothing on disk says which cutoffs the app enforces, so enforcing the strictest, a 95% end floor and thermal rules on"
+        let strictest = "the cutoffs the app enforces are not known here, so enforcing the strictest, a 95% end floor and thermal rules on"
         var cases: [PolicyCase] = []
         for (n, config) in configs.enumerated() {
             for (b, breakIt) in config.breaks.enumerated() {
@@ -1662,14 +1662,15 @@ struct SeparateRun {
         }
     }
 
-    /// Runs each agent once, at most `width` at a time, then lets go of
-    /// each alive lock. Returns, in order, each exit status and whether the
-    /// run removed session.json.
-    static func runAll(_ runs: [SeparateRun], width: Int = 8) async throws -> [(status: Int32, ended: Bool)] {
+    /// Runs each agent once, at most `width` at a time (PatchedBackstop's
+    /// runAll), then lets go of each alive lock, also when that throws.
+    /// Returns, in order, each exit status and whether the run removed
+    /// session.json.
+    static func runAll(_ runs: [SeparateRun], width: Int = 16) async throws -> [(status: Int32, ended: Bool)] {
+        defer { runs.forEach { $0.alive.release() } }
         let statuses = try await PatchedBackstop.runAll(runs.map(\.agent), width: width)
         return try zip(runs, statuses).map { run, status in
-            run.alive.release()
-            return (status, try Store(paths: run.paths).loadSession() == nil)
+            (status, try Store(paths: run.paths).loadSession() == nil)
         }
     }
 }

@@ -133,7 +133,7 @@ final class LockEndRecordTests: XCTestCase {
         let alive = AppAliveLock(url: h.home.paths.appAliveFile)
         XCTAssertTrue(try alive.tryAcquire())
         defer { alive.release() }
-        agent.clearCalls()
+        try agent.clearCalls()
         let mark = logText().count
         let status = try await agent.run()
         return (status, logText(since: mark))
@@ -843,7 +843,7 @@ final class LockEndRecordTests: XCTestCase {
         let alive = AppAliveLock(url: h.home.paths.appAliveFile)
         XCTAssertTrue(try alive.tryAcquire())
         defer { alive.release() }
-        agent.clearCalls()
+        try agent.clearCalls()
         try await runAgent(expecting: 1)
         XCTAssertTrue(logText().contains("already ended (recorded in \(lockFile.path), which it could not be read, so it may hold this session's end and counts as one)"), logText())
         XCTAssertFalse(agent.calls.contains("pmset -g batt"))
@@ -1102,7 +1102,7 @@ final class LockEndRecordTests: XCTestCase {
         XCTAssertEqual(lockBytes(), Data(), "the resume empties it")
         try writeInPlace(cut, to: lockFile)
 
-        agent.clearCalls()
+        try agent.clearCalls()
         try await runAgent(expecting: 0)
         XCTAssertNotNil(try h.store.loadSession())
         XCTAssertTrue(agent.calls.contains("pmset -g batt"))
@@ -1427,7 +1427,7 @@ final class LockEndRecordTests: XCTestCase {
         try h.store.deleteSession()
         XCTAssertEqual(lockBytes(), cut)
         XCTAssertNil(h.store.sessionEndRecordedInLock(), "nothing to end without session.json")
-        agent.clearCalls()
+        try agent.clearCalls()
         try await runAgent(expecting: 0)
         XCTAssertTrue(logText().contains("emptying \(lockFile.path): it holds bytes other than one whole end record, which ends no session"), logText())
         XCTAssertEqual(lockBytes(), Data())
@@ -1442,7 +1442,7 @@ final class LockEndRecordTests: XCTestCase {
         try writeInPlace(unread, to: lockFile)
         try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: h.home.paths.sessionFile.path)
         var mark = logText().count
-        agent.clearCalls()
+        try agent.clearCalls()
         try await runAgent(expecting: 0)
         XCTAssertTrue(logText(since: mark).contains("session.json cannot be read"), logText(since: mark))
         XCTAssertFalse(logText(since: mark).contains("emptying \(lockFile.path)"), logText(since: mark))

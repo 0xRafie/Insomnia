@@ -474,9 +474,12 @@ symlink to nothing, which the app reads as no journal. With `config.json`
 missing or rejected, none gives the app's defaults (10%, on). With
 `config.json` there but read neither by the binary nor by the agent, none gives
 the strictest values, a 95% end floor with the thermal rule on, and a log line
-says why. Nothing on disk then says which values the app enforces, so the agent
-can end a session on battery below 95%, or at critical heat with the thermal
-rule off, that the app would keep. A running app that answers writes its record
+says why. The values the app enforces are not known to the agent then, though
+they may be on disk: a valid `config.json` over 8 MiB, or one the reader does
+not finish within 30 seconds, still holds the values the app takes from it. A
+file on which Foundation stops the app is not a decode; the app never loads it.
+So the agent can end a session on battery below 95%, or at critical heat with
+the thermal rule off, that the app would keep. A running app that answers writes its record
 within a second, so these cases need an app that has stopped answering. The
 defaults and the 95% values here are stopgaps no one has approved; spec section
 6 lists them as open. Before it reads them, or ends a session, the agent checks
@@ -487,16 +490,18 @@ parts do not load as the app loads them, or the check cannot tell what the app
 makes of them (an Int64 on which Foundation stops the app, text it does not
 finish reading within 30 seconds), the agent keeps the session, changes
 nothing and logs why, until the app or a person fixes the file; the first run
-after the fix ends the session if it is over. The check also refuses two kinds
-of text the app loads but never writes: a string the app reads that holds
-`\u0000` and is longer than 1024 bytes, and `\u0000` in a journal that also
-holds U+E000 (spec section 6). A running app rewrites the journal in its own
-form the next time it writes it, but with the app crashed or hung, such a
-journal keeps the session and its sleep hold, past the deadline too, until
-someone fixes the file. A journal the agent edits is published only when the
-edited copy loads as the app loads it and holds every `Float` the app decodes
-bit for bit as before, with each `\u0000` written back; otherwise the agent
-keeps the old journal, with what it still has to undo, and exits 1. Each
+after the fix ends the session if it is over. A string the app reads that
+holds `\u0000`, which `plutil` cannot hold, is read through a placeholder that
+no string of the journal holds, whatever its length and whatever else the
+journal holds; when no placeholder can be had (the system's `grep` fails), the
+check refuses the journal as not known (spec section 6). A running app
+rewrites the journal in its own form the next time it writes it, but with the
+app crashed or hung, a journal the check refuses keeps the session and its
+sleep hold, past the deadline too, until someone fixes the file. A journal
+the agent edits is published only when the edited copy loads as the app loads
+it, holds every `Float` the app decodes bit for bit as before, and has the
+text of each string that holds `\u0000` back once, where it was; otherwise
+the agent keeps the old journal, with what it still has to undo, and exits 1. Each
 early end is logged with its reason, and the saved session is deleted before
 the restore starts. A restore that cannot finish leaves entries in the journal
 for the next run and the app. If the saved session cannot be deleted, its end

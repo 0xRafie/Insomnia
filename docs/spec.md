@@ -770,13 +770,18 @@ counts as a record the app does not write. A NUL byte in text the app
 skips, which `plutil` does not read, is left out of the view; one in a
 string the app reads or between values is refused, as the app refuses it.
 A string the app reads that holds `\u0000`, which `plutil` cannot hold, is
-held in the view with U+E000 for each `\u0000`, and each journal published
-from the view has them written back as `\u0000`. The check refuses some
-text the app's decoder reads, none of which the app writes: such a string
-longer than 1024 bytes, `\u0000` in a journal that also holds U+E000 (raw
-or as an escape), which the view could not tell from a mark, and text the
-check does not finish reading within 30 s (an object with very many keys or
-a very long array can take that long). It cannot tell what the app makes of
+held in the view as a placeholder string, `insomnia-held-<k>-<n>`, and each
+journal published from the view has each placeholder written back as its
+string's own text, byte for byte, whatever its length. k is one more than
+the greatest k any text of the journal holds in that form, its letters,
+digits and dashes written as such or as `\u` escapes, so no string of the
+journal's reads as a placeholder; U+E000 and every other text stay as they
+are. A frozen process's `bootSession` the app does not read, which the
+scripts compare, gets one too. Where no placeholder can be had (`grep`
+fails), the check refuses the journal as not known. The check also refuses
+text the app's decoder reads that it does not finish reading within 30 s
+(an object with very many keys or a very long array can take that long);
+the app never writes such text. It cannot tell what the app makes of
 an Int64 on which Foundation stops the app (a precondition in its `Decimal`
 parse): the app neither loads nor rejects that journal, it stops, and the
 check refuses it as not known. It refuses UTF-32LE with a byte order mark,
@@ -793,8 +798,14 @@ Before an edited copy is renamed over `state.json`
 (`journal_candidate_ok`), the check reads it as it reads the journal: it
 must load as the app loads it, hold every `Float` the app decodes, where it
 is and bit for bit, as the journal it was copied from, and, where the view
-wrote U+E000 for `\u0000`, hold `\u0000` there and no U+E000. Strings,
-whole numbers and bools `plutil` writes back as they were. A copy that
+holds placeholders, have each written back as its string's own text: once,
+as a value where its string was in the app's terms
+(`frozenProcesses[].bootSession`), and never for a string the edit took out
+with its entry or value. A placeholder is matched by its number, not its
+index, so an entry keeps its strings when the entries before it go; an edit
+that moved a placeholder to another entry of the same array would pass, and
+no edit the backstop makes does that. Strings, whole numbers and bools
+`plutil` writes back as they were. A copy that
 fails is not published: the run keeps the old journal, with every entry it
 still has to undo, and exits 1. While a refused journal stays, a valid
 session keeps sleep held unless the app ends it, and nothing is undone,
@@ -846,8 +857,13 @@ end floor with thermal rules on (`Config.agentDefaultCutoffs`), which the
 app enforces while the file is missing and it has recorded nothing
 (section 10). While `config.json` is there but neither the binary nor the
 backstop can read it, none gives the strictest values, a 95% end floor with
-thermal rules on, and a log line naming the cause. Nothing on disk then
-says which cutoffs the app enforces: that fallback ends a session on
+thermal rules on, and a log line naming the cause. The cutoffs the app
+enforces are not known to the backstop then, though they may be on disk:
+a valid `config.json` over 8 MiB, or one the reader does not finish within
+30 s, still holds the cutoffs the app takes from it, which no reader here
+gets. A file on which Foundation stops the app is not decoded at all (the
+app never loads it), and a missing file and one the app rejects are the
+cases above, not this one. That fallback ends a session on
 battery power below 95% and ends one at critical heat even with the
 thermal rule off, where the app may keep it, and the defaults can keep a
 session the app, holding stricter settings in memory, would end. The app

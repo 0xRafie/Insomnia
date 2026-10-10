@@ -1005,12 +1005,17 @@ final class BlockingKeychain: KeychainStoring, @unchecked Sendable {
 /// something does, open(2) blocks until a writer appears; the watchdog opens
 /// the FIFO for writing once a second, which lets a blocked reader through
 /// (it reads EOF) and records that a reader was there. A regression then
-/// fails its test instead of hanging the suite.
+/// fails its test instead of hanging the suite. `stop` returns only once
+/// the watchdog's thread has returned, so nothing opens the path after it.
 final class FIFOWatch: @unchecked Sendable {
     let url: URL
     private let lock = NSLock()
-    private var stopped = false
     private var seen = false
+    /// Signalled by `stop`; ends the watchdog's wait between checks early.
+    private let stopSignal = DispatchSemaphore(value: 0)
+    /// Signalled once when the watchdog's thread returns. Each `stop` takes
+    /// it and puts it back, so every call returns.
+    private let finished = DispatchSemaphore(value: 0)
 
     init(at url: URL) throws {
         self.url = url
@@ -1019,9 +1024,10 @@ final class FIFOWatch: @unchecked Sendable {
         }
         let path = url.path
         Thread.detachNewThread { [self] in
+            defer { self.finished.signal() }
             for _ in 0..<120 {
-                Thread.sleep(forTimeInterval: 1)
-                if self.isStopped { return }
+                // A second between checks, as before, unless stopped first.
+                if self.stopSignal.wait(timeout: .now() + 1) == .success { return }
                 // Succeeds only while a reader has the FIFO open.
                 let fd = open(path, O_WRONLY | O_NONBLOCK)
                 if fd >= 0 {
@@ -1041,9 +1047,14 @@ final class FIFOWatch: @unchecked Sendable {
         return lstat(url.path, &info) == 0 && info.st_mode & S_IFMT == S_IFIFO
     }
 
-    func stop() { lock.lock(); stopped = true; lock.unlock() }
+    /// Stops the watchdog and returns once its thread has returned: at
+    /// most the open and close of a check under way, never a second's wait.
+    func stop() {
+        stopSignal.signal()
+        finished.wait()
+        finished.signal()
+    }
 
-    private var isStopped: Bool { lock.lock(); defer { lock.unlock() }; return stopped }
     private func markSeen() { lock.lock(); seen = true; lock.unlock() }
 }
 
@@ -1146,5 +1157,58 @@ enum BuiltApp {
         <plist version="1.0"><dict><key>CFBundleExecutable</key><string>Insomnia</string>\(frozen)\(cutoffs)</dict></plist>
 
         """
+    }
+}
+
+/// The scripts in this checkout's scripts/ folder, as the tests that patch
+/// a copy of one read them. Each read takes the file's bytes from disk
+/// again. The lines split from them, and which lines set each constant,
+/// are kept and reused only while those bytes are the ones they came from,
+/// so a script changed on disk is split anew and never read stale.
+final class ScriptSource: @unchecked Sendable {
+    static let shared = ScriptSource()
+
+    static var folder: URL {
+        // .../Tests/InsomniaTests/TestSupport.swift -> .../scripts
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("scripts", isDirectory: true)
+    }
+
+    struct NotUTF8: Error, CustomStringConvertible {
+        let name: String
+        var description: String { "scripts/\(name) is not UTF-8" }
+    }
+
+    private struct Kept {
+        let bytes: Data
+        let lines: [String]
+        var hits: [String: [Int]] = [:]
+    }
+
+    private let lock = NSLock()
+    private var kept: [String: Kept] = [:]
+
+    /// The lines of scripts/`name`, and for each of `constants` the indices
+    /// of the lines that set it (those that start with `NAME=`).
+    func lines(_ name: String, setting constants: [String]) throws -> (lines: [String], hits: [String: [Int]]) {
+        let bytes = try Data(contentsOf: Self.folder.appendingPathComponent(name))
+        lock.lock()
+        defer { lock.unlock() }
+        var entry: Kept
+        if let old = kept[name], old.bytes == bytes {
+            entry = old
+        } else {
+            guard let text = String(data: bytes, encoding: .utf8) else { throw NotUTF8(name: name) }
+            entry = Kept(bytes: bytes, lines: text.components(separatedBy: "\n"))
+        }
+        var hits: [String: [Int]] = [:]
+        for constant in constants {
+            let found = entry.hits[constant] ?? entry.lines.indices.filter { entry.lines[$0].hasPrefix("\(constant)=") }
+            entry.hits[constant] = found
+            hits[constant] = found
+        }
+        kept[name] = entry
+        return (entry.lines, hits)
     }
 }

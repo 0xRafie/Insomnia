@@ -55,11 +55,16 @@ file otherwise than the app (a later copy of a key, an escaped key, such a
 number, UTF-16 or UTF-32), the scripts read and edit a view of the journal
 as the app reads it, which drops what the app's own save drops. An escape
 JSON does not have, a value that is no JSON value and text the app's
-decoder refuses (JSON5 keys, comments) are refused. So are two forms the
-app loads but never writes, a NUL byte and `\u0000` in a string the app
-reads, and text the reader does not finish within 30 s (very many keys or
-a very long array). Any of these makes the journal malformed, so nothing
-is undone and uninstall removes nothing. Values are checked only where the
+decoder refuses (JSON5 keys, comments) are refused, and so is a NUL byte
+in a string the app reads, as the app refuses it; one in text the app
+skips is left out of the view. A `\u0000` escape in a string the app
+reads, which plutil cannot hold, is held in the view as a placeholder no
+string of the journal holds (json_held_token), and every journal
+published from the view must have that string's own text back once, where
+it was, or it is not published. Refused too: a journal for which no
+placeholder can be had (grep fails), and text the reader does not finish
+within 30 s (very many keys or a very long array). Any refusal makes the
+journal malformed, so nothing is undone and uninstall removes nothing. Values are checked only where the
 app reads them: in a frozen process, `startedAtMicros` only after a
 `startedAt` that is there and not null, and `bootSession` only after both,
 as `FrozenProcess` decodes them. A `sessionCutoffs` the app reads as no

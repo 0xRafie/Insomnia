@@ -258,7 +258,6 @@ BASE64=/usr/bin/base64
 STAT=/usr/bin/stat
 CAT=/bin/cat
 GREP=/usr/bin/grep
-SED=/usr/bin/sed
 HEAD=/usr/bin/head
 TAIL=/usr/bin/tail
 TR=/usr/bin/tr
@@ -1337,23 +1336,42 @@ json_string_check() { # text between the quotes
   return 0
 }
 
-# For record_text_problems: the text $1 of a string the app reads that
-# holds \u0000 (json_string_check), which plutil cannot hold, as the view
-# writes it, in marked: each \u0000 as \uE000, U+E000, a character of
-# Unicode's private use area, which every journal published from the view
-# writes back as \u0000 (journal_candidate_ok in backstop.sh). A journal
-# that also holds U+E000 itself is not read (record_text_problems).
-# Non-zero without a view, and for a string longer than 1024 bytes, as a
-# pattern substitution in bash takes time that grows with the square of
-# the length.
-json_nul_mark() { # text between the quotes
-  local t c=$'\002'
-  [[ -n "$view" ]] && (( ${#1} <= 1024 )) || return 1
-  # Each \\ first, so that no \u0000 is read across one; the text holds no
-  # control character.
-  t="${1//\\\\/$c}"
-  t="${t//\\u0000/\\uE000}"
-  marked="${t//$c/\\\\}"
+# For json_held_token: held_prefix, the start of every placeholder the
+# view holds for a string that holds \u0000: insomnia-held-<k>-, k one more
+# than the greatest k any string of the text, read as the app reads it,
+# holds such a prefix with (0 when none does). A string holds one only where
+# the text writes each of its letters, digits and dashes as such or as a \u
+# escape; grep(1) finds every place it does in all of the text (pieces) in
+# one pass. A k written with a leading zero, or of more than 18 digits, is
+# none that can be chosen. Non-zero when grep fails.
+json_held_prefix() {
+  local hp k line found rc=0 top=-1
+  hp='(i|\\u0069)(n|\\u006[eE])(s|\\u0073)(o|\\u006[fF])(m|\\u006[dD])(n|\\u006[eE])(i|\\u0069)(a|\\u0061)(-|\\u002[dD])(h|\\u0068)(e|\\u0065)(l|\\u006[cC])(d|\\u0064)(-|\\u002[dD])(([0-9]|\\u003[0-9])+)(-|\\u002[dD])'
+  found="$(printf '%s' ${pieces[@]+"${pieces[@]}"} | LC_ALL=C "$GREP" -a -o -E -e "$hp" 2> /dev/null)" || rc=$?
+  (( rc <= 1 )) || return 1
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^$hp$ ]] && (( ${#BASH_REMATCH[15]} <= 108 )); then
+      k="${BASH_REMATCH[15]//\\u003/}"
+      if [[ "$k" =~ ^(0|[1-9][0-9]{0,17})$ ]] && (( 10#$k > top )); then top=$((10#$k)); fi
+    fi
+  done <<< "$found"
+  held_prefix="insomnia-held-$((top + 1))-"
+  return 0
+}
+
+# For record_text_problems: the view's text, in emit, for a string the app
+# reads at vpath that holds \u0000 (json_string_check), which plutil cannot
+# hold: a placeholder string, held_prefix (json_held_prefix) and how many
+# placeholders came before it. It also prints "held: <placeholder> <vpath>
+# <vshown> <text>", the text being $1, the string's own between the
+# quotes, of any length; every journal published from the view has each
+# placeholder put back as that text (journal_candidate_ok in backstop.sh).
+# Non-zero when no placeholder can be had (json_held_prefix).
+json_held_token() { # text between the quotes
+  [[ -n "$held_prefix" ]] || json_held_prefix || return 1
+  emit="\"$held_prefix$held_next\""
+  printf 'held: %s %s %s %s\n' "$held_prefix$held_next" "$vpath" "$vshown" "$1"
+  held_next=$((held_next + 1))
   return 0
 }
 
@@ -1428,14 +1446,24 @@ json_window_trim() {
 #     than the app, and how the view (below) holds it: a key the app reads
 #     there twice, or written with an escape; a whole number written with a
 #     fraction or an exponent; UTF-16 or UTF-32; a bootSession the app
-#     does not read that plutil would not read either, left out; a number where the app reads a Float that plutil would
-#     write back as text the app reads as another Float (json_float); a NUL
-#     byte in text the app skips, which plutil does not read, left out; a
-#     string the app reads that holds \u0000, which plutil cannot hold,
-#     written with U+E000 for it (json_nul_mark).
+#     does not read that it would not read as a string either, left out; a
+#     number where the app reads a Float that plutil would write back as
+#     text the app reads as another Float (json_float); a NUL byte in text
+#     the app skips, which plutil does not read, left out; a string the app
+#     reads that holds \u0000, which plutil cannot hold, held as a
+#     placeholder (json_held_token), a frozen process's bootSession too
+#     where the app does not read it.
+#   - "held: " (state.json with $3 only): each such placeholder, where it
+#     is and the string's text it stands for (json_held_token).
 #   - "float: " (state.json with floats as $4): each Float the app decodes,
 #     where it is and its bit pattern, which journal_candidate_ok in
 #     backstop.sh compares with those of the journal it edited.
+#   - with restore as $5, the text being a copy of the view that plutil
+#     edited: any line about a placeholder of the journal's (HELD_PREFIX,
+#     the arrays held_paths, held_shown and held_raws for each, held_gone
+#     for those the edit took out) that is not, once, where its string was
+#     in the journal's terms, or that the edit took out, or about one the
+#     edit did not take out that is not there.
 #   - "record: " (state.json): sessionCutoffs is a value the app reads as no
 #     record (RuntimeState.decodeSessionCutoffs): an object, an array, a
 #     number, a bool, or a string its decoder does not read. The journal
@@ -1455,14 +1483,13 @@ json_window_trim() {
 #     where it decodes the journal: the faults of "rejected: " but a value
 #     of a type it does not take and a key an entry lacks, which
 #     journal_shape_problems checks in the view; a string that holds
-#     \u0000 where the app reads it, which plutil refuses, when there is no
-#     view, when it is longer than 1024 bytes, or when the journal holds
-#     U+E000 as well (json_nul_mark); and a Float that json_float does not
-#     work out. A NUL byte, which the shell cannot
-#     hold, is read as \001, another control character: the app takes one
-#     only inside text it skips, in a string or a key.
-# With $3, for state.json, and only when no other line than "view: " and
-# "record: " lines is printed, the journal as the app reads it is written to
+#     \u0000 where the app reads it when no placeholder could be had for
+#     it (json_held_prefix); and a Float that json_float does not work out.
+#     A NUL byte, which the shell cannot hold, is read as \001, another
+#     control character: the app takes one only inside text it skips, in a
+#     string or a key.
+# With $3, for state.json, and only when no other line than "view: ",
+# "held: " and "record: " lines is printed, the journal as the app reads it is written to
 # the file $3, the view, which plutil reads the way the app reads the text:
 # in each object the app decodes, the keys it reads, each once (the first
 # copy) and without escapes, in the order of the text; for what it does not
@@ -1472,21 +1499,23 @@ json_window_trim() {
 # keeps), when plutil would write it back as another Float, as the same
 # Float in 9 digits (json_float), and when it is longer than 40 bytes or
 # has an exponent of three digits or more, which plutil may not read, as
-# the same value in a form it reads; a string that holds \u0000 with
-# U+E000 for it (json_nul_mark); a frozen process's bootSession also
-# where the app does not read it, as a string the scripts can read; nothing
-# else the app skips. The view drops what the app's own save drops (keys it
-# does not read, later copies, a sessionCutoffs it reads as no record).
-# The text is read in pieces of 4096 bytes, and long strings and numbers
-# with regular expressions only, as a pattern cut in bash takes time that
-# grows with the square of the length.
-record_text_problems() { # file [state|config] [view] [floats]
+# the same value in a form it reads; a string that holds \u0000 as its
+# placeholder (json_held_token); a frozen process's bootSession also where
+# the app does not read it, as a string the scripts can read; nothing else
+# the app skips. The view drops what the app's own save drops (keys it does
+# not read, later copies, a sessionCutoffs it reads as no record). With
+# restore as $5, the view of the copy has each placeholder put back as the
+# string's own text, so that it is the journal to publish. The text is
+# read in pieces of 4096 bytes, and long strings and numbers with regular
+# expressions only, as a pattern cut in bash takes time that grows with the
+# square of the length.
+record_text_problems() { # file [state|config] [view] [floats] [restore]
   local LC_ALL=C
   local doc rj broken slow piece from bom unit size big=0 large c rest raw name token want d vpath vshown kind rel cls allowed
   local str scalar number lax esc kelvin hex nul nl ws blank problem deadline next count nuls held emit refused view steps n
-  local ip frac esign edig sign floats marks pua mark markesc marked nulview
+  local ip frac esign edig sign floats nulview restore held_prefix held_next held_rx held_n x y
   local -a lead pieces kinds paths shown keys names counts rels knowns begun timed mdecoded bdecoded
-  local -a bufs members puts pairs mbufs bbufs bheld
+  local -a bufs members puts pairs mbufs bbufs bheld held_used
   str='^"([^"\\]|\\[^u]|\\u[^"][^"][^"][^"])*"'
   ws=$' \t\n\r'
   blank="^[$ws]+"
@@ -1503,19 +1532,33 @@ record_text_problems() { # file [state|config] [view] [floats]
   rj=""
   view="${3:-}"
   floats="${4:-}"
+  restore="${5:-}"
   if [[ "${2:-}" == config ]]; then
     doc=config.json
     rj="rejected: "
     view=""
     floats=""
+    restore=""
   fi
-  # A string the app reads that holds \u0000 (marks), and U+E000 in any
-  # string, raw or as an escape (pua): see json_nul_mark.
-  marks=0
-  pua=0
-  mark=$'\xee\x80\x80'
-  markesc='\\u[eE]000'
-  nulview="holds \\u0000, which plutil cannot hold; written in the view as U+E000 (\\uE000), which each journal published from it writes back as \\u0000"
+  # Placeholders for strings that hold \u0000 (json_held_token): none yet.
+  # With restore, held_rx finds HELD_PREFIX in a string, each letter, digit
+  # and dash as such or as a \u escape, and held_used marks each
+  # placeholder put back.
+  held_prefix=""
+  held_next=0
+  held_rx=""
+  if [[ -n "$restore" ]]; then
+    for (( n = 0; n < ${#HELD_PREFIX}; n++ )); do
+      c="${HELD_PREFIX:n:1}"
+      printf -v x '%02x' "'$c"
+      y="${x:1:1}"
+      case "$y" in
+        a) y='[aA]' ;; b) y='[bB]' ;; c) y='[cC]' ;; d) y='[dD]' ;; e) y='[eE]' ;; f) y='[fF]' ;;
+      esac
+      held_rx+="($c|\\\\u00${x:0:1}$y)"
+    done
+  fi
+  nulview="holds \\u0000, which plutil cannot hold; held in the view as a placeholder string (json_held_token), which each journal published from it writes back as the string's own text"
   broken="${rj}the text of $doc is not JSON the app's decoder reads"
   slow="reading $doc here did not finish within ${TEXT_READ_SECONDS}s, so what the app makes of it is not known here"
   deadline=$((SECONDS + TEXT_READ_SECONDS))
@@ -1780,8 +1823,9 @@ record_text_problems() { # file [state|config] [view] [floats]
             # The app reads startedAtMicros only after a startedAt, and
             # bootSession only after both; an entry without them has no
             # identity. A bootSession the app does not read is kept as a
-            # string the scripts can read, for an entry an older build wrote
-            # without startedAtMicros, which they compare on startedAt and
+            # string the scripts can read, a placeholder too where it holds
+            # \u0000, for an entry an older build wrote without
+            # startedAtMicros, which they compare on startedAt and
             # bootSession alone.
             if (( begun[d] == 1 )); then
               printf '%s' "${mdecoded[d]}"
@@ -1797,13 +1841,12 @@ record_text_problems() { # file [state|config] [view] [floats]
               [[ -z "${bdecoded[d]}" ]] || refused=1
               if [[ "${bheld[d]}" == 1 && -z "${bdecoded[d]}" ]]; then
                 echo "view: ${shown[d]}.bootSession $nulview"
-                marks=1
               fi
-            else
-              if [[ -n "${bbufs[d]}" && "${bheld[d]}" != 0 ]]; then
-                [[ -z "${bheld[d]}" ]] || echo "view: ${shown[d]}.bootSession, which the app does not read there, is a string the app would not read; left out"
-                bbufs[d]=""
-              fi
+            elif [[ -n "${bbufs[d]}" && "${bheld[d]}" == 1 ]]; then
+              echo "view: ${shown[d]}.bootSession, which the app does not read there, $nulview"
+            elif [[ -n "${bbufs[d]}" && "${bheld[d]}" != 0 ]]; then
+              [[ -z "${bheld[d]}" ]] || echo "view: ${shown[d]}.bootSession, which the app does not read there, is a string the app would not read; left out"
+              bbufs[d]=""
             fi
             if [[ -n "${bbufs[d]}" ]]; then
               (( members[d] == 0 )) || bufs[d]+=,
@@ -1860,7 +1903,21 @@ record_text_problems() { # file [state|config] [view] [floats]
         rest="${rest:${#raw}}"
         json_window_trim
         raw="${raw:1:${#raw}-2}"
-        if [[ -n "$view" ]] && (( pua == 0 )) && [[ "$raw" == *"$mark"* || "$raw" =~ $markesc ]]; then pua=1; fi
+        # With restore, a string that holds HELD_PREFIX is a placeholder of
+        # the journal's: exactly one, as a value where its string was in
+        # the app's terms, the first time, and not one the edit took out.
+        held_n=""
+        if [[ -n "$restore" && "$raw" =~ $held_rx ]]; then
+          held_n="${raw#"$HELD_PREFIX"}"
+          if [[ "$want" == value && "$rel" == 1 && "$raw" == "$HELD_PREFIX"* && "$held_n" =~ ^(0|[1-9][0-9]{0,8})$ ]] &&
+            (( held_n < held_count )) && [[ "${held_paths[held_n]}" == "$vpath" && -z "${held_used[held_n]:-}" && -z "${held_gone[held_n]:-}" ]]; then
+            held_used[held_n]=1
+          else
+            echo "${vshown:-a key in ${shown[d]:-the top level of $doc}} holds a placeholder for a string that holds \\u0000 (json_held_token) where none of the journal's goes, so what the app reads is not known here"
+            refused=1
+            held_n=""
+          fi
+        fi
         if [[ "$want" == key ]]; then
           # The key as a log names it: its first 64 bytes, with ? for each
           # one that is not a letter, a digit or _.
@@ -1942,21 +1999,26 @@ record_text_problems() { # file [state|config] [view] [floats]
               'state.json:frozenProcesses[].bootSession:'*)
                 bheld[d]="$held"
                 (( held != 2 )) || problem="$vshown is a string the app's decoder does not read (a control character, bytes that are not UTF-8, an escape JSON does not have, or a lone surrogate)"
-                if (( held == 1 )); then
-                  if json_nul_mark "$raw"; then emit="\"$marked\""; else problem="$vshown holds \\u0000, which the app reads and plutil does not; not read here"; fi
+                # Read by the app or not, it is held: the scripts read it.
+                if (( held == 1 )) && [[ -n "$view" && -z "$restore" ]] && ! json_held_token "$raw"; then
+                  echo "$vshown holds \\u0000, which plutil cannot hold, and no placeholder for it could be had here, so what the app reads is not known here"
+                  refused=1
+                  # Refused: no view line for it at the entry's end.
+                  bheld[d]=""
                 fi
                 ;;
               *:2) problem="${rj}$vshown is a string the app's decoder does not read (a control character, bytes that are not UTF-8, an escape JSON does not have, or a lone surrogate)" ;;
               state.json:*:1)
-                if json_nul_mark "$raw"; then
-                  emit="\"$marked\""
+                if [[ -z "$view" || -n "$restore" ]]; then
+                  :
+                elif json_held_token "$raw"; then
                   echo "view: $vshown $nulview"
-                  marks=1
                 else
-                  problem="$vshown holds \\u0000, which the app reads and plutil does not; not read here"
+                  problem="$vshown holds \\u0000, which plutil cannot hold, and no placeholder for it could be had here, so what the app reads is not known here"
                 fi
                 ;;
             esac
+            [[ -z "$held_n" ]] || emit="\"${held_raws[held_n]}\""
             case "$doc:$vpath" in
               'state.json:frozenProcesses[].startedAtMicros') mdecoded[d]+="${problem}${problem:+$nl}" ;;
               'state.json:frozenProcesses[].bootSession') bdecoded[d]+="${problem}${problem:+$nl}" ;;
@@ -2095,7 +2157,8 @@ record_text_problems() { # file [state|config] [view] [floats]
         case "$doc:$vpath" in
           'state.json:frozenProcesses[].startedAtMicros') mdecoded[d]+="${problem}${problem:+$nl}" ;;
           'state.json:frozenProcesses[].bootSession')
-            bheld[d]=""
+            # Not for a later copy, which the app skips.
+            (( rel == 0 )) || bheld[d]=""
             bdecoded[d]+="${problem}${problem:+$nl}"
             ;;
           *)
@@ -2114,9 +2177,13 @@ record_text_problems() { # file [state|config] [view] [floats]
       echo "${rj}$vshown is $cls, which the app's decoder does not take there"
     fi
   done
-  if [[ -n "$view" ]] && (( marks == 1 && pua == 1 )); then
-    echo "$doc holds \\u0000 where the app reads it, which the view writes as U+E000, and U+E000 as well, so what the app reads is not known here"
-    refused=1
+  if [[ -n "$restore" ]]; then
+    for (( n = 0; n < held_count; n++ )); do
+      if [[ -z "${held_used[n]:-}" && -z "${held_gone[n]:-}" ]]; then
+        echo "${held_shown[n]}, a string that holds \\u0000, has no placeholder where it was (json_held_token), so what the app reads is not known here"
+        refused=1
+      fi
+    done
   fi
   if [[ -n "$view" ]] && (( refused == 0 )); then
     (( nuls == 0 )) || echo "view: $doc holds a NUL byte in text the app skips, which plutil does not read; left out"
@@ -2253,15 +2320,21 @@ journal_shape_problems() { # file
 # per version of the file: each write here (record_end_in_journal,
 # prepare_low_power_off) has it run again.
 # record_text_problems reads the text first, as the app's decoder reads
-# it. A line from it other than "view: ", "record: " and "float: " makes
-# the journal malformed: a value the app does not decode, or text whose
-# meaning to the app is not known here (a read that did not finish, say).
-# journal_floats keeps the "float: " lines, each Float the app decodes,
-# which every edited copy published below must keep (journal_candidate_ok).
-# journal_marks is 1 when the view writes a string the app reads that holds
-# \u0000 with U+E000 for it (json_nul_mark), which journal_candidate_ok
-# writes back. The journal every read below then uses, JOURNAL, is
-# state.json itself, or,
+# it. A line from it other than "view: ", "held: ", "record: " and "float: "
+# makes the journal malformed: a value the app does not decode, or text
+# whose meaning to the app is not known here (a read that did not finish,
+# say). journal_floats keeps the "float: " lines, each Float the app
+# decodes, which every edited copy published below must keep
+# (journal_candidate_ok). The "held: " lines name each placeholder the view
+# holds for a string that holds \u0000, which plutil cannot hold
+# (json_held_token): HELD_PREFIX is the start they share and held_count how
+# many there are; held_paths, held_shown and held_raws hold where each is
+# (frozenProcesses[].bootSession), where a log names it
+# (frozenProcesses[0].bootSession) and the string's own text between the
+# quotes, which journal_candidate_ok puts back in every copy published from
+# the view. Read from the view, such a string is its placeholder, which no
+# string of the journal's holds (json_held_prefix). The journal every read
+# below then uses, JOURNAL, is state.json itself, or,
 # when plutil would read the text otherwise than the app ("view: " lines)
 # or cannot parse it at all (text under a key the app does not read, such
 # as a leading zero), the view record_text_problems wrote: the journal as
@@ -2275,18 +2348,26 @@ JOURNAL="$STATE"
 JOURNAL_VIEW="$APP_SUPPORT/.state.json.backstop-view.$$"
 journal_text=""
 journal_floats=""
-journal_marks=0
+HELD_PREFIX=""
+held_count=0
+held_paths=()
+held_shown=()
+held_raws=()
 journal_checked=0
 journal_state=""
 shape_problems=""
 check_journal() {
-  local line problems=""
+  local line token problems=""
   (( journal_checked == 0 )) || return 0
   journal_checked=1
   shape_problems=""
   journal_text=""
   journal_floats=""
-  journal_marks=0
+  HELD_PREFIX=""
+  held_count=0
+  held_paths=()
+  held_shown=()
+  held_raws=()
   JOURNAL="$STATE"
   # A view left by an earlier run that was killed, this run's own among
   # them; one under a shared lock may belong to a run that has not ended,
@@ -2308,9 +2389,21 @@ check_journal() {
   journal_text="$(record_text_problems "$STATE" state "$JOURNAL_VIEW" floats)"
   while IFS= read -r line; do
     case "$line" in
-      "view: "*"written in the view as U+E000"*) journal_marks=1 ;;
       ""|"view: "*|"record: "*) ;;
       "float: "*) journal_floats+="${line#float: }"$'\n' ;;
+      "held: "*)
+        # held: <placeholder> <where> <where a log names it> <text>, the
+        # placeholders numbered from 0 in order.
+        line="${line#held: }"
+        token="${line%% *}"
+        line="${line#* }"
+        held_paths[held_count]="${line%% *}"
+        line="${line#* }"
+        held_shown[held_count]="${line%% *}"
+        held_raws[held_count]="${line#* }"
+        HELD_PREFIX="${token%"$held_count"}"
+        held_count=$((held_count + 1))
+        ;;
       *) problems+="$line"$'\n' ;;
     esac
   done <<< "$journal_text"
@@ -2348,31 +2441,52 @@ trap '"$RM" -f "$JOURNAL_VIEW" "$JOURNAL_VIEW.candidate" 2>/dev/null || true' EX
 # number back through a Double or a Decimal, which can turn the text of a
 # level the app reads as one Float into text it reads as another
 # (json_float); such a copy is not published, and the run keeps the
-# journal it has. A copy of a view that writes \u0000 as U+E000
-# (journal_marks) first has each U+E000, which plutil writes as such, put
-# back as \u0000; the journal held no U+E000 of its own (json_nul_mark),
-# and the copy must then hold none, raw or as an escape.
-journal_candidate_ok() { # file floats
-  local line ok=1 floats="" view="$JOURNAL_VIEW.candidate" rc=0
-  [[ "$("$PLUTIL" -convert json -o - "$1" 2>/dev/null | "$HEAD" -c 1)" == "{" ]] || return 1
-  [[ "$("$HEAD" -c 1 "$1")" == "{" ]] || return 1
+# journal it has. A copy of a view that holds placeholders for strings that
+# hold \u0000 (held_count, check_journal) is first written again with each
+# put back as its string's own text: record_text_problems reads the copy
+# with restore and writes it as the app reads it, each placeholder as the
+# text it stands for. Each must be once in the copy, where its string was
+# in the app's terms (frozenProcesses[].bootSession), and every one must be
+# there but those the edit took out: $3 and on, each the value the edit
+# took out as read from the view, such as the bootSession of a frozen entry
+# it cleared. Anything else, such as one the edit took out that is still
+# there, keeps the journal as it is. The copy is then that text, checked
+# as above.
+journal_candidate_ok() { # file floats [values the edit took out...]
+  local line n ok=1 floats="" view="$JOURNAL_VIEW.candidate" file="$1" given="$2"
+  local -a held_gone
+  shift 2
+  [[ "$("$PLUTIL" -convert json -o - "$file" 2>/dev/null | "$HEAD" -c 1)" == "{" ]] || return 1
+  [[ "$("$HEAD" -c 1 "$file")" == "{" ]] || return 1
   "$RM" -f "$view" 2>/dev/null || true
-  if (( journal_marks == 1 )); then
-    if ! { "$SED" "s/"$'\xee\x80\x80'"/\\\\u0000/g" "$1" > "$view" 2>/dev/null && "$MV" -f "$view" "$1" 2>/dev/null; }; then
+  if (( held_count > 0 )); then
+    held_gone=()
+    for line in "$@"; do
+      n="${line#"$HELD_PREFIX"}"
+      if [[ "$line" == "$HELD_PREFIX"* && "$n" =~ ^(0|[1-9][0-9]{0,8})$ ]] && (( n < held_count )); then
+        held_gone[n]=1
+      fi
+    done
+    while IFS= read -r line; do
+      case "$line" in
+        ""|"view: "*|"record: "*) ;;
+        *) ok=0 ;;
+      esac
+    done < <(record_text_problems "$file" state "$view" "" restore)
+    if (( ok == 0 )) || [[ ! -f "$view" ]] || ! "$MV" -f "$view" "$file" 2>/dev/null; then
+      (( ok == 1 )) || log error "the edited copy of $STATE is not a journal the app loads with each string that holds \\u0000 once, where it was in the journal; not published"
       "$RM" -f "$view" 2>/dev/null || true
       return 1
     fi
-    "$GREP" -q -e $'\xee\x80\x80' -e '\\u[eE]000' "$1" 2>/dev/null || rc=$?
-    (( rc == 1 )) || return 1
   fi
   while IFS= read -r line; do
     case "$line" in
-      ""|"view: "*|"record: "*) ;;
+      ""|"view: "*|"held: "*|"record: "*) ;;
       "float: "*) floats+="${line#float: }"$'\n' ;;
       *) ok=0 ;;
     esac
-  done < <(record_text_problems "$1" state "$view" floats)
-  if (( ok == 1 )) && ! same_floats "$floats" "${2:-}"; then
+  done < <(record_text_problems "$file" state "$view" floats)
+  if (( ok == 1 )) && ! same_floats "$floats" "$given"; then
     log error "the edited copy of $STATE holds a level the app would read as another Float than the journal's; not published"
     ok=0
   fi
@@ -2997,9 +3111,13 @@ app_alive() {
 #   - config.json there and read neither by the binary nor here, and no
 #     record (none, a value the app does not write, no journal or a symlink
 #     to nothing): the strictest cutoffs, a 95% end floor and thermal rules
-#     on, with an error logged. Nothing on disk then says which cutoffs the
-#     app enforces; it may hold others from that file. On battery power
-#     this ends the session below 95%. The app rewrites the record within a
+#     on, with an error logged. The cutoffs the app enforces are not known
+#     here then, though they may be on disk: a valid file over 8 MiB, or
+#     one the reader here does not finish within the timeout, still holds
+#     the floor and rule the app takes from it. A file on which the app's
+#     decoder stops the app is not decoded at all; the app does not load
+#     it. A copy that fails gives nothing either. On battery power this
+#     ends the session below 95%. The app rewrites the record within a
 #     second while it answers (publishSessionCutoffs), so this needs an app
 #     that has stopped answering.
 # The strictest cutoffs here, and the defaults where config.json is missing
@@ -3092,7 +3210,7 @@ read_cutoffs() {
   fi
   cutoff_floor=95
   cutoff_thermal=true
-  log error "$fallback, and $what; nothing on disk says which cutoffs the app enforces, so enforcing the strictest, a 95% end floor and thermal rules on"
+  log error "$fallback, and $what; the cutoffs the app enforces are not known here, so enforcing the strictest, a 95% end floor and thermal rules on"
   return 0
 }
 
@@ -3416,7 +3534,7 @@ record_end() {
 # as an old-style plist and will not edit, is written whole. True only when
 # the journal then records the end.
 record_end_in_journal() {
-  local tmp="$APP_SUPPORT/.state.json.backstop.$$" encoded json="" floats=""
+  local tmp="$APP_SUPPORT/.state.json.backstop.$$" encoded json="" floats="" old=""
   if journal_records_end; then return 0; fi
   encoded="$(session_base64)" || return 1
   [[ -n "$encoded" ]] || return 1
@@ -3425,6 +3543,9 @@ record_end_in_journal() {
     [[ "$journal_state" == clean ]] || return 1
     json="$("$PLUTIL" -convert json -o - "$JOURNAL" 2>/dev/null)" || return 1
     floats="$journal_floats"
+    # The endedSession this replaces, a placeholder too where it holds
+    # \u0000 (journal_candidate_ok).
+    (( held_count == 0 )) || old="$(extract "$JOURNAL" endedSession || true)"
   fi
   # As in record_end: a leftover at this PID's name goes unopened first.
   "$RM" -f "$tmp" 2>/dev/null || true
@@ -3435,7 +3556,7 @@ record_end_in_journal() {
     "$RM" -f "$tmp" 2>/dev/null || true
     return 1
   fi
-  if ! journal_candidate_ok "$tmp" "$floats" || ! "$MV" -f "$tmp" "$STATE" 2>/dev/null; then
+  if ! journal_candidate_ok "$tmp" "$floats" "$old" || ! "$MV" -f "$tmp" "$STATE" 2>/dev/null; then
     "$RM" -f "$tmp" 2>/dev/null || true
     return 1
   fi
@@ -3733,9 +3854,9 @@ prepare_low_power_off() {
   t="$(type_of "$JOURNAL" keptDisplayUnderLowPower)"
   [[ "$t" == float || "$t" == integer ]] || return 0
   boot="$("$SYSCTL" -n kern.bootsessionuuid 2>/dev/null || true)"
-  # A boot that holds U+E000 would be written back as \u0000 with the
-  # view's (journal_candidate_ok).
-  if (( journal_marks == 1 )) && [[ "$boot" == *$'\xee\x80\x80'* ]]; then return 1; fi
+  # A boot that holds the view's placeholders' prefix could match one here,
+  # or be read as one (journal_candidate_ok); no boot the system writes does.
+  if (( held_count > 0 )) && [[ "$boot" == *"$HELD_PREFIX"* ]]; then return 1; fi
   recorded="$(extract "$JOURNAL" keptDisplayUnderLowPowerBoot || true)"
   [[ "$recorded" == "$boot" ]] && return 0
   tmp="$APP_SUPPORT/.state.json.backstop-boot.$$"
@@ -3744,7 +3865,7 @@ prepare_low_power_off() {
     "$PLUTIL" -replace keptDisplayUnderLowPowerBoot -string "$boot" "$tmp" >/dev/null 2>&1 || ok=0
   fi
   if (( ok == 1 )); then
-    journal_candidate_ok "$tmp" "$journal_floats" || ok=0
+    journal_candidate_ok "$tmp" "$journal_floats" "$recorded" || ok=0
   fi
   if (( ok == 1 )); then
     "$MV" -f "$tmp" "$STATE" || ok=0
@@ -3783,6 +3904,7 @@ fi
 # kept[i] marks entry i as kept; the kept entries are republished in journal
 # order whatever order they were settled in.
 kept=()
+frozen_boot=()
 keep_entry() { # index
   kept[$1]=1
 }
@@ -3920,10 +4042,11 @@ resume_via_app() {
 }
 if (( frozen_count > 0 )); then
   boot_now="$("$SYSCTL" -n kern.bootsessionuuid 2>/dev/null || true)"
-  # The view writes a bootSession that holds \u0000 with U+E000 for it
-  # (journal_marks); a boot that holds U+E000 could match it here where it
-  # does not in the app, so it counts as unread.
-  if (( journal_marks == 1 )) && [[ "$boot_now" == *$'\xee\x80\x80'* ]]; then boot_now=""; fi
+  # The view holds a bootSession that holds \u0000 as a placeholder
+  # (json_held_token); a boot that holds the placeholders' prefix could
+  # match one here where it does not in the app, so it counts as unread. No
+  # boot the system writes does.
+  if (( held_count > 0 )) && [[ "$boot_now" == *"$HELD_PREFIX"* ]]; then boot_now=""; fi
   uid_now="$("$ID" -u)"
   i=0
   while (( i < frozen_count )); do
@@ -3931,6 +4054,7 @@ if (( frozen_count > 0 )); then
     started="$(extract_whole "$JOURNAL" "frozenProcesses.$i.startedAt" || true)"
     micros="$(extract_whole "$JOURNAL" "frozenProcesses.$i.startedAtMicros" || true)"
     boot="$(extract "$JOURNAL" "frozenProcesses.$i.bootSession" || true)"
+    frozen_boot[i]="$boot"
     if ! is_positive_int "$pid"; then
       log error "frozen entry $i has no valid pid (${pid:-?}); kept, not signaled"
       failures+=("frozen entry $i has an invalid pid")
@@ -4044,9 +4168,10 @@ if (( app_nap_count > 0 )); then
       log error "App Nap entry $i has no usable bundle id (${bundle:-?}); kept, nothing written"
       failures+=("App Nap entry $i has no usable bundle id")
       keep_app_nap_entry "$i"
-    elif (( journal_marks == 1 )) && [[ "$bundle" == *$'\xee\x80\x80'* ]]; then
-      # The view writes \u0000 as U+E000 (json_nul_mark): the app's bundle
-      # id holds \u0000, which no command here can name.
+    elif (( held_count > 0 )) && [[ "$bundle" == "$HELD_PREFIX"* ]]; then
+      # A placeholder of the view's (json_held_token): the app's bundle id
+      # holds \u0000, which no command here can name. The entry, kept, keeps
+      # it, and the journal published below the string's own text.
       log error "App Nap entry $i has a bundle id that holds \\u0000; kept, nothing written"
       failures+=("App Nap entry $i has a bundle id that holds \\u0000")
       keep_app_nap_entry "$i"
@@ -4154,10 +4279,17 @@ if (( changed == 1 )); then
   [[ "$new_docker" == "$docker_frozen" ]] || publish_edit -replace dockerFrozen -bool "$new_docker"
   (( frozen_count == 0 )) || publish_edit -replace frozenProcesses -json "[$kept_frozen]"
   (( app_nap_count == 0 )) || publish_edit -replace appNapOverrides -json "[$kept_app_nap]"
+  # The bootSession of each frozen entry cleared goes with it, a placeholder
+  # too where it holds \u0000 (journal_candidate_ok). Every App Nap entry
+  # whose bundle id is one is kept.
+  frozen_gone=()
+  for (( i = 0; i < frozen_count; i++ )); do
+    [[ -n "${kept[i]:-}" ]] || frozen_gone+=("${frozen_boot[i]:-}")
+  done
   if (( publish_ok == 1 )); then
     # plutil keeps JSON files as JSON; make sure the result is still one,
     # and one the app loads as plutil reads it.
-    journal_candidate_ok "$tmp" "$journal_floats" || publish_ok=0
+    journal_candidate_ok "$tmp" "$journal_floats" ${frozen_gone[@]+"${frozen_gone[@]}"} || publish_ok=0
   fi
   if (( publish_ok == 1 )); then
     "$MV" -f "$tmp" "$STATE" || publish_ok=0

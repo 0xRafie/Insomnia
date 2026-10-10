@@ -66,10 +66,6 @@ struct PatchedBackstop {
             exit 1
             """#,
         ]
-        let source = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-            .appendingPathComponent("scripts/backstop.sh")
-        var lines = try String(contentsOf: source, encoding: .utf8).components(separatedBy: "\n")
         var constants = [String: String]()
         for (name, body) in fakes {
             let fake = dir.appendingPathComponent(name.lowercased())
@@ -80,8 +76,10 @@ struct PatchedBackstop {
         let info = dir.appendingPathComponent("Info.plist")
         try BuiltApp.infoPlist(agentCutoffsVersion: "\(AgentCutoffsCommand.version)").write(to: info, atomically: true, encoding: .utf8)
         constants["INSOMNIA_INFO"] = info.path
+        let source = try ScriptSource.shared.lines("backstop.sh", setting: Array(constants.keys))
+        var lines = source.lines
         for (name, value) in constants {
-            let hits = lines.indices.filter { lines[$0].hasPrefix("\(name)=") }
+            let hits = source.hits[name] ?? []
             guard hits.count == 1 else { throw PatchError(constant: name, hits: hits.count) }
             lines[hits[0]] = "\(name)='\(value)'"
         }
@@ -155,16 +153,21 @@ struct PatchedBackstop {
     }
 
     /// Runs each agent once, at most `width` at a time, and returns their
-    /// exit statuses in order. The agents must act on separate homes. Every
-    /// run that started is waited for, also when another fails to start:
-    /// the group waits for its tasks before it throws.
-    static func runAll(_ agents: [PatchedBackstop], width: Int = 8) async throws -> [Int32] {
+    /// exit statuses in order. The agents must act on separate homes. The
+    /// runs whose copy has a shortened read limit (`setCommandTimeout`),
+    /// for a binary that does not answer, start first: each waits that
+    /// limit out, and one started last would hold the table up alone.
+    /// Every run that started is waited for, also when another fails to
+    /// start: the group waits for its tasks before it throws.
+    static func runAll(_ agents: [PatchedBackstop], width: Int = 16) async throws -> [Int32] {
         var statuses = [Int32](repeating: -1, count: agents.count)
+        let shortened = try agents.map { try $0.readLimitIsShortened() }
+        let order = agents.indices.filter { shortened[$0] } + agents.indices.filter { !shortened[$0] }
         try await withThrowingTaskGroup(of: (Int, Int32).self) { group in
             var next = 0
             func add() {
-                guard next < agents.count else { return }
-                let (i, agent) = (next, agents[next])
+                guard next < order.count else { return }
+                let (i, agent) = (order[next], agents[order[next]])
                 group.addTask { (i, try await agent.run()) }
                 next += 1
             }
@@ -177,8 +180,15 @@ struct PatchedBackstop {
         return statuses
     }
 
-    func clearCalls() {
-        try? FileManager.default.removeItem(at: dir.appendingPathComponent("calls"))
+    /// Removes the calls record. Only a record that is not there counts as
+    /// removed; any other failure throws, so calls that stay cannot pass
+    /// for calls of the next run.
+    func clearCalls() throws {
+        do {
+            try FileManager.default.removeItem(at: dir.appendingPathComponent("calls"))
+        } catch let error as CocoaError where error.code == .fileNoSuchFile {
+            return
+        }
     }
 
     var calls: [String] {
@@ -308,25 +318,53 @@ struct PatchedBackstop {
 
     /// Points GREP at a fake that, each time the agent looks for an end
     /// record line while no other writer holds insomnia.log's lock (lockf
-    /// -t 0 gets it), first starts another writer that takes that lock,
-    /// writes `held sh`, waits a second, then writes `ort`, still without a
-    /// newline, and lets go. The fake runs /usr/bin/grep once that writer
-    /// holds the lock, or after 5 s without it. So the agent's write after
-    /// such a check, its record included, waits for that writer and finds
-    /// the log ends in a line cut short. A check while the lock is held
-    /// (the agent's own read-back) starts no writer. Each writer's process
-    /// ends by itself once it lets go.
-    func holdTheLogAtEveryRecordCheck(log: URL) throws {
+    /// -t 0 gets it), first has another writer started that takes that
+    /// lock, writes `held sh`, waits a second, then writes `ort`, still
+    /// without a newline, and lets go. The fake runs /usr/bin/grep once
+    /// that writer holds the lock, or after 5 s without it. So the agent's
+    /// write after such a check, its record included, waits for that writer
+    /// and finds the log ends in a line cut short. A check while the lock is
+    /// held (the agent's own read-back) starts no writer. The writers are
+    /// children of the returned LogWriters' server, not of the fake, which
+    /// cannot wait for them; settle them before the home goes.
+    func holdTheLogAtEveryRecordCheck(log: URL) throws -> LogWriters {
         let grep = dir.appendingPathComponent("grep")
+        let server = dir.appendingPathComponent("log-writers")
+        let fifo = dir.appendingPathComponent("log-writers.fifo")
+        let statuses = dir.appendingPathComponent("log-writers.status")
         let ready = dir.appendingPathComponent("holder.ready").path
+        try #"""
+        #!/bin/bash
+        # Started and reaped by the test (PatchedBackstop.LogWriters). Starts
+        # a writer as a child of its own for each line "start" on the FIFO.
+        # On any other line, or none, it waits for each writer and records
+        # that line, then each writer's exit status in start order.
+        exec 3<'\#(fifo.path)'
+        pids=()
+        request=""
+        while IFS= read -r request <&3 && [[ "$request" == start ]]; do
+          /usr/bin/lockf -k -s -t 5 '\#(log.path)' /bin/bash -c '
+            printf "held sh" >> "$0"; : > "$1"; /bin/sleep 1; printf "ort" >> "$0"
+          ' '\#(log.path)' '\#(ready)' </dev/null >/dev/null 2>&1 3<&- &
+          pids[${#pids[@]}]=$!
+          request=""
+        done
+        exec 3<&-
+        recorded="$request"
+        for pid in ${pids[@]+"${pids[@]}"}; do
+          wait "$pid"
+          recorded="$recorded"$'\n'"$?"
+        done
+        printf '%s\n' "$recorded" > '\#(statuses.path)'
+
+        """#.write(to: server, atomically: true, encoding: .utf8)
         try #"""
         #!/bin/bash
         if [[ "${1:-}" == -Fxq && "${2:-}" == -e && "${3:-}" == "insomnia-ended-session-v1 "* && -f '\#(log.path)' ]] \
            && /usr/bin/lockf -k -s -t 0 '\#(log.path)' /usr/bin/true; then
           /bin/rm -f '\#(ready)'
-          /usr/bin/lockf -k -s -t 5 '\#(log.path)' /bin/bash -c '
-            printf "held sh" >> "$0"; : > "$1"; /bin/sleep 1; printf "ort" >> "$0"
-          ' '\#(log.path)' '\#(ready)' </dev/null >/dev/null 2>&1 &
+          # Read and write, so the open never waits for a reader.
+          { printf 'start\n' >&4; } 4<>'\#(fifo.path)'
           for _ in $(/usr/bin/jot 500); do
             [[ -e '\#(ready)' ]] && break
             /bin/sleep 0.01
@@ -337,6 +375,92 @@ struct PatchedBackstop {
         """#.write(to: grep, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: grep.path)
         try patch("GREP=/usr/bin/grep", "GREP='\(grep.path)'")
+        return try LogWriters(server: server, fifo: fifo, statuses: statuses, output: dir.appendingPathComponent("log-writers.out"))
+    }
+
+    /// The writers holdTheLogAtEveryRecordCheck's fake has started, all
+    /// children of one server this test starts and reaps. The test holds
+    /// the FIFO open for reading and writing from before the server starts
+    /// until it has exited, so a request never waits for a reader and is
+    /// never lost. `settle` asks the server to stop; it waits for every
+    /// writer, records their exit statuses and exits.
+    final class LogWriters: @unchecked Sendable {
+        private let server: Process
+        private let exit: ProcessExit
+        private let statuses: URL
+        private let output: URL
+        private let lock = NSLock()
+        /// The FIFO, open for reading and writing until the server is reaped.
+        private var requests: Int32 = -1
+        private var settled: [Int32]?
+
+        init(server script: URL, fifo path: URL, statuses: URL, output: URL) throws {
+            self.statuses = statuses
+            self.output = output
+            let process = Process()
+            server = process
+            exit = ProcessExit(process)
+            guard mkfifo(path.path, 0o600) == 0 else {
+                throw RunError(description: "could not make the FIFO \(path.path): errno \(errno)")
+            }
+            requests = open(path.path, O_RDWR | O_CLOEXEC)
+            guard requests >= 0 else { throw RunError(description: "could not open the FIFO \(path.path): errno \(errno)") }
+            guard FileManager.default.createFile(atPath: output.path, contents: nil) else {
+                close(requests)
+                throw RunError(description: "could not create \(output.path) for the writers' server")
+            }
+            do {
+                let handle = try FileHandle(forWritingTo: output)
+                defer { try? handle.close() }
+                server.executableURL = URL(fileURLWithPath: "/bin/bash")
+                server.arguments = [script.path]
+                server.standardInput = FileHandle.nullDevice
+                server.standardOutput = handle
+                server.standardError = handle
+                try server.run()
+            } catch {
+                close(requests)
+                throw error
+            }
+        }
+
+        /// Asks the server to stop and returns each writer's exit status,
+        /// in start order, once the server has waited for every writer and
+        /// has exited and been reaped. Throws when the server did not exit
+        /// 0 after the request within 30 s, which is far longer than a
+        /// writer takes (at most 5 s for the lock and one second held). It
+        /// is then terminated and reaped; a writer it started still ends by
+        /// itself.
+        @discardableResult
+        func settle() async throws -> [Int32] {
+            let (done, fd) = lock.withLock { () -> ([Int32]?, Int32) in
+                defer { requests = -1 }
+                return (settled, requests)
+            }
+            if let done { return done }
+            let stop = Array("stop\n".utf8)
+            var asked = false
+            if fd >= 0 {
+                asked = stop.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) } == stop.count
+            }
+            let exited = asked ? await exit.exited(within: 30) : false
+            if !exited {
+                server.terminate()
+                await exit.exited()
+            }
+            if fd >= 0 { close(fd) }
+            let printed = (try? String(contentsOf: output, encoding: .utf8)) ?? ""
+            guard exited, server.terminationReason == .exit, server.terminationStatus == 0 else {
+                throw RunError(description: "the log writers' server did not stop as asked (asked \(asked), exited \(exited), status \(server.terminationStatus)); output: \(printed)")
+            }
+            let lines = try String(contentsOf: statuses, encoding: .utf8).split(separator: "\n", omittingEmptySubsequences: false)
+            let codes = lines.dropFirst().dropLast().compactMap { Int32($0) }
+            guard lines.count >= 2, lines.first == "stop", lines.last == "", codes.count == lines.count - 2 else {
+                throw RunError(description: "the log writers' server recorded \(lines); output: \(printed)")
+            }
+            lock.withLock { settled = codes }
+            return codes
+        }
     }
 
     private func patch(_ line: String, _ replacement: String) throws {
@@ -389,5 +513,12 @@ struct PatchedBackstop {
         let line = "COMMAND_TIMEOUT_SECONDS=30"
         guard text.components(separatedBy: "\n").filter({ $0 == line }).count == 1 else { throw PatchError(constant: "COMMAND_TIMEOUT_SECONDS", hits: 0) }
         try text.replacingOccurrences(of: "\n\(line)\n", with: "\nCOMMAND_TIMEOUT_SECONDS=\(seconds)\n").write(to: script, atomically: true, encoding: .utf8)
+    }
+
+    /// Whether setCommandTimeout has changed this copy's limit on each read
+    /// from the 30 s backstop.sh sets.
+    func readLimitIsShortened() throws -> Bool {
+        let text = try String(contentsOf: script, encoding: .utf8)
+        return !text.components(separatedBy: "\n").contains("COMMAND_TIMEOUT_SECONDS=30")
     }
 }
