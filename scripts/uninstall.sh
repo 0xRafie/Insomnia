@@ -556,21 +556,27 @@ case "$APP_SUPPORT" in /*) ;; *) echo "refusing: app support path is not absolut
 # Opens the file mktemp has just made, $1, on fd 4 and on fd 3, each
 # read-write, so a FIFO put at the name cannot hold the open; checks that
 # both are one empty regular file; and removes the name. 1 when any of that
-# fails. (macOS gives /dev/fd/N the device of /dev, not of the file, so the
-# two descriptors can be compared with each other but not with the name.)
+# fails. Each descriptor is checked as itself: stat with no file named
+# describes its standard input (fstat). A test of /dev/fd/N (-f, -s, -ef)
+# is not reliable: while another process looks up the same name, as another
+# of these scripts does for its own fds 3 and 4, macOS can give the wrong
+# type for it, or no answer at all.
 pin_output() { # file
+  local four three
   [[ -f "$1" && ! -L "$1" ]] || return 1
   exec 4<>"$1" 3<>"$1" || return 1
-  [[ -f /dev/fd/4 && ! -s /dev/fd/4 && /dev/fd/3 -ef /dev/fd/4 ]] || return 1
+  four="$("$STAT" -f '%HT:%z:%d:%i' <&4)" && three="$("$STAT" -f '%HT:%z:%d:%i' <&3)" || return 1
+  [[ "$four" == "Regular File:0:"* && "$three" == "$four" ]] || return 1
   "$RM" -f "$1" || return 1
   [[ ! -e "$1" && ! -L "$1" ]]
 } 2>/dev/null
 # Reads fd 3 from where it stands to its end into READ_TEXT byte for byte,
 # without $(...), which drops NUL bytes and trailing newlines. fd 3 must be a
-# regular file, and at most READ_MAX_BYTES are taken from it, so a file that
-# keeps growing cannot hold the read. One more read after its end must find
-# nothing: a byte there was written while the file was read, by something the
-# call left running, and the text could stop anywhere.
+# regular file (checked by fstat, as pin_output does), and at most
+# READ_MAX_BYTES are taken from it, so a file that keeps growing cannot hold
+# the read. One more read after its end must find nothing: a byte there was
+# written while the file was read, by something the call left running, and
+# the text could stop anywhere.
 # Returns 0 when all of it was read; 1 when it has a NUL byte, which no shell
 # variable can hold (READ_TEXT is then the text without them and trailing
 # newlines, and READ_HEAD the text before the first); 2 when it is not a
@@ -581,7 +587,7 @@ read_fd3() { # -> READ_TEXT, READ_HEAD
   local LC_ALL=C part text="" head="" nul=0 left=$(( READ_MAX_BYTES + 1 ))
   READ_TEXT=""
   READ_HEAD=""
-  [[ -f /dev/fd/3 ]] || return 2
+  [[ "$("$STAT" -f %HT <&3)" == "Regular File" ]] || return 2
   while :; do
     unset -v part
     if IFS= read -r -d '' -n "$left" -u 3 part; then
@@ -2422,11 +2428,45 @@ info_identity() { # file
   fi
   return 0
 }
+# Whether the status of the 'plutil -extract <key path> raw' call just made
+# on a file, with what it printed, says no more than that the plist there
+# has no value at that key path: exit 1 and plutil's exact words for that,
+# read back whole. Anything else is a read that failed: another status, a
+# file plutil could not open or parse, other or more words, a NUL byte, or
+# output not read back. How it failed is then in EXTRACT_RESULT, for a
+# message. No second call settles it: the exit 1 and its words are the
+# evidence, and a plutil -lint of the same file would answer for a later
+# moment and say nothing about this read.
+EXTRACT_RESULT=""
+extract_said_none() { # status keypath file
+  local said line
+  EXTRACT_RESULT="$(call_result "$1")"
+  (( $1 == 1 )) || return 1
+  case "$BOUNDED_READ" in
+    0)
+      said="${READ_TEXT%$'\n'}"
+      said="${said#"$3: "}"
+      [[ "$said" != "Could not extract value, error: No value at that key path or invalid key path: $2" ]] || return 0
+      if [[ -z "$said" ]]; then
+        EXTRACT_RESULT="exited 1 and printed nothing"
+      else
+        # Its first line, and no more than 300 characters of that.
+        line="${said%%$'\n'*}"
+        EXTRACT_RESULT="exited 1 (${line:0:300})"
+        [[ "$line" == "$said" && ${#line} -le 300 ]] || EXTRACT_RESULT="$EXTRACT_RESULT and printed more than that"
+      fi
+      ;;
+    1) EXTRACT_RESULT="exited 1 and printed a NUL byte" ;;
+    *) EXTRACT_RESULT="exited 1, but its output could not be read back" ;;
+  esac
+  return 1
+}
 # InsomniaResumeFrozenVersion from an Info.plist in INFO_VERSION, and the
 # file's identity before the read in INFO_EVIDENCE ("none" when no regular
 # file is there, which declares nothing). 1, with INFO_PROBLEM and
 # INFO_EVIDENCE left as they were, when a read failed or did not answer,
-# when the file does not parse, or when its identity after the read differs.
+# when plutil's exit 1 says anything but that the key is absent (see
+# extract_said_none), or when the file's identity after the read differs.
 read_info_version() { # file
   local rc=0 before
   info_identity "$1" || return 1
@@ -2441,17 +2481,8 @@ read_info_version() { # file
       fi
       # As $(...) would read it: trailing newlines cut.
       INFO_VERSION="${READ_TEXT%"${READ_TEXT##*[!$'\n']}"}"
-    elif (( rc == 1 )); then
-      # No such key, or no plist at all: only a plist that parses declares
-      # no version.
-      rc=0
-      bounded "$PLUTIL" -lint "$1" || rc=$?
-      if (( rc != 0 )); then
-        INFO_PROBLEM="it does not parse ('plutil -lint' $(call_result "$rc"))"
-        return 1
-      fi
-    else
-      INFO_PROBLEM="'plutil -extract InsomniaResumeFrozenVersion' $(call_result "$rc")"
+    elif ! extract_said_none "$rc" InsomniaResumeFrozenVersion "$1"; then
+      INFO_PROBLEM="'plutil -extract InsomniaResumeFrozenVersion' $EXTRACT_RESULT"
       return 1
     fi
     info_identity "$1" || return 1

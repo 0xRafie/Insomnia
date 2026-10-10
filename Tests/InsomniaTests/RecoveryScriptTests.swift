@@ -704,7 +704,9 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(fx.exists(fx.session))
         let moved = try movedAsideSessions()
         XCTAssertEqual(moved.count, 1, "\(moved)")
-        XCTAssertEqual(try String(contentsOf: fx.home.appendingPathComponent(moved[0]), encoding: .utf8), json, "bytes kept as they were")
+        if let first = moved.first {   // the count above fails otherwise
+            XCTAssertEqual(try String(contentsOf: fx.home.appendingPathComponent(first), encoding: .utf8), json, "bytes kept as they were")
+        }
         XCTAssertTrue(fx.log().contains("startedAt is missing"), fx.log())
         XCTAssertTrue(fx.log().contains("extensions is missing"), fx.log())
     }
@@ -2462,6 +2464,7 @@ final class RecoveryScriptTests: XCTestCase {
         SUDO="\(fx.bin.appendingPathComponent("sudo").path)"
         MKTEMP=/usr/bin/mktemp
         RM=/bin/rm
+        STAT=/usr/bin/stat
         PERL=/usr/bin/perl
         BASH_PATH=/bin/bash
         CALL_TIMEOUT_SECONDS=3
@@ -2534,9 +2537,11 @@ final class RecoveryScriptTests: XCTestCase {
     /// a mktemp that leaves a FIFO, or a file with bytes in it, where it
     /// made its file gets 126 at once, and the call is not made; a
     /// supervisor whose read-back stalls (a DEBUG trap holds it for 8 s)
-    /// leaves its caller with the status and with the output not read back
-    /// (BOUNDED_READ 2) READ_GRACE_SECONDS later, and keeps the lock until
-    /// it has sent; and a call past its 1 s limit that ignores SIGTERM gives
+    /// leaves its caller READ_GRACE_SECONDS later with 125 and the output
+    /// not read back (BOUNDED_READ 2): the call's status came, but the
+    /// supervisor was not seen to finish, so neither that status nor any
+    /// output is taken. That supervisor keeps the lock until it has sent and
+    /// ended; and a call past its 1 s limit that ignores SIGTERM gives
     /// 125 with its pid, and its supervisor keeps the lock until the test
     /// releases the call. A harness that waited at a FIFO would hold until
     /// this test opened it, which it does only past a 20 s deadline. No
@@ -2589,7 +2594,7 @@ final class RecoveryScriptTests: XCTestCase {
             waited=$(( SECONDS - started ))
             (( waited >= 5 && waited <= 7 )) && echo "waited 5 to 7 s" >> "\(calls)" || echo "waited $waited s" >> "\(calls)"
 
-            """ + logged, ["waited 5 to 7 s", "bounded 0 read=2 output=[]"], false),
+            """ + logged, ["waited 5 to 7 s", "bounded 125 read=2 output=[]"], false),
             ("ignores SIGTERM past its limit", #"""
             rc=0
             BOUNDED_TERM_ONLY=1 BOUNDED_LIMIT=1 bounded /bin/bash -c 'trap "" TERM
@@ -2671,6 +2676,7 @@ final class RecoveryScriptTests: XCTestCase {
         set -uo pipefail
         READ_MAX_BYTES=8
         RM=/bin/rm
+        STAT=/usr/bin/stat
         FIELD=""
         d='\(dir.path)'
 
@@ -2904,6 +2910,83 @@ final class RecoveryScriptTests: XCTestCase {
             "take sends-late 3 '' '' at-the-deadline held",
             "",
         ], r.stdout)
+    }
+
+    /// pin_output and read_fd3 check each descriptor with a stat of the
+    /// descriptor itself (stat with no file named), not with bash's -f, -s
+    /// or -ef on /dev/fd/N: macOS can answer a stat of /dev/fd/N with the
+    /// wrong type, or fail it, while another process looks up the same
+    /// /dev/fd name, as a second script's own checks do when two run at
+    /// once (the launchd backstop beside an install, say). Here four shells
+    /// each test their own fds 3 and 4 through /dev/fd over and over, while
+    /// install.sh's layer pins 150 files, writes "abc" through fd 4 and
+    /// reads it back. Every pin and every read succeeds. Between them the
+    /// same shell tests a file of its own on fds 3 and 4 through /dev/fd,
+    /// the way pin_output did before; at least one of those tests must
+    /// answer wrongly, or this run did not meet the race at all.
+    func testTheReadBackLayerChecksEachDescriptorItselfWhileOtherShellsLookUpTheSameNames() throws {
+        let text = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent("install.sh"), encoding: .utf8)
+        let dir = fx.root.appendingPathComponent("devfd", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let script = fx.root.appendingPathComponent("devfd.sh")
+        var layer = ""
+        for name in ["pin_output", "read_fd3"] { layer += try Self.shellFunction(name, in: text, "install.sh") }
+        try ("""
+        set -uo pipefail
+        READ_MAX_BYTES=8
+        RM=/bin/rm
+        STAT=/usr/bin/stat
+        d='\(dir.path)'
+
+        """ + layer + #"""
+        trap ': > "$d/stop"' EXIT
+        others=()
+        for i in 1 2 3 4; do
+          ( exec 4<>"$d/other.$i" 3<>"$d/other.$i"
+            n=0
+            while [[ ! -e "$d/stop" ]] && (( n < 2000000 )); do
+              [[ -f /dev/fd/4 && /dev/fd/3 -ef /dev/fd/4 ]] || :
+              n=$(( n + 1 ))
+            done ) &
+          others+=("$!")
+        done
+        pin_failed=0 read_failed=0 wrong=0 tests=0
+        for (( i = 0; i < 150; i++ )); do
+          : > "$d/out.$i"
+          if pin_output "$d/out.$i"; then
+            printf abc >&4
+            read_fd3 && [[ "$READ_TEXT" == abc ]] || read_failed=$(( read_failed + 1 ))
+          else
+            pin_failed=$(( pin_failed + 1 ))
+            "$RM" -f "$d/out.$i"
+          fi
+          exec 4<>"$d/control" 3<>"$d/control"
+          for (( j = 0; j < 20; j++ )); do
+            tests=$(( tests + 1 ))
+            [[ -f /dev/fd/4 && ! -s /dev/fd/4 && /dev/fd/3 -ef /dev/fd/4 ]] || wrong=$(( wrong + 1 ))
+          done
+          exec 3<&- 4>&-
+        done
+        : > "$d/stop"
+        wait "${others[@]}"
+        echo "pin_output failed $pin_failed of 150, read_fd3 $read_failed"
+        echo "$wrong of $tests"
+
+        """#).write(to: script, atomically: true, encoding: .utf8)
+
+        let run = try fx.start(script)
+        let ended = waitUntil(60) { run.process.hasExited }
+        if !ended { _ = run.process.signal(SIGKILL) }
+        let r = run.finish()
+
+        XCTAssertTrue(ended, r.stdout)
+        XCTAssertEqual(r.status, 0, r.stderr)
+        let lines = r.stdout.components(separatedBy: "\n")
+        XCTAssertEqual(lines.first, "pin_output failed 0 of 150, read_fd3 0", r.stdout)
+        let control = lines.count > 1 ? lines[1].components(separatedBy: " of ") : []
+        XCTAssertEqual(control.count, 2, r.stdout)
+        XCTAssertGreaterThan(Int(control.first ?? "") ?? 0, 0, "no test through /dev/fd answered wrongly, so this run did not meet the race: \(r.stdout)")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dir.path).sorted(), ["control", "other.1", "other.2", "other.3", "other.4", "stop"], "every pinned file lost its name")
     }
 
     /// What a caller makes of a supervisor that sends a status and its
@@ -5558,9 +5641,12 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
         let bootstraps = fx.calls().filter { $0.hasPrefix("launchctl bootstrap") }
-        XCTAssertEqual(bootstraps.count, 2, "candidate, then the previous plist again: \(fx.calls())")
-        XCTAssertTrue(bootstraps[0].contains("candidate-") && bootstraps[0].hasSuffix(".plist"), "loaded through a private candidate launchctl accepts: \(bootstraps)")
-        XCTAssertEqual(bootstraps[1], "launchctl bootstrap gui/\(fx.uid) \(fx.plist.path)")
+        XCTAssertEqual(bootstraps.count, 2, "candidate, then the previous plist again: \(fx.calls())\n\(r.stderr)\n\(r.stdout)")
+        // Each is checked only when it is there, so a run that stopped early
+        // fails the count above and every assertion below, instead of
+        // ending the test process.
+        XCTAssertTrue(bootstraps.count > 0 && bootstraps[0].contains("candidate-") && bootstraps[0].hasSuffix(".plist"), "loaded through a private candidate launchctl accepts: \(bootstraps)")
+        XCTAssertEqual(bootstraps.count > 1 ? bootstraps[1] : nil, "launchctl bootstrap gui/\(fx.uid) \(fx.plist.path)")
         XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "trusted", "the trusted plist was never modified")
         XCTAssertTrue(r.stderr.contains("loaded again"), r.stderr)
         XCTAssertTrue(r.stderr.contains("not verified"), "reload success is not a schedule claim: \(r.stderr)")
@@ -5842,13 +5928,16 @@ final class RecoveryScriptTests: XCTestCase {
 
     /// The release-install path with the real codesign: a bundle ad-hoc
     /// signed with `codesign -s -` inside the fixture (every other tool stays
-    /// a fake) verifies before the password prompt, the copy ditto makes at
+    /// a fake, and the fake perl, chmod and ditto act on access control
+    /// lists for real, useNativeACLs) verifies before the password prompt,
+    /// the copy the real ditto makes at
     /// the installed path verifies again against the requirement codesign
     /// read from it, and the agent plist pins that real cdhash. After the
     /// sealed script is edited the same bundle is refused before sudo with
     /// codesign's reason.
     func testInstallFromAnAdHocSignedPrebuiltAppVerifiesTheRealSignatureAndItsDittoCopy() throws {
         try fx.prepareInstall()
+        try fx.useNativeACLs()
         try fx.writeInstallCopies(extraConstants: ["CODESIGN": "/usr/bin/codesign"])
         let prebuilt = try fx.writePrebuiltApp(machO: true)
         let sign = try fx.runTool("/usr/bin/codesign", ["--force", "--sign", "-", prebuilt.path])
@@ -5884,9 +5973,11 @@ final class RecoveryScriptTests: XCTestCase {
     /// download given an ACL, leaves a bundle other accounts could edit.
     /// Neither is part of the signature: the bundle verifies with them, and
     /// the installed copy loses both, keeps the quarantine flag and still
-    /// passes the real codesign and the requirement the agent pins.
+    /// passes the real codesign and the requirement the agent pins. The
+    /// real ditto and chmod -N do the copy and the removal (useNativeACLs).
     func testInstallFromAPrebuiltAppDropsOtherAccountsWriteAccessButKeepsTheSignatureAndQuarantine() throws {
         try fx.prepareInstall()
+        try fx.useNativeACLs()
         try fx.writeInstallCopies(extraConstants: ["CODESIGN": "/usr/bin/codesign"])
         let prebuilt = try fx.writePrebuiltApp(machO: true)
         let sign = try fx.runTool("/usr/bin/codesign", ["--force", "--sign", "-", prebuilt.path])
@@ -6311,7 +6402,7 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
         XCTAssertLessThan(elapsed, 30)
-        XCTAssertTrue(r.stderr.contains("aside at \(previous.path). 'codesign --verify', which tells which of the two bundles \(fx.plist.path) pins, did not answer within 5s.\nNeither bundle was moved"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("aside at \(previous.path). 'codesign --verify' on \(fx.app.path), which tells which of the two bundles \(fx.plist.path) pins, did not answer within 5s.\nNeither bundle was moved"), r.stderr)
         let calls = fx.calls()
         XCTAssertTrue(calls.contains("codesign FD9-OPEN"), "the call keeps the lock while it runs: \(calls)")
         XCTAssertTrue(fx.hungProcessGone("codesign", within: 0), "it was killed and reaped before the run went on")
@@ -6462,7 +6553,9 @@ final class RecoveryScriptTests: XCTestCase {
         let goW = try XCTUnwrap(fx.chmodCalls().first { $0.hasPrefix("chmod -R go-w \(staging)") }, "\(fx.chmodCalls())")
         let newApp = String(goW.dropFirst("chmod -R go-w ".count))
         XCTAssertTrue(newApp.hasSuffix("/Insomnia.app"), newApp)
-        XCTAssertTrue(fx.chmodCalls().contains("chmod -R -N \(newApp)"), "\(fx.chmodCalls())")
+        XCTAssertTrue(fx.chmodCalls().contains("chmod SKIPPED-ACL -R -N \(newApp)"), "\(fx.chmodCalls())")
+        XCTAssertEqual(fx.dittoCalls().count, 1, "\(fx.dittoCalls())")
+        XCTAssertTrue(fx.dittoCalls().first?.hasSuffix(" \(newApp)") == true, "the bundle is copied to the staged path with DITTO: \(fx.dittoCalls())")
         for call in [
             "mkdir -p \(fx.appsDir.path)",
             "mkdir -p \(fx.home.path) \(fx.home.path)/Logs \(fx.plist.deletingLastPathComponent().path)",
@@ -9284,17 +9377,19 @@ final class RecoveryScriptTests: XCTestCase {
     // MARK: - Access control lists, and root's last read of the rule
 
     /// A fixture with the rule installed, ready for install.sh or
-    /// uninstall.sh (`install`), whose copy runs root's perl and cat through
-    /// the fakes named in `fakes`. An install that gets past its rule step
-    /// skips the staging step's `chmod -R -N` (skipACLRemoval): no test
-    /// here checks the staged bundle's access control lists.
-    private func ruleFixture(install: Bool, fakes: [String] = []) throws -> ScriptFixture {
+    /// uninstall.sh (`install`), whose copy runs root's cat through the
+    /// fakes named in `fakes` (perl is always the fake). With `nativeACLs`
+    /// root's reader reads the real access control lists (useNativeACLs).
+    /// An install that gets past its rule step skips the staging step's
+    /// `chmod -R -N`, as every fixture does: no test here checks the staged
+    /// bundle's access control lists.
+    private func ruleFixture(install: Bool, fakes: [String] = [], nativeACLs: Bool = false) throws -> ScriptFixture {
         let f = try ScriptFixture()
         let constants = Dictionary(uniqueKeysWithValues: fakes.map { ($0.uppercased(), f.bin.appendingPathComponent($0).path) })
+        if nativeACLs { try f.useNativeACLs(["perl"]) }
         if install {
             try f.writeInstallCopies(extraConstants: constants)
             try f.prepareInstall()
-            try f.skipACLRemoval()
             f.setMode("launchctl", "loaded")
         } else {
             try f.writeUninstallCopy(extraConstants: constants)
@@ -9339,7 +9434,7 @@ final class RecoveryScriptTests: XCTestCase {
         for c in cases {
             for install in c.install ? [true, false] : [false] {
                 let label = "\(c.name), \(install ? "install" : "uninstall")"
-                let f = try ruleFixture(install: install)
+                let f = try ruleFixture(install: install, nativeACLs: true)
                 defer { f.destroy() }
                 try f.prepareSudoersLock()
                 let target = c.target(f)
@@ -9367,7 +9462,7 @@ final class RecoveryScriptTests: XCTestCase {
     /// stay.
     func testRootAcceptsAccessControlListsThatOnlyDenyOrAllowReading() throws {
         for install in [true, false] {
-            let f = try ruleFixture(install: install)
+            let f = try ruleFixture(install: install, nativeACLs: true)
             let folder = f.sudoersLock.deletingLastPathComponent()
             let above = folder.deletingLastPathComponent()
             defer {
@@ -9394,8 +9489,8 @@ final class RecoveryScriptTests: XCTestCase {
     }
 
     /// A list root cannot read in full counts as one that allows a change,
-    /// through the fake perl, which runs the real reader and then changes
-    /// its answer; no access control list is changed. The reader cannot
+    /// through the fake perl, which runs its identity reader and then
+    /// changes its answer; no access control list is read or changed. The reader cannot
     /// open the rule (4, both scripts), or answers in full and then fails
     /// (4); its answer for the lock has no last "checked" line (7), or an
     /// unexpected line after it, for the rule's folder (7); or it prints an
@@ -9412,7 +9507,7 @@ final class RecoveryScriptTests: XCTestCase {
         for c in cases {
             for install in c.install ? [true, false] : [false] {
                 let label = "\(c.file), \(install ? "install" : "uninstall")"
-                let f = try ruleFixture(install: install, fakes: ["perl"])
+                let f = try ruleFixture(install: install)
                 defer { f.destroy() }
                 let target = c.target(f)
                 try f.prepareSudoersLock()
@@ -9441,12 +9536,12 @@ final class RecoveryScriptTests: XCTestCase {
 
     /// An entry that allows a change, reported for the rule's folder after
     /// root's first checks and its read of the rule (the fake perl adds it
-    /// to the real reader's answer on its fourth call, the first of the
+    /// to its identity reader's answer on its fourth call, the first of the
     /// checks made last before the rename or removal), stops the run there,
-    /// with exit 7. No access control list is changed.
+    /// with exit 7. No access control list is read or changed.
     func testRootChecksAccessControlListsAgainJustBeforeItChangesTheRule() throws {
         for install in [true, false] {
-            let f = try ruleFixture(install: install, fakes: ["perl"])
+            let f = try ruleFixture(install: install)
             defer { f.destroy() }
             let folder = f.sudoersLock.deletingLastPathComponent().path
             try "\(folder)|ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C 0x1 0x4\n".write(to: f.root.appendingPathComponent("perl.entry"), atomically: true, encoding: .utf8)
@@ -9469,7 +9564,10 @@ final class RecoveryScriptTests: XCTestCase {
     /// file ID the kernel gives with that same answer as the list. Here the
     /// fake perl puts another file at the rule's path by a rename (an owned
     /// file in the fixture, no access control list changed) on the third
-    /// call, after root's stat of the rule and before the reader opens it.
+    /// call, after root's stat of the rule and before its identity reader,
+    /// which makes the same comparison from fstat and says so in the real
+    /// reader's words, opens it. testRootReaderReadsOnlyTheFileStatDescribed
+    /// runs the real reader on such files.
     /// Root stops with exit 4, naming both identities, and keeps the file
     /// that is there now. The matched control is root's text from that run,
     /// run again alone with no rename: it reads all six lists and
@@ -9477,7 +9575,7 @@ final class RecoveryScriptTests: XCTestCase {
     func testRootReadsTheListOfTheFileItCheckedNotOnePutAtItsPathLater() throws {
         for install in [true, false] {
             let label = "install \(install)"
-            let f = try ruleFixture(install: install, fakes: ["perl"])
+            let f = try ruleFixture(install: install)
             defer { f.destroy() }
             let count = f.root.appendingPathComponent("perl.count")
             let theirs = ScriptFixture.sudoersRule(for: ScriptFixture.account)
@@ -9642,7 +9740,8 @@ final class RecoveryScriptTests: XCTestCase {
             let s = try fx.runTool("/usr/bin/stat", ["-f", "%Hp %d:%i", url.path])
             XCTAssertEqual(s.status, 0, s.output)
             let w = s.output.trimmingCharacters(in: .newlines).split(separator: " ").map(String.init)
-            return (w[0], w[1])
+            XCTAssertEqual(w.count, 2, s.output)
+            return (w.first ?? "", w.count > 1 ? w[1] : "")
         }
         let text = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent("uninstall.sh"), encoding: .utf8)
         let function = try Self.shellFunction("r_acl_reader", in: text, "uninstall.sh")
@@ -9685,7 +9784,7 @@ final class RecoveryScriptTests: XCTestCase {
         ]
         for c in cases {
             let label = "\(c.how), \(c.install ? "install" : "uninstall")"
-            let f = try ruleFixture(install: c.install, fakes: c.how == "visudo" ? [] : ["perl"])
+            let f = try ruleFixture(install: c.install)
             defer { f.destroy() }
             let theirs = ScriptFixture.sudoersRule(for: "bob")
             let inode = try f.inode(f.sudoers)
@@ -9956,9 +10055,9 @@ final class RecoveryScriptTests: XCTestCase {
     /// user record: the UUID it gives for ROOT_UID is the entry's, and the
     /// ID it gives for that UUID is "uid: <ROOT_UID>", each as one line
     /// from a dsmemberutil that exits 0. Here the fake perl adds the entry
-    /// (allow add_file and delete_child) to the real reader's answer for
-    /// the rule's folder on every call, so no access control list is
-    /// changed; ROOT_UID is the test account's uid in these copies. With no
+    /// (allow add_file and delete_child) to its identity reader's answer for
+    /// the rule's folder on every call, so no access control list is read
+    /// or changed; ROOT_UID is the test account's uid in these copies. With no
     /// answer each script stops at root with exit 7, through the script.
     /// Root's text from that run, alone and from the same state, completes
     /// with both answers right, unless the reader's last line ("checked
@@ -9969,7 +10068,7 @@ final class RecoveryScriptTests: XCTestCase {
     /// 1.
     func testRootAdmitsAChangeOnlyForAnEntryShownToBeRootsOwnUser() throws {
         for install in [true, false] {
-            let f = try ruleFixture(install: install, fakes: ["perl"])
+            let f = try ruleFixture(install: install)
             defer { f.destroy() }
             let folder = f.sudoersLock.deletingLastPathComponent()
             try f.prepareSudoersLock()
@@ -10378,8 +10477,9 @@ final class RecoveryScriptTests: XCTestCase {
     /// job it may have loaded and the previous app set aside; the plist is
     /// never replaced. The print before the unload decides nothing alone:
     /// the unload asks print again, so that run goes on and installs. The
-    /// staging step's `chmod -R -N` is skipped (skipACLRemoval): no row
-    /// checks ACLs, and none changes one.
+    /// staging step's `chmod -R -N` is skipped, as in every fixture that
+    /// does not ask for useNativeACLs: no row checks ACLs, and none changes
+    /// one.
     func testInstallTakesAMissingStatusFromEachBoundedCallAsNoAnswer() throws {
         enum Stage { case beforeAnything, beforeSwap, newJobUnknown, finished }
         struct Row {
@@ -10429,7 +10529,6 @@ final class RecoveryScriptTests: XCTestCase {
             try "trusted".write(to: f.plist, atomically: true, encoding: .utf8)
             try f.writeState(Self.cleanJournal)
             f.setMode("launchctl", "loaded")
-            try f.skipACLRemoval()
             try f.killSupervisor(of: row.pattern, after: row.skip)
             let tmp = try f.privateTmp()
 
@@ -10556,21 +10655,43 @@ final class RecoveryScriptTests: XCTestCase {
 
     /// From a checkout, uninstall.sh reads the installed app's
     /// InsomniaResumeFrozenVersion before the recovery lock, with bounded
-    /// calls. A read that does not answer, fails, or finds a plist that does
-    /// not parse stops the run there, before the password is asked: which
-    /// backstop.sh speaks the app's interface is unknown, so none runs and
-    /// nothing is removed.
+    /// calls. A read that does not answer or fails stops the run there,
+    /// before the password is asked: which backstop.sh speaks the app's
+    /// interface is unknown, so none runs and nothing is removed. plutil's
+    /// exit 1 counts as "no such key" only with its exact words for that,
+    /// read back whole; a plist that does not parse, a NUL byte, output not
+    /// read back, words cut short or more words after them are reads that
+    /// failed. (plutil's words for a file that does not parse differ between
+    /// macOS versions, so only their start is checked.)
     func testUninstallStopsWhenTheInstalledVersionCannotBeRead() throws {
         typealias Setup = (ScriptFixture) throws -> Void
-        let cases: [(why: String, hung: Bool, setup: Setup)] = [
-            ("'plutil -extract InsomniaResumeFrozenVersion' did not answer within 5s", true, { f in
-                try f.plutilCalls(matching: "-extract InsomniaResumeFrozenVersion *", hang: true)
+        let read = "'plutil -extract InsomniaResumeFrozenVersion'"
+        let absent = "Could not extract value, error: No value at that key path or invalid key path: InsomniaResumeFrozenVersion"
+        let pattern = "-extract InsomniaResumeFrozenVersion *"
+        let cases: [(why: String, ends: String, hung: Bool, setup: Setup)] = [
+            ("\(read) did not answer within 5s", "", true, { f in
+                try f.plutilCalls(matching: pattern, hang: true)
             }),
-            ("'plutil -extract InsomniaResumeFrozenVersion' exited 2", false, { f in
-                try f.plutilCalls(matching: "-extract InsomniaResumeFrozenVersion *", hang: false)
+            ("\(read) exited 2", "", false, { f in
+                try f.plutilCalls(matching: pattern, hang: false)
             }),
-            ("it does not parse ('plutil -lint' exited 1)", false, { f in
+            ("\(read) exited 1 (", ")", false, { f in
                 try "not a property list".write(to: f.appInfo, atomically: true, encoding: .utf8)
+            }),
+            ("\(read) exited 1 and printed a NUL byte", "", false, { f in
+                try f.plutilSays(Data("\(f.appInfo.path): \(absent)\0\n".utf8), status: 1, matching: pattern)
+            }),
+            ("\(read) exited 1, but its output could not be read back", "", false, { f in
+                try f.plutilSays(Data(repeating: UInt8(ascii: "x"), count: 1_048_577), status: 1, matching: pattern)
+            }),
+            ("\(read) exited 1 (Could not extract value, error: No value at)", "", false, { f in
+                try f.plutilSays(Data("\(f.appInfo.path): Could not extract value, error: No value at".utf8), status: 1, matching: pattern)
+            }),
+            ("\(read) exited 1 (\(absent)) and printed more than that", "", false, { f in
+                try f.plutilSays(Data("\(f.appInfo.path): \(absent)\nplutil: read error\n".utf8), status: 1, matching: pattern)
+            }),
+            ("\(read) exited 1 and printed nothing", "", false, { f in
+                try f.plutilSays(Data(), status: 1, matching: pattern)
             }),
         ]
         for c in cases {
@@ -10583,7 +10704,8 @@ final class RecoveryScriptTests: XCTestCase {
             let r = try f.run(f.uninstall)
 
             XCTAssertEqual(r.status, 1, "\(c.why): " + r.stderr + r.stdout)
-            XCTAssertTrue(r.stderr.contains("Could not read InsomniaResumeFrozenVersion from \(f.appInfo.path): \(c.why). Which backstop.sh speaks the installed app's interface is unknown, so none was run. Nothing was removed; rerun once it reads."), "\(c.why): " + r.stderr)
+            XCTAssertTrue(r.stderr.contains("Could not read InsomniaResumeFrozenVersion from \(f.appInfo.path): \(c.why)"), "\(c.why): " + r.stderr)
+            XCTAssertTrue(r.stderr.contains("\(c.ends). Which backstop.sh speaks the installed app's interface is unknown, so none was run. Nothing was removed; rerun once it reads."), "\(c.why): " + r.stderr)
             let calls = f.calls()
             XCTAssertFalse(calls.contains { $0.hasPrefix("sudo") || $0.hasPrefix("launchctl") || $0.contains("FD9-OPEN") }, "\(c.why): \(calls)")
             if c.hung { XCTAssertTrue(f.hungProcessGone("plutil", within: 0), c.why) }
@@ -10655,8 +10777,10 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(try fx.lockIsFree())
     }
 
-    /// As above, when the plist on disk does not parse: only a plist that
-    /// parses pins nothing.
+    /// As above, when the plist on disk does not parse: plutil's exit 1
+    /// then says something other than that the key path holds no value, so
+    /// it does not show that the plist pins nothing. (plutil's words for a
+    /// file that does not parse differ between macOS versions.)
     func testInstallMovesNeitherBundleWhenThePlistOnDiskDoesNotParse() throws {
         let previous = try writeInterruptedSwap()
         try fx.writeState(Self.cleanJournal)
@@ -10666,12 +10790,116 @@ final class RecoveryScriptTests: XCTestCase {
         let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": ScriptFixture.account])
 
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
-        XCTAssertTrue(r.stderr.contains("aside at \(previous.path). 'plutil -lint \(fx.plist.path)' exited 1, so which of the two bundles it pins is unknown.\nNeither bundle was moved"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("aside at \(previous.path). 'plutil -extract ProgramArguments.4', which reads the requirement \(fx.plist.path) pins, exited 1 ("), r.stderr)
+        XCTAssertTrue(r.stderr.contains(").\nNeither bundle was moved"), r.stderr)
+        XCTAssertFalse(r.stderr.contains("No value at that key path"), r.stderr)
         XCTAssertFalse(fx.calls().contains { $0.hasPrefix("launchctl") }, "\(fx.calls())")
         XCTAssertEqual(try fx.installedBinaryFirstLine(), "interrupted")
         XCTAssertEqual(try String(contentsOf: previous.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "previous\n")
         XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "not a property list")
         XCTAssertTrue(try fx.lockIsFree())
+    }
+
+    /// After an interrupted swap and a clean recovery, which bundle the
+    /// plist on disk pins decides which one stays, and the other is moved
+    /// out or removed. plutil's exit 1 shows that the plist pins nothing only
+    /// with its exact words for a missing key path, read back whole, and
+    /// codesign shows that a bundle fails the pinned requirement only with
+    /// exit 3. Any other answer leaves it unknown: neither bundle is moved
+    /// or removed, no job is unloaded or loaded, the plist stays as it was,
+    /// and the lock is let go.
+    func testInstallMovesNeitherBundleWhenWhatThePlistPinsIsNotShown() throws {
+        typealias Setup = (ScriptFixture, URL) throws -> Void
+        let absent = "Could not extract value, error: No value at that key path or invalid key path: ProgramArguments.4"
+        let pattern = "-extract ProgramArguments.4 *"
+        let cases: [(name: String, says: (ScriptFixture, URL) -> String, setup: Setup)] = [
+            ("output not read back", { f, _ in "'plutil -extract ProgramArguments.4', which reads the requirement \(f.plist.path) pins, exited 1, but its output could not be read back." }, { f, _ in
+                try f.plutilSays(Data(repeating: UInt8(ascii: "x"), count: 1_048_577), status: 1, matching: pattern)
+            }),
+            ("a NUL byte", { f, _ in "'plutil -extract ProgramArguments.4', which reads the requirement \(f.plist.path) pins, exited 1 and printed a NUL byte." }, { f, _ in
+                try f.plutilSays(Data("\(f.plist.path): \(absent)\0\n".utf8), status: 1, matching: pattern)
+            }),
+            ("words cut short", { f, _ in "'plutil -extract ProgramArguments.4', which reads the requirement \(f.plist.path) pins, exited 1 (Could not extract value, error: No value at)." }, { f, _ in
+                try f.plutilSays(Data("\(f.plist.path): Could not extract value, error: No value at".utf8), status: 1, matching: pattern)
+            }),
+            ("an error after the words", { f, _ in "'plutil -extract ProgramArguments.4', which reads the requirement \(f.plist.path) pins, exited 1 (\(absent)) and printed more than that." }, { f, _ in
+                try f.plutilSays(Data("\(f.plist.path): \(absent)\nplutil: read error\n".utf8), status: 1, matching: pattern)
+            }),
+            ("the words of another key path", { f, _ in "'plutil -extract ProgramArguments.4', which reads the requirement \(f.plist.path) pins, exited 1 (Could not extract value, error: No value at that key path or invalid key path: Label)." }, { f, _ in
+                try f.plutilSays(Data("\(f.plist.path): Could not extract value, error: No value at that key path or invalid key path: Label\n".utf8), status: 1, matching: pattern)
+            }),
+            ("codesign exit 1 on $APP", { f, _ in "'codesign --verify' on \(f.app.path), which tells which of the two bundles \(f.plist.path) pins, exited 1." }, { f, _ in
+                try FileManager.default.removeItem(at: f.root.appendingPathComponent("codesign.rejects"))
+                try f.failRequirementCheck(of: f.app)
+            }),
+            ("codesign exit 1 on the previous bundle", { f, previous in "'codesign --verify' on \(previous.path), which tells which of the two bundles \(f.plist.path) pins, exited 1." }, { f, previous in
+                try f.failRequirementCheck(of: previous)
+            }),
+        ]
+        for c in cases {
+            fx.destroy()
+            fx = try ScriptFixture()
+            let f: ScriptFixture = fx
+            let previous = try writeInterruptedSwap()
+            try f.writeState(Self.cleanJournal)
+            f.setMode("launchctl", "loaded")
+            try c.setup(f, previous)
+            let plistBefore = try Data(contentsOf: f.plist)
+
+            let r = try f.run(f.installRedirected, extraEnvironment: ["USER": ScriptFixture.account])
+
+            XCTAssertEqual(r.status, 1, "\(c.name): " + r.stderr + r.stdout)
+            XCTAssertTrue(r.stderr.contains("aside at \(previous.path). \(c.says(f, previous))\nNeither bundle was moved and no LaunchAgent job was unloaded"), "\(c.name): " + r.stderr)
+            XCTAssertTrue(r.stderr.contains("The recovery journal was clean when\nchecked above."), "\(c.name): " + r.stderr)
+            let calls = f.calls()
+            XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl bootout") || $0.hasPrefix("launchctl bootstrap") }, "\(c.name): \(calls)")
+            XCTAssertFalse(calls.contains { $0.hasPrefix("rm ") && $0.contains(previous.path) }, "\(c.name): \(calls)")
+            XCTAssertEqual(try f.installedBinaryFirstLine(), "interrupted", c.name)
+            XCTAssertEqual(try String(contentsOf: previous.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "previous\n", c.name)
+            XCTAssertEqual(try f.contents(of: f.appsDir), [".Insomnia.app.previous", "Insomnia.app"], "only the staged build is discarded: \(c.name)")
+            XCTAssertEqual(try Data(contentsOf: f.plist), plistBefore, c.name)
+            XCTAssertTrue(try f.lockIsFree(), c.name)
+        }
+    }
+
+    /// The controls for the test above, with the same interrupted swap and
+    /// clean recovery. A plist with no fifth program argument, which plutil
+    /// says in its exact words, pins neither bundle, and so does one both
+    /// bundles fail with codesign's exit 3: the set-aside copy is spare and
+    /// is removed, and $APP stays. The same exact words printed by the fake
+    /// count too, while the bundle at $APP fails with exit 3.
+    func testInstallRemovesTheSetAsideBundleWhenThePlistIsShownToPinNeither() throws {
+        typealias Setup = (ScriptFixture, URL) throws -> Void
+        let cases: [(name: String, setup: Setup)] = [
+            ("no fifth program argument", { f, _ in
+                let dict: [String: Any] = ["Label": "com.insomnia.backstop", "ProgramArguments": ["/bin/sh", "-c"]]
+                try PropertyListSerialization.data(fromPropertyList: dict, format: .xml, options: 0).write(to: f.plist)
+            }),
+            ("plutil's exact words", { f, _ in
+                try f.plutilSays(Data("\(f.plist.path): Could not extract value, error: No value at that key path or invalid key path: ProgramArguments.4\n".utf8), status: 1, matching: "-extract ProgramArguments.4 *")
+            }),
+            ("both bundles fail with exit 3", { f, previous in
+                try f.rejectSignature(of: previous)
+            }),
+        ]
+        for c in cases {
+            fx.destroy()
+            fx = try ScriptFixture()
+            let f: ScriptFixture = fx
+            let previous = try writeInterruptedSwap()
+            try f.writeState(Self.cleanJournal)
+            // launchctl mode ok: nothing is loaded, and a bootstrap's job is never listed
+            try c.setup(f, previous)
+
+            let r = try f.run(f.installRedirected, extraEnvironment: ["USER": ScriptFixture.account])
+
+            XCTAssertEqual(r.status, 1, "\(c.name): " + r.stderr + r.stdout)
+            XCTAssertTrue(r.stdout.contains("removed the bundle an interrupted run had set aside; \(f.app.path) stays"), "\(c.name): " + r.stdout)
+            XCTAssertTrue(f.calls().contains("rm -rf \(previous.path)"), "\(c.name): \(f.calls())")
+            XCTAssertEqual(try f.installedBinaryFirstLine(), "interrupted", c.name)
+            XCTAssertEqual(try f.contents(of: f.appsDir), ["Insomnia.app"], c.name)
+            XCTAssertTrue(try f.lockIsFree(), c.name)
+        }
     }
 
     /// install.sh lints the new LaunchAgent plist under the recovery lock,
@@ -11569,14 +11797,14 @@ final class RecoveryScriptTests: XCTestCase {
     /// failed recovery, saying so; one that does not (125) stops it at once
     /// and keeps the lock until it ends. Nothing is replaced or unloaded,
     /// and the version evidence, "none" with no app at $APP, went down. The
-    /// staging step's ACL removal is skipped (skipACLRemoval).
+    /// staging step's ACL removal is skipped, as in every fixture that does
+    /// not ask for useNativeACLs.
     func testInstallStopsWhenItsBackstopDoesNotFinishInTime() throws {
         for mode in ["stop", "receive"] {
             let f = try ScriptFixture()
             defer { f.releaseCommand(); f.destroy() }
             try f.writeInstallCopies(extraConstants: ["BACKSTOP_TIMEOUT_SECONDS": "2"])
             try f.prepareInstall()
-            try f.skipACLRemoval()
             try "trusted".write(to: f.plist, atomically: true, encoding: .utf8)
             try f.writeState(Self.cleanJournal)
             f.setMode("launchctl", "loaded")
@@ -12362,7 +12590,9 @@ private final class ScriptFixture {
     /// and the rule, its lock and the app are the fixture's. ROOT_UID is the
     /// account running the tests, which owns every file the fake sudo's root
     /// shell checks. DSMEMBERUTIL is always the fake, so no test asks the
-    /// real directory service whose entry an access control list names. A test that needs another constant (a longer
+    /// real directory service whose entry an access control list names,
+    /// and so is PERL, so root reads no access control list unless a test
+    /// asks for that (useNativeACLs). A test that needs another constant (a longer
     /// CALL_TIMEOUT_SECONDS, while a gate holds the fake sudo) rewrites the
     /// copy with it.
     func writeUninstallCopy(extraConstants: [String: String]) throws {
@@ -12378,6 +12608,7 @@ private final class ScriptFixture {
             "KILL": bin.appendingPathComponent("kill").path,
             "CP": bin.appendingPathComponent("cp").path,
             "DSMEMBERUTIL": bin.appendingPathComponent("dsmemberutil").path,
+            "PERL": bin.appendingPathComponent("perl").path,
             "APP": app.path,
             "SUDOERS": sudoers.path,
             "SUDOERS_LOCK": sudoersLock.path,
@@ -12390,7 +12621,9 @@ private final class ScriptFixture {
 
     /// install.sh: every $HOME-derived path and every tool is redirected
     /// into the fixture (signing, sudo, launchctl included; the build goes
-    /// through the patched build-app.sh above). Tests that need another
+    /// through the patched build-app.sh above). PERL, CHMOD and DITTO are
+    /// the fakes, so a run reads and changes no access control list unless
+    /// a test asks for that (useNativeACLs). Tests that need another
     /// constant (the real CODESIGN) rewrite both copies with it.
     func writeInstallCopies(extraConstants: [String: String]) throws {
         let patchedInstall = try Self.patch(try parsedScript("install.sh"), installConstants(appsDir: appsDir, home: home).merging(extraConstants) { $1 })
@@ -12432,6 +12665,8 @@ private final class ScriptFixture {
             "MKTEMP": bin.appendingPathComponent("mktemp").path,
             "MKDIR": bin.appendingPathComponent("mkdir").path,
             "CHMOD": bin.appendingPathComponent("chmod").path,
+            "DITTO": bin.appendingPathComponent("ditto").path,
+            "PERL": bin.appendingPathComponent("perl").path,
             "PLUTIL": bin.appendingPathComponent("plutil").path,
             "LOCK_TIMEOUT_SECONDS": "1",
             "CALL_TIMEOUT_SECONDS": "5",
@@ -12897,7 +13132,9 @@ private final class ScriptFixture {
         // "deep-verify-fails" fails only the `--deep` form install.sh runs
         // on a prebuilt bundle, and "requirement-verify-fails" only the
         // `-R=` form (the agent's pinned check). A path listed in
-        // codesign.rejects (see `rejectSignature(of:)`) fails every form.
+        // codesign.rejects (see `rejectSignature(of:)`) fails every form
+        // with exit 3, and one listed in codesign.fails (see
+        // `failRequirementCheck(of:)`) fails the `-R=` form with exit 1.
         // Mode "verify-hangs": `--verify` never answers (see hangHere);
         // "verify-hangs-under-lock": only while someone holds the recovery
         // lock.
@@ -12924,6 +13161,7 @@ private final class ScriptFixture {
               if [[ "$mode" == verify-hangs ]]; then hang_here; fi
               if [[ "$mode" == verify-hangs-under-lock ]] && lock_held; then hang_here; fi
               if [[ -f "\(r)/codesign.rejects" ]] && grep -qxF -- "$last" "\(r)/codesign.rejects"; then echo "$last: does not satisfy its designated Requirement" >&2; exit 3; fi
+              if (( pinned )) && [[ -f "\(r)/codesign.fails" ]] && grep -qxF -- "$last" "\(r)/codesign.fails"; then echo "$last: a sealed resource is missing or invalid" >&2; exit 1; fi
               if [[ "$mode" == verify-fails || ( "$mode" == deep-verify-fails && $deep == 1 ) || ( "$mode" == requirement-verify-fails && $pinned == 1 ) ]]; then echo "$last: a sealed resource is missing or invalid" >&2; exit 1; fi
               exit 0 ;;
           esac
@@ -13007,14 +13245,19 @@ private final class ScriptFixture {
         // chmod: recorded in chmod.calls, apart from calls.log, then run for
         // real so the modes still change. A path that a line of chmod.fail
         // (a bash glob; a plain path matches only itself) matches fails the
-        // way an immutable file does. With chmod.no-acl, a call with -N
-        // (which removes ACL entries) is recorded as "chmod SKIPPED-ACL
-        // <arguments>" and succeeds without running, so a test that does
-        // not check ACLs changes none (see skipACLRemoval).
+        // way an immutable file does. A call with -N (which removes ACL
+        // entries) is recorded as "chmod SKIPPED-ACL <arguments>" and
+        // succeeds without running, and one with another ACL option (+a,
+        // -a, =a, -E, -C, -i, -I) exits 2 without running, so no test
+        // changes an ACL through it; with chmod.native-acl (see
+        // useNativeACLs) both run for real.
         try writeFake("chmod", """
-        if [[ -f "\(r)/chmod.no-acl" ]]; then
+        if [[ ! -f "\(r)/chmod.native-acl" ]]; then
           for a in "$@"; do
-            if [[ "$a" == -N ]]; then printf 'chmod SKIPPED-ACL %s\\n' "$*" >> "\(r)/chmod.calls"; exit 0; fi
+            case "$a" in
+              -N) printf 'chmod SKIPPED-ACL %s\\n' "$*" >> "\(r)/chmod.calls"; exit 0 ;;
+              +a*|-a*|=a*|-E|-C|-i|-I) echo "chmod: this fixture changes no ACL: $*" >&2; exit 2 ;;
+            esac
           done
         fi
         printf 'chmod %s\\n' "$*" >> "\(r)/chmod.calls"
@@ -13027,6 +13270,24 @@ private final class ScriptFixture {
           done < "\(r)/chmod.fail"
         fi
         exec /bin/chmod "$@"
+        """)
+        // ditto: install.sh's DITTO, which copies a bundle to a path that
+        // is not there yet. Recorded in ditto.calls, apart from calls.log.
+        // The real ditto copies ACLs as well, so it reads them; this one
+        // makes the copy with /bin/cp -R, which keeps the files, links,
+        // modes (less the umask) and extended attributes and copies an
+        // ACL only with -p. Any other call (options, another count of
+        // arguments, a source that is not a folder or is a link, a
+        // destination that is there) exits 1 without copying. With
+        // ditto.native (see useNativeACLs) the real ditto runs.
+        try writeFake("ditto", """
+        printf 'ditto %s\\n' "$*" >> "\(r)/ditto.calls"
+        if [[ -f "\(r)/ditto.native" ]]; then exec /usr/bin/ditto "$@"; fi
+        if (( $# != 2 )) || [[ "$1" == -* || "$2" == -* || -L "$1" || ! -d "$1" || -e "$2" || -L "$2" ]]; then
+          echo "ditto: this fixture copies only a folder to a path that is not there yet: $*" >&2
+          exit 1
+        fi
+        exec /bin/cp -R "$1" "$2"
         """)
         // cp: the CP of uninstall.sh and of backstop copies that read
         // through fakes, which copy session.json and state.json into the
@@ -13122,24 +13383,29 @@ private final class ScriptFixture {
             exec \(real) "$@"
             """)
         }
-        // perl: the PERL of install.sh and uninstall.sh copies whose root
-        // shell reads access control lists through a fake. That PERL also
-        // starts the backstop as the leader of its own process group and
-        // asks whether that group is empty (group_gone); those two programs,
-        // matched as the scripts write them, go straight to /usr/bin/perl
-        // with the same pid and are not counted, so the backstop's
-        // supervisor sees what it would with the real perl. Apart from them
-        // it takes only the call root's r_acl makes (-e <reader> -- then
-        // pairs of what stat said and a name) and counts those calls in
-        // perl.count. On the call perl.rewrite names, it first writes the
-        // text of rule.replacement into the rule in place (the same file,
-        // logged "perl REWROTE-RULE"); on the call perl.replace names, it
-        // first puts that text at the rule's path by a rename (a new file,
-        // logged "perl REPLACED-RULE").
+        // perl: the PERL of every install.sh and uninstall.sh copy. That
+        // PERL also starts the backstop as the leader of its own process
+        // group and asks whether that group is empty (group_gone); those
+        // two programs, matched as the scripts write them, go straight to
+        // /usr/bin/perl with the same pid and are not counted, so the
+        // backstop's supervisor sees what it would with the real perl.
+        // Apart from them it takes only the call root's r_acl makes (-e
+        // <reader> -- then pairs of what stat said and a name) and counts
+        // those calls in perl.count. On the call perl.rewrite names, it
+        // first writes the text of rule.replacement into the rule in place
+        // (the same file, logged "perl REWROTE-RULE"); on the call
+        // perl.replace names, it first puts that text at the rule's path by
+        // a rename (a new file, logged "perl REPLACED-RULE").
         // For a name a line of perl.fail (a bash glob) matches, it exits 1
-        // as an open that fails. Otherwise it runs /usr/bin/perl with the
-        // same arguments, the real reader, and passes on its answer with
-        // these changes: for each name a line "<glob>|<text>" of perl.entry
+        // as an open that fails. Otherwise it reads with /usr/bin/perl and
+        // the identity reader below: it opens each name the way the real
+        // reader does and compares the type, device and file ID fstat gives
+        // with the pair, with the real reader's words for a failed open or
+        // another file, and prints "checked <pairs>". It reads no access
+        // control list, so it prints no entry. With perl.native-acl (see
+        // useNativeACLs) it runs the real reader, the same arguments,
+        // instead. Either answer is passed on
+        // with these changes: for each name a line "<glob>|<text>" of perl.entry
         // matches, on every call or only on the call perl.entry.at names, a
         // line "<pair> <text>" before the last line, as the reader prints an
         // entry that allows a change (logged "perl ADDED-ENTRY"); without the
@@ -13179,7 +13445,22 @@ private final class ScriptFixture {
             done < "\(r)/perl.entry"
           fi
         done
-        out="$(/usr/bin/perl "$@" 2>&1)" || { rc=$?; printf '%s\\n' "$out"; exit "$rc"; }
+        if [[ -f "\(r)/perl.native-acl" ]]; then
+          out="$(/usr/bin/perl "$@" 2>&1)" || { rc=$?; printf '%s\\n' "$out"; exit "$rc"; }
+        else
+          # The mode's file type (st_mode >> 12) as the vnode type
+          # fgetattrlist gives: FIFO 7, character device 4, folder 2, block
+          # device 3, regular file 1, link 5, socket 6.
+          id_reader='@ARGV%2==0&&@ARGV or die "no files named\\n";
+        for(my $k=0;$k<@ARGV;$k+=2){my($want,$p)=@ARGV[$k,$k+1];
+        sysopen(my $h,$p,4|256|($want=~/^4 /?1048576:0)) or die "$p could not be opened: $!\\n";
+        my @s=stat($h) or die "$p could not be read: $!\\n";
+        my $type=({1,7,2,4,4,2,6,3,8,1,10,5,12,6}->{($s[2]>>12)&15}//0);
+        my($t,$i)=split(/ /,$want,2);
+        $type==({4,2,10,1}->{$t}//0)&&$i eq "$s[0]:$s[1]" or die "$p: type $type, file $s[0]:$s[1], not $want\\n"}
+        print("checked ",@ARGV/2,"\\n")'
+          out="$(/usr/bin/perl -e "$id_reader" -- "${@:4}" 2>&1)" || { rc=$?; printf '%s\\n' "$out"; exit "$rc"; }
+        fi
         last="${out##*$'\\n'}"
         [[ "$out" == *$'\\n'* ]] && printf '%s\\n' "${out%$'\\n'*}"
         if (( ${#added[@]} > 0 )); then printf '%s\\n' "${added[@]}"; printf 'perl ADDED-ENTRY\\n' >> "\(calls)"; fi
@@ -13215,9 +13496,10 @@ private final class ScriptFixture {
         // insomnia.ppid, the link count and type of what its standard input
         // and output are open on to insomnia.io, one line each, and the
         // inode of the file open on its fd 9 to insomnia.fd9 (empty without
-        // an fd 9). Modes: "raw" prints insomnia.output verbatim and
-        // exits with insomnia.status. "hang" prints its answer and then
-        // sleeps for 300 s, so only a signal ends it in time. "hold" waits
+        // an fd 9), each from a stat of the descriptor itself, not of
+        // /dev/fd/N (see pin_output). Modes: "raw" prints insomnia.output
+        // verbatim and exits with insomnia.status. "hang" prints its answer
+        // and then sleeps for 300 s, so only a signal ends it in time. "hold" waits
         // until insomnia.release exists (30 s at most), records "Insomnia
         // released", and then answers as usual. A test that
         // needs SIGTERM ignored runs the backstop with it ignored (see
@@ -13232,8 +13514,8 @@ private final class ScriptFixture {
         for line in "${input[@]}"; do joined="${joined:+$joined; }$line"; done
         printf 'Insomnia %s < %s\\n' "$*" "$joined" >> "\(calls)"
         echo "$PPID" > "\(r)/insomnia.ppid"
-        /usr/bin/stat -f '%l %HT' /dev/fd/0 /dev/fd/8 8>&1 > "\(r)/insomnia.io" 2>/dev/null || :
-        if [[ -e /dev/fd/9 ]]; then stat -f %i /dev/fd/9 > "\(r)/insomnia.fd9"; else : > "\(r)/insomnia.fd9"; fi
+        { /usr/bin/stat -f '%l %HT'; /usr/bin/stat -f '%l %HT' <&8; } 8>&1 > "\(r)/insomnia.io" 2>/dev/null || :
+        /usr/bin/stat -f %i 2>/dev/null <&9 > "\(r)/insomnia.fd9" || : > "\(r)/insomnia.fd9"
         mode="$(cat "\(r)/insomnia.mode" 2>/dev/null || echo ok)"
         if [[ "$mode" == hold ]]; then
           for (( i = 0; i < 300; i++ )); do
@@ -13354,7 +13636,10 @@ private final class ScriptFixture {
         // against each argument and against all of them joined by spaces, so
         // a plain path matches every call that reads that file. With
         // plutil.fail.from holding N, only the Nth call that plutil.fail
-        // matches and those after it fail (counted in plutil.fail.count).
+        // matches and those after it fail (counted in plutil.fail.count). A
+        // call that a line of plutil.say matches prints the bytes of
+        // plutil.say.out as they are and exits with the status in
+        // plutil.say.status (see plutilSays).
         try writeFake("plutil", """
         \(hangHere("plutil"))
         all="$*"
@@ -13373,6 +13658,7 @@ private final class ScriptFixture {
           if [[ "$a" == */Contents/Info.plist ]]; then printf '%s\\n' "$a" >> "\(r)/plutil.reads"; fi
         done
         if matches "\(r)/plutil.hang"; then hang_here; fi
+        if matches "\(r)/plutil.say"; then cat "\(r)/plutil.say.out"; exit "$(cat "\(r)/plutil.say.status")"; fi
         # plutil.nul: answers "true", a NUL byte and a newline, exit 0.
         # plutil.partial: the real answer's first byte, then exit 2.
         if matches "\(r)/plutil.nul"; then printf 'true\\0\\n'; exit 0; fi
@@ -13548,6 +13834,13 @@ private final class ScriptFixture {
     func answer(_ tool: String, _ how: String, matching pattern: String) throws {
         try (pattern + "\n").write(to: root.appendingPathComponent("\(tool).\(how)"), atomically: true, encoding: .utf8)
     }
+    /// Makes each plutil call that `pattern` matches print `output` byte for
+    /// byte and exit with `status` (the fake plutil's plutil.say).
+    func plutilSays(_ output: Data, status: Int32, matching pattern: String) throws {
+        try answer("plutil", "say", matching: pattern)
+        try output.write(to: root.appendingPathComponent("plutil.say.out"))
+        try String(status).write(to: root.appendingPathComponent("plutil.say.status"), atomically: true, encoding: .utf8)
+    }
 
     /// The calls the fake cp recorded.
     func copyCalls() -> [String] {
@@ -13570,6 +13863,14 @@ private final class ScriptFixture {
     /// only, the way a bundle that is not the build a requirement pins does.
     func rejectSignature(of url: URL) throws {
         let list = root.appendingPathComponent("codesign.rejects")
+        let existing = (try? String(contentsOf: list, encoding: .utf8)) ?? ""
+        try (existing + url.path + "\n").write(to: list, atomically: true, encoding: .utf8)
+    }
+    /// Makes the pinned check (`--verify -R=`) of the bundle at `url` exit
+    /// 1, as codesign does for a sealed resource it cannot read: a failed
+    /// check that does not say the requirement is unmet.
+    func failRequirementCheck(of url: URL) throws {
+        let list = root.appendingPathComponent("codesign.fails")
         let existing = (try? String(contentsOf: list, encoding: .utf8)) ?? ""
         try (existing + url.path + "\n").write(to: list, atomically: true, encoding: .utf8)
     }
@@ -13610,10 +13911,18 @@ private final class ScriptFixture {
 
     var supervisorKill: URL { root.appendingPathComponent("supervisor.kill") }
 
-    /// Makes the fake chmod skip every call with -N (see its comment), so an
-    /// install that reaches its staging step changes no ACL.
-    func skipACLRemoval() throws {
-        try "".write(to: root.appendingPathComponent("chmod.no-acl"), atomically: true, encoding: .utf8)
+    /// Lets the named fakes read or change access control lists the way the
+    /// real tools do (see each fake's comment): "perl" runs root's real
+    /// reader, "chmod" runs -N and the other ACL options, and "ditto" runs
+    /// the real ditto. Without this no fake reads or changes one. Only the
+    /// tests whose subject is a real access control list, a real signature
+    /// or a quarantine flag ask for it.
+    func useNativeACLs(_ fakes: [String] = ["perl", "chmod", "ditto"]) throws {
+        let flags = ["perl": "perl.native-acl", "chmod": "chmod.native-acl", "ditto": "ditto.native"]
+        for fake in fakes {
+            let flag = try XCTUnwrap(flags[fake], "no native mode for \(fake)")
+            try "".write(to: root.appendingPathComponent(flag), atomically: true, encoding: .utf8)
+        }
     }
 
     /// Makes the rule one only root can read, as the real one is (root's,
@@ -13867,6 +14176,11 @@ private final class ScriptFixture {
 
     func chmodCalls() -> [String] {
         guard let text = try? String(contentsOf: root.appendingPathComponent("chmod.calls"), encoding: .utf8) else { return [] }
+        return text.split(separator: "\n").map(String.init)
+    }
+
+    func dittoCalls() -> [String] {
+        guard let text = try? String(contentsOf: root.appendingPathComponent("ditto.calls"), encoding: .utf8) else { return [] }
         return text.split(separator: "\n").map(String.init)
     }
 
