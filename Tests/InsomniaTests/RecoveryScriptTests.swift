@@ -5430,11 +5430,13 @@ final class RecoveryScriptTests: XCTestCase {
     /// case, in the same string or another, read or not; only the first
     /// copy of a key, the one the app reads. Where the app does not read
     /// the string, or reads it as no record, it goes as any such string.
-    /// The placeholders start with insomnia-held-<k>-, k one more than the
-    /// greatest canonical k (at most 18 digits) any text of the journal's
-    /// holds, its letters, digits and dashes written as such or as \u
-    /// escapes (json_held_prefix), so that no string of the journal's is
-    /// read as one.
+    /// The placeholders start with insomnia-held-<k>-, a start no text of
+    /// the journal's holds, its letters, digits and dashes written as such
+    /// or as \u escapes (json_held_prefix), so that no string of the
+    /// journal's is read as one: k is one more than the greatest canonical
+    /// k of at most 18 digits the text holds, or, where the text holds that
+    /// k as well (Greptile 4239597182: 1000000000000000000 after eighteen
+    /// 9s), one of fewer digits it does not hold, chosen a digit at a time.
     func testTheRecordReaderKeepsFloatsAndNULsAsTheAppReadsThem() throws {
         let b = backslash
         func utf8(_ s: String) -> Data { Data(s.utf8) }
@@ -5454,6 +5456,11 @@ final class RecoveryScriptTests: XCTestCase {
         let bundle = ("appNapOverrides[].bundleId", "appNapOverrides[0].bundleId")
         let long = String(repeating: "n", count: 1100) + "\(b)u0000"
         let many = String(repeating: String(repeating: "n", count: 1000) + "\(b)u0000", count: 70)
+        let nines = String(repeating: "9", count: 18)
+        let after = "1" + String(repeating: "0", count: 18)
+        // Each digit as a \u escape, 6 characters a digit.
+        func escaped(_ digits: String) -> String { digits.map { "\(b)u003\($0)" }.joined() }
+        let starts = ["0", "0", "1", "2", "3", "4", "5", "5", "7", "8", "9", "00", nines, after].map { #""insomnia-held-\#($0)-""# }.joined(separator: ",")
         let cases: [(label: String, bytes: Data, prints: String, appReads: Bool)] = [
             ("NUL byte in a key the app skips", utf8("{\"a\":{\"x\u{0}\":1}}"), skippedNUL, true),
             ("NUL byte in a string the app reads", utf8("{\"appNapOverrides\":[{\"bundleId\":\"a\u{0}b\"}]}"),
@@ -5523,7 +5530,21 @@ final class RecoveryScriptTests: XCTestCase {
             ("a placeholder's start with 18 digits",
              utf8(#"{"note":"insomnia-held-999999999999999998-","appNapOverrides":[{"bundleId":"a\#(b)u0000"}]}"#),
              marked(0, bundle.0, bundle.1, "a\(b)u0000", k: "999999999999999999"), true),
-            ("starts no placeholder can have: a leading zero, 19 digits, no dash after",
+            ("a placeholder's start after eighteen 9s, beside others of 19 and 20 digits",
+             utf8(#"{"note":["insomnia-held-999999999999999999-","insomnia-held-1000000000000000001-","insomnia-held-10000000000000000000-"],"appNapOverrides":[{"bundleId":"a\#(b)u0000"}]}"#),
+             marked(0, bundle.0, bundle.1, "a\(b)u0000", k: "1000000000000000000"), true),
+            // Greptile 4239597182: the text holds the start after eighteen
+            // 9s too, so k is a start it does not hold.
+            ("saved output names that start as placeholders after eighteen 9s do",
+             utf8(#"{"savedAudioOutputs":[{"deviceUID":"u\#(b)u0000","name":"insomnia-held-999999999999999999-","volume":0.5,"muted":false},{"deviceUID":"v","name":"insomnia-held-1000000000000000000-0","volume":0.5,"muted":false}]}"#),
+             marked(0, "savedAudioOutputs[].deviceUID", "savedAudioOutputs[0].deviceUID", "u\(b)u0000"), true),
+            ("the starts after eighteen 9s and after 0, each digit an escape (19 digits in 114 characters)",
+             utf8(#"{"note":["\#(b)u0069nsomnia\#(b)u002Dheld-\#(escaped(nines))-","insomnia\#(b)u002dheld\#(b)u002d\#(escaped(after))\#(b)u002D","insomnia-held-\#(escaped("0"))-"],"appNapOverrides":[{"bundleId":"a\#(b)u0000"}]}"#),
+             marked(0, bundle.0, bundle.1, "a\(b)u0000", k: "1"), true),
+            ("the start after eighteen 9s, 0 to 9 but 6 with 0 and 5 twice, and 00",
+             utf8(#"{"note":[\#(starts)],"appNapOverrides":[{"bundleId":"a\#(b)u0000"}]}"#),
+             marked(0, bundle.0, bundle.1, "a\(b)u0000", k: "10"), true),
+            ("starts that leave k at 0: a leading zero, 19 digits, no dash after",
              utf8(#"{"note":["insomnia-held-07-","insomnia-held-1234567890123456789-","insomnia-held-5"],"appNapOverrides":[{"bundleId":"a\#(b)u0000"}]}"#),
              marked(0, bundle.0, bundle.1, "a\(b)u0000"), true),
             ("a Float plutil would write back as another", utf8(#"{"keptDisplayReadLit":0.5000000298023223876953125000000000000001}"#),
@@ -5558,6 +5579,9 @@ final class RecoveryScriptTests: XCTestCase {
              "frozenProcesses[0].bootSession \(unknown)", true),
             ("a bootSession the app does not read", utf8(#"{"frozenProcesses":[{"pid":1,"startedAt":5,"bootSession":"b\#(b)u0000"}]}"#),
              "frozenProcesses[0].bootSession \(unknown)", true),
+            ("an App Nap entry beside names that start as placeholders after eighteen 9s do",
+             utf8(#"{"savedAudioOutputs":\#(Self.namesAfterEighteenNines.json),"appNapOverrides":[{"bundleId":"a\#(b)u0000"}]}"#),
+             "savedAudioOutputs[0].deviceUID \(unknown)appNapOverrides[0].bundleId \(unknown)", true),
             ("no string that holds \\u0000", utf8(#"{"appNapOverrides":[{"bundleId":"a"}],"note":"\#(b)u0000"}"#), "", true),
         ], grep: grep.path)
     }
@@ -5571,6 +5595,16 @@ final class RecoveryScriptTests: XCTestCase {
     /// journal.
     private typealias PublishedJournalRow = (label: String, journal: String, ending: Bool, status: Int32, raws: [String],
                                              calls: (ScriptFixture) -> [String], undone: (inout RuntimeState, ScriptFixture) throws -> Void)
+
+    /// Greptile 4239597182: saved outputs whose names start as placeholders
+    /// after eighteen 9s do, one of them with a device UID that holds
+    /// \u0000 and one with a UID that starts as one after 0 does, as JSON
+    /// text, and the strings of theirs that start with insomnia-held-. The
+    /// placeholders of a journal that holds them start with
+    /// insomnia-held-1-, a start it does not hold.
+    static let namesAfterEighteenNines = (
+        json: #"[{"deviceUID":"d\u0000","name":"insomnia-held-999999999999999999-","volume":0.5,"muted":false},{"deviceUID":"insomnia-held-0-0","name":"insomnia-held-1000000000000000000-0","volume":0.5,"muted":false}]"#,
+        raws: ["insomnia-held-999999999999999999-", "insomnia-held-0-0", "insomnia-held-1000000000000000000-0"])
 
     private static func publishedJournalRows() -> [PublishedJournalRow] {
         let lit = "0.5000000298023223876953125000000000000001"
@@ -5630,6 +5664,20 @@ final class RecoveryScriptTests: XCTestCase {
              false, 1, [#"insomnia-held-0-1 n\u0000"#, #"k\u0000"#, #"com.example\u0000x"#],
              { [sleepOff($0), "defaults write com.example.y NSAppSleepDisabled -bool false"] },
              { s, _ in s.sleepDisabledByUs = false; s.frozenProcesses = [s.frozenProcesses[2]]; s.appNapOverrides.removeFirst() }),
+            // Greptile 4239597182: the placeholders start with
+            // insomnia-held-1-, which no name holds, through the boot
+            // given before Low Power Mode goes off, the undo at the end and
+            // the end recorded in the journal. savedOutputVolume, which
+            // only the app restores, stays, so the backstop exits 1, as
+            // uninstall does with the outputs it lists.
+            ("names that start as placeholders after eighteen 9s do, with Low Power Mode",
+             #"{"sleepDisabledByUs":true,"lowPowerSetByUs":true,"savedDisplayBrightness":\#(above),"displayRestoreRefused":true,"keptDisplayUnderLowPower":\#(above),"keptDisplayUnderLowPowerBoot":"boot\u0000","keptDisplayReadLit":\#(above),"savedAudioOutputs":\#(namesAfterEighteenNines.json),"savedOutputVolume":0.25}"#,
+             false, 1, [#"d\u0000"#] + namesAfterEighteenNines.raws, { [sleepOff($0), lowPowerOff($0)] },
+             { s, f in s.sleepDisabledByUs = false; s.lowPowerSetByUs = false; s.keptDisplayUnderLowPowerBoot = f.bootUUID }),
+            ("the end in the journal, beside names that start as placeholders after eighteen 9s do",
+             #"{"sleepDisabledByUs":true,"endedSession":"e\u0000","savedAudioOutputs":\#(namesAfterEighteenNines.json)}"#,
+             true, 1, [#"d\u0000"#] + namesAfterEighteenNines.raws, { [sleepOff($0)] },
+             { s, f in s.sleepDisabledByUs = false; s.endedSession = try Data(contentsOf: f.session).base64EncodedString() }),
         ]
     }
 
@@ -5728,10 +5776,12 @@ final class RecoveryScriptTests: XCTestCase {
             XCTAssertFalse(r.stderr.contains("malformed") || f.log().contains("malformed"), label)
             XCTAssertFalse(f.log().contains("could not publish"), label)
             // No placeholder of the view's shows; the journal's own strings
-            // that start like one may.
+            // that start like one may, as JSON text in quotes or, names
+            // that hold no \u0000, as themselves. The longest go first.
             var shown = r.stdout + r.stderr
-            for own in row.journal.components(separatedBy: "\"").filter({ $0.hasPrefix("insomnia-held-") }) {
-                shown = shown.replacingOccurrences(of: "\"\(own)\"", with: "")
+            let owns = row.journal.components(separatedBy: "\"").filter { $0.hasPrefix("insomnia-held-") }.sorted { $0.count > $1.count }
+            for own in owns {
+                shown = shown.replacingOccurrences(of: "\"\(own)\"", with: "").replacingOccurrences(of: own, with: "")
             }
             XCTAssertFalse(shown.contains("insomnia-held-"), label)
             let undoing = f.calls().filter { call in ["sudo -n ", "defaults write ", "defaults delete ", "kill "].contains { call.hasPrefix($0) } }
@@ -5759,14 +5809,20 @@ final class RecoveryScriptTests: XCTestCase {
     /// Mode goes off: the mode stays on, and the undo at the end still
     /// publishes the journal with that record as it was. The end recorded
     /// in the journal: it goes to the next place, and endedSession stays.
-    /// GREP failing, so that no placeholder can be had: the journal is
-    /// malformed, nothing is undone and state.json keeps its bytes.
+    /// Greptile 4239597182: the same two beside names that start as
+    /// placeholders after eighteen 9s do, the placeholders starting with
+    /// insomnia-held-1-. GREP failing, so that no placeholder can be had:
+    /// the journal is malformed, nothing is undone and state.json keeps
+    /// its bytes.
     func testAPublicationThatDoesNotPutEachStringBackKeepsWhatIsOwed() async throws {
         let above = "0.500000059604644775390625"
         let moved = try XCTUnwrap(Self.publishedJournalRows().first { $0.label == "frozen processes and App Nap entries taken out and moved up" })
         let lowPower = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":true,"savedDisplayBrightness":\#(above),"displayRestoreRefused":true,"keptDisplayUnderLowPower":\#(above),"keptDisplayUnderLowPowerBoot":"boot\u0000","keptDisplayReadLit":\#(above),"savedAudioOutputs":[{"deviceUID":"d\u0000","volume":0.5,"muted":false}]}"#
         let ending = #"{"sleepDisabledByUs":true,"endedSession":"e\u0000","savedAudioOutputs":[{"deviceUID":"d\u0000","volume":0.5,"muted":false}]}"#
         let appNap = #"{"sleepDisabledByUs":true,"appNapOverrides":[{"bundleId":"a\u0000","previous":true}]}"#
+        let names = Self.namesAfterEighteenNines
+        let lowPowerNames = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":true,"savedDisplayBrightness":\#(above),"displayRestoreRefused":true,"keptDisplayUnderLowPower":\#(above),"keptDisplayUnderLowPowerBoot":"boot\u0000","keptDisplayReadLit":\#(above),"savedAudioOutputs":\#(names.json)}"#
+        let endingNames = #"{"sleepDisabledByUs":true,"endedSession":"e\u0000","savedAudioOutputs":\#(names.json)}"#
         let sed = "/usr/bin/sed -i '' "
         // What the fake does after the undo's edit of frozenProcesses.
         let undo: [(label: String, tamper: String)] = [
@@ -5785,6 +5841,10 @@ final class RecoveryScriptTests: XCTestCase {
         let rows = undo.map { failing("the undo at the end: " + $0.label, moved.journal, "frozenProcesses", $0.tamper, false) } + [
             failing("the kept display entry's boot", lowPower, "keptDisplayUnderLowPowerBoot", sed + #"-e 's/"insomnia-held-0-1"/"d"/' "$file""#, false),
             failing("the end in the journal", ending, "endedSession", sed + #"-e 's/"insomnia-held-0-1"/"d"/' "$file""#, false),
+            failing("the kept display entry's boot, beside names that start as placeholders after eighteen 9s do", lowPowerNames,
+                    "keptDisplayUnderLowPowerBoot", sed + #"-e 's/"insomnia-held-1-1"/"d"/' "$file""#, false),
+            failing("the end in the journal, beside names that start as placeholders after eighteen 9s do", endingNames,
+                    "endedSession", sed + #"-e 's/"insomnia-held-1-1"/"d"/' "$file""#, false),
             failing("no placeholder can be had", appNap, "", "", true),
         ]
         var fixtures: [ScriptFixture] = []
@@ -5793,7 +5853,7 @@ final class RecoveryScriptTests: XCTestCase {
             let f = try ScriptFixture.concurrentRow()
             fixtures.append(f)
             try f.writeState(row.1)
-            if row.1 == ending {
+            if row.2 == "endedSession" {
                 // As in publishedJournalRows: the end can go to neither
                 // session.json's removal nor ended-session.json.
                 try f.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
@@ -5840,6 +5900,7 @@ final class RecoveryScriptTests: XCTestCase {
             XCTAssertEqual(r.status, 1, "\(label): \(r.stderr) \(log)")
             XCTAssertEqual(try f.contents(of: f.home).filter { $0.hasPrefix(".state.json") }, [], label)
             let published = try String(contentsOf: f.state, encoding: .utf8)
+            let owned = row.1.contains(names.json) ? names.raws : []
             switch row.2 {
             case "frozenProcesses":
                 XCTAssertEqual(published, row.1, label)
@@ -5852,13 +5913,13 @@ final class RecoveryScriptTests: XCTestCase {
                 XCTAssertTrue(log.contains(notPublished), "\(label): \(log)")
                 XCTAssertTrue(log.contains("could not publish this boot for the kept display entry's record to \(f.state.path); Low Power Mode left on"), "\(label): \(log)")
                 XCTAssertEqual(undoing, [sleepOff], label)
-                try checkPublishedJournal((label, row.1, false, 1, [#"boot\u0000"#, #"d\u0000"#], { _ in [] }, { s, _ in s.sleepDisabledByUs = false }), f)
+                try checkPublishedJournal((label, row.1, false, 1, [#"boot\u0000"#, #"d\u0000"#] + owned, { _ in [] }, { s, _ in s.sleepDisabledByUs = false }), f)
             case "endedSession":
                 XCTAssertTrue(log.contains(notPublished), "\(label): \(log)")
                 XCTAssertFalse(log.contains("(endedSession) instead"), "\(label): \(log)")
                 XCTAssertTrue(log.contains("its end is recorded in"), "\(label): \(log)")
                 XCTAssertEqual(undoing, [sleepOff], label)
-                try checkPublishedJournal((label, row.1, false, 1, [#"e\u0000"#, #"d\u0000"#], { _ in [] }, { s, _ in s.sleepDisabledByUs = false }), f)
+                try checkPublishedJournal((label, row.1, false, 1, [#"e\u0000"#, #"d\u0000"#] + owned, { _ in [] }, { s, _ in s.sleepDisabledByUs = false }), f)
             default:
                 XCTAssertEqual(published, row.1, label)
                 XCTAssertTrue(log.contains("appNapOverrides[0].bundleId holds \\u0000, which plutil cannot hold, and no placeholder for it could be had here, so what the app reads is not known here"), "\(label): \(log)")
@@ -5896,6 +5957,32 @@ final class RecoveryScriptTests: XCTestCase {
             XCTAssertFalse(out.contains("insomnia-held-") || out.contains("\u{0}"), out)
         }
         XCTAssertEqual(r.stderr.components(separatedBy: "\u{E000}").count, 2, r.stderr)
+    }
+
+    /// Greptile 4239597182: uninstall shows names of saved outputs that
+    /// start as placeholders after eighteen 9s do as themselves, and an
+    /// output with no name by its device UID that holds \u0000, as the
+    /// journal writes it, once. At 23bfb75 the placeholder for the first
+    /// output's UID, which also holds \u0000, was
+    /// insomnia-held-1000000000000000000-0, the second output's name,
+    /// which was then shown as that UID's text.
+    func testUninstallShowsNamesThatStartAsPlaceholdersAfterEighteenNinesAsThemselves() throws {
+        try fx.installMachinery()
+        let outputs = Self.namesAfterEighteenNines.json.dropLast() + #",{"deviceUID":"e\u0000","volume":0.5,"muted":false}]"#
+        let json = #"{"sleepDisabledByUs":false,"savedAudioOutputs":\#(outputs)}"#
+        try fx.writeState(json)
+
+        let r = try fx.run(fx.uninstall, [])
+
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertTrue(fx.exists(fx.app))
+        XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), json)
+        let note = #" (as JSON text in state.json, where \u0000 is a NUL character)"#
+        XCTAssertTrue(r.stderr.contains("insomnia-held-999999999999999999- is still muted from a lid close"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("insomnia-held-1000000000000000000-0 is still muted from a lid close"), r.stderr)
+        XCTAssertEqual(r.stderr.components(separatedBy: #""e\u0000""# + note + " is still muted from a lid close").count, 2, r.stderr)
+        XCTAssertFalse(r.stderr.contains(#""d\u0000""#), r.stderr)
+        XCTAssertFalse(r.stderr.contains("insomnia-held-1-"), r.stderr)
     }
 
     /// The same records in a form the app reads do not stop the uninstall:

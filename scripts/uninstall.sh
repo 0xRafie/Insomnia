@@ -841,25 +841,67 @@ json_string_check() { # text between the quotes
 }
 
 # For json_held_token: held_prefix, the start of every placeholder the
-# view holds for a string that holds \u0000: insomnia-held-<k>-, k one more
-# than the greatest k any string of the text, read as the app reads it,
-# holds such a prefix with (0 when none does). A string holds one only where
-# the text writes each of its letters, digits and dashes as such or as a \u
-# escape; grep(1) finds every place it does in all of the text (pieces) in
-# one pass. A k written with a leading zero, or of more than 18 digits, is
-# none that can be chosen. Non-zero when grep fails.
+# view holds for a string that holds \u0000: insomnia-held-<k>-, a start no
+# string of the text holds, read as the app reads it. A string holds
+# insomnia-held-<j>- only where the text writes each of its letters, digits
+# and dashes as such or as a \u escape; grep(1) finds every place it does
+# in all of the text (pieces) in one pass. Each j found of at most 19
+# digits, as many as a k chosen here can have, is kept as its digits (seen,
+# n of them); a digit is written in 1 or 6 characters, so a j written in
+# more than 114 has more than 19 and is not decoded. k is one more than the
+# greatest j kept of at most 18 digits with no leading zero (0 when there
+# is none), taken when no j kept is k, digit for digit. When one is (as
+# 1000000000000000000 can be, after eighteen 9s), k is chosen a digit at a
+# time instead: d is the fewest digits with 10^d above n (n is far below
+# 10^18, as each j takes 16 bytes of the text), each j kept of at most d
+# digits is written in d with zeros before it (left), and each step adds
+# the digit that the fewest of those that start as k does so far have
+# next, the lowest of any that tie. Fewer than 10^(d-s) of them start as k
+# does after s steps, so after d steps none does: k, its zeros before it
+# then taken off, is no j kept, and has fewer digits than any j not kept.
+# The j kept are gone over at most d + 2 times. Non-zero when grep fails.
 json_held_prefix() {
-  local hp k line found rc=0 top=-1
+  local hp j k line found rc=0 top=-1 hit=0 n=0 m=0 d s b c cap pad=000000000000000000
+  local -a seen left cnt
   hp='(i|\\u0069)(n|\\u006[eE])(s|\\u0073)(o|\\u006[fF])(m|\\u006[dD])(n|\\u006[eE])(i|\\u0069)(a|\\u0061)(-|\\u002[dD])(h|\\u0068)(e|\\u0065)(l|\\u006[cC])(d|\\u0064)(-|\\u002[dD])(([0-9]|\\u003[0-9])+)(-|\\u002[dD])'
   found="$(printf '%s' ${pieces[@]+"${pieces[@]}"} | LC_ALL=C "$GREP" -a -o -E -e "$hp" 2> /dev/null)" || rc=$?
   (( rc <= 1 )) || return 1
+  seen=()
   while IFS= read -r line; do
-    if [[ "$line" =~ ^$hp$ ]] && (( ${#BASH_REMATCH[15]} <= 108 )); then
-      k="${BASH_REMATCH[15]//\\u003/}"
-      if [[ "$k" =~ ^(0|[1-9][0-9]{0,17})$ ]] && (( 10#$k > top )); then top=$((10#$k)); fi
+    if [[ "$line" =~ ^$hp$ ]] && (( ${#BASH_REMATCH[15]} <= 114 )); then
+      j="${BASH_REMATCH[15]//\\u003/}"
+      if (( ${#j} <= 19 )); then seen[n]=$j; n=$((n + 1)); fi
+      if [[ "$j" =~ ^(0|[1-9][0-9]{0,17})$ ]] && (( 10#$j > top )); then top=$((10#$j)); fi
     fi
   done <<< "$found"
-  held_prefix="insomnia-held-$((top + 1))-"
+  k=$((top + 1))
+  for j in ${seen[@]+"${seen[@]}"}; do
+    if [[ "$j" == "$k" ]]; then hit=1; break; fi
+  done
+  if (( hit )); then
+    d=1
+    cap=10
+    while (( cap <= n )); do d=$((d + 1)); cap=$((cap * 10)); done
+    left=()
+    for j in "${seen[@]}"; do
+      if (( ${#j} <= d )); then left[m]="${pad:0:d-${#j}}$j"; m=$((m + 1)); fi
+    done
+    k=""
+    for (( s = 0; s < d; s++ )); do
+      cnt=(0 0 0 0 0 0 0 0 0 0)
+      for j in ${left[@]+"${left[@]}"}; do
+        if [[ "${j:0:s}" == "$k" ]]; then c=${j:s:1}; cnt[c]=$((cnt[c] + 1)); fi
+      done
+      b=0
+      for (( c = 1; c < 10; c++ )); do
+        (( cnt[c] >= cnt[b] )) || b=$c
+      done
+      k="$k$b"
+    done
+    k="${k#"${k%%[1-9]*}"}"
+    k="${k:-0}"
+  fi
+  held_prefix="insomnia-held-$k-"
   return 0
 }
 

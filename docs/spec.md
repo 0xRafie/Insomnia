@@ -772,11 +772,15 @@ string the app reads or between values is refused, as the app refuses it.
 A string the app reads that holds `\u0000`, which `plutil` cannot hold, is
 held in the view as a placeholder string, `insomnia-held-<k>-<n>`, and each
 journal published from the view has each placeholder written back as its
-string's own text, byte for byte, whatever its length. k is one more than
-the greatest k any text of the journal holds in that form, its letters,
+string's own text, byte for byte, whatever its length. The start
+`insomnia-held-<k>-` is one no text of the journal holds, its letters,
 digits and dashes written as such or as `\u` escapes, so no string of the
-journal's reads as a placeholder; U+E000 and every other text stay as they
-are. A frozen process's `bootSession` the app does not read, which the
+journal's reads as a placeholder: k is one more than the greatest k of at
+most 18 digits, with no leading zero, that the text holds in that form,
+taken when no k the text holds is those same digits; when one is (as
+1000000000000000000 can be, after eighteen 9s), k is one of fewer digits
+that the text does not hold, chosen a digit at a time. U+E000 and every
+other text stay as they are. A frozen process's `bootSession` the app does not read, which the
 scripts compare, gets one too. Where no placeholder can be had (`grep`
 fails), the check refuses the journal as not known. The check also refuses
 text the app's decoder reads that it does not finish reading within 30 s
