@@ -12866,6 +12866,212 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(try fx.lockIsFree())
     }
 
+    /// The journal states every uninstall test below starts from, and the
+    /// glob of uninstall.sh's parse of its journal copy, a plutil read made
+    /// inside the `$(journal_problems)` capture.
+    private static let parseJournal = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#
+    private static let journalParse = "plutil -convert json -o /dev/null *insomnia-uninstall.*"
+
+    /// Starts uninstall.sh through one pipe with the parse of its journal
+    /// copy's supervisor stopped (see stopSupervisor), and returns the run
+    /// and that supervisor's pid once the fake has stopped it, reading the
+    /// pipe meanwhile, for at most 60 s.
+    private func startUninstallWithItsJournalParseStopped(tmp: URL) throws -> (run: ScriptFixture.PipedRun, supervisor: pid_t?) {
+        try fx.installMachinery()
+        try fx.writeState(Self.parseJournal)
+        try fx.stopSupervisor(of: Self.journalParse)
+        let r = try fx.startThroughOnePipe(fx.uninstall, extraEnvironment: ["TMPDIR": tmp.path])
+        let deadline = ProcessInfo.processInfo.systemUptime + 60
+        while fx.stoppedSupervisor() == nil && !r.readWhileRunning(for: 0.2) && ProcessInfo.processInfo.systemUptime < deadline {
+            if r.endedAfter != nil { Thread.sleep(forTimeInterval: 0.05) }
+        }
+        return (r, fx.stoppedSupervisor())
+    }
+
+    /// Lets a supervisor stopped by stopSupervisor go on once, and then
+    /// waits up to 60 s for the run to exit and reaps it, reading its pipe;
+    /// for a test's teardown, so that nothing it started outlives it.
+    private func finishStoppedRun(_ r: ScriptFixture.PipedRun, continuing stopped: inout pid_t?) {
+        if let pid = stopped { kill(pid, SIGCONT) }
+        stopped = nil
+        if r.readWhileRunning(for: 60) { r.readUntilExit(thenFor: 1) }
+    }
+
+    /// uninstall.sh's parse of its journal copy has a supervisor that does
+    /// not finish: it stops where it stands, as one stuck on a stalled disk
+    /// does, once the call has started. The run gives up on the read at its
+    /// deadline (the limit, 5 s, plus 5 s), says the journal could not be
+    /// fully checked, removes nothing and exits 1, within 20 s of the stop.
+    /// Read through one pipe, its output ends once it exits: the read's
+    /// result is taken into a variable, not sent to /dev/null by a
+    /// redirection of the function call, so the stopped supervisor keeps
+    /// the recovery lock but neither the capture's pipe nor the run's
+    /// output (see testARedirectedJournalParseWouldKeepTheUninstallsCaptureOpen,
+    /// the same run with that redirection). Its work folder goes: the read's
+    /// output file has had no name since before the call started. Once the
+    /// supervisor goes on it ends, the lock is free, what the read printed
+    /// in the meantime reaches no one, and the next run, read through one
+    /// pipe too, finishes the uninstall.
+    func testUninstallStopsWithoutKeepingItsOutputWhenItsJournalParseDoesNotSettle() throws {
+        let tmp = try fx.privateTmp()
+        let started = try startUninstallWithItsJournalParseStopped(tmp: tmp)
+        let r = started.run
+        var stopped = started.supervisor
+        defer { finishStoppedRun(r, continuing: &stopped) }
+        let supervisor = try XCTUnwrap(stopped, "the parse's supervisor was stopped: \(fx.calls()) \(r.output)")
+
+        XCTAssertTrue(r.readWhileRunning(for: 20), "the run exits while the read's supervisor is stopped: \(r.output)")
+        r.readUntilExit(thenFor: 2)
+
+        XCTAssertEqual(r.status, 1, r.output)
+        XCTAssertNotNil(r.endedAfter, "the output ends with the run (exit after \(r.exitedAfter) s), while the supervisor is stopped: \(r.output)")
+        XCTAssertTrue(r.output.contains("Uninstall stopped BEFORE removing anything"), r.output)
+        XCTAssertTrue(r.output.contains("the journal could not be fully checked: 'plutil -convert json' on state.json did not answer within 5s, and whether it has ended is not known"), r.output)
+        let calls = fx.calls()
+        XCTAssertEqual(calls.filter { $0.hasSuffix(" SUPERVISOR-STOPPED") }, ["plutil SUPERVISOR-STOPPED"], "\(calls)")
+        XCTAssertTrue(calls.contains("sudo -n \(fx.fakePmset) -a disablesleep 0"), "the backstop ran first: \(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo -n insomnia-sudoers-remove") }, "\(calls)")
+        for kept in [fx.app, fx.plist, fx.state, fx.sudoers] {
+            XCTAssertTrue(fx.exists(kept), "nothing was removed: \(kept.path)")
+        }
+        XCTAssertEqual(try fx.contents(of: tmp).filter { $0.hasPrefix("insomnia-uninstall.") }, [], "the work folder goes")
+        XCTAssertEqual(kill(supervisor, 0), 0, "the supervisor is still there, stopped")
+        XCTAssertFalse(try fx.lockIsFree(), "the stopped supervisor keeps the recovery lock")
+
+        kill(supervisor, SIGCONT)
+        stopped = nil
+        try assertLockHeldUntilGone(supervisor, within: 15)
+        XCTAssertFalse(r.output.contains("printed after its supervisor stopped"), r.output)
+
+        let again = try fx.runThroughOnePipe(fx.uninstall, extraEnvironment: ["TMPDIR": tmp.path], endWithin: 2)
+        XCTAssertEqual(again.status, 0, again.output)
+        XCTAssertNotNil(again.endedAfter, "the output ends with the run (exit after \(again.exitedAfter) s): \(again.output)")
+        for gone in [fx.app, fx.plist, fx.state, fx.sudoers] {
+            XCTAssertFalse(fx.exists(gone), "the next run removes \(gone.path)")
+        }
+        XCTAssertEqual(try fx.contents(of: tmp).filter { $0.hasPrefix("insomnia-uninstall.") }, [], "the work folder goes")
+        XCTAssertTrue(try fx.lockIsFree())
+    }
+
+    /// The same run as in
+    /// testUninstallStopsWithoutKeepingItsOutputWhenItsJournalParseDoesNotSettle,
+    /// with the parse of the journal copy written as it was before: its
+    /// output sent to /dev/null by a redirection of the plutil_read call.
+    /// While that redirection is in effect, bash 3.2 keeps the capture's
+    /// pipe, the shell's standard output then, on a descriptor of its own,
+    /// which the read's supervisor inherits. So the run cannot finish its
+    /// `$(journal_problems)` while the supervisor is stopped: 20 s after
+    /// the stop it has not exited and its output has not ended. Once the
+    /// supervisor goes on, the run says what the other one said, removes
+    /// nothing and exits 1.
+    func testARedirectedJournalParseWouldKeepTheUninstallsCaptureOpen() throws {
+        let fixed = #"  value="$(plutil_read -convert json -o /dev/null "$STATE_COPY")" || rc=$?"#
+        let redirected = #"  plutil_read -convert json -o /dev/null "$STATE_COPY" >/dev/null || rc=$?"#
+        let text = try String(contentsOf: fx.uninstall, encoding: .utf8)
+        try ScriptFixture.replaceOnce(text, fixed, with: redirected).write(to: fx.uninstall, atomically: true, encoding: .utf8)
+        let tmp = try fx.privateTmp()
+        let started = try startUninstallWithItsJournalParseStopped(tmp: tmp)
+        let r = started.run
+        var stopped = started.supervisor
+        defer { finishStoppedRun(r, continuing: &stopped) }
+        let supervisor = try XCTUnwrap(stopped, "the parse's supervisor was stopped: \(fx.calls()) \(r.output)")
+
+        XCTAssertFalse(r.readWhileRunning(for: 20), "the run waits for its capture: \(r.output)")
+        XCTAssertNil(r.endedAfter, r.output)
+        XCTAssertFalse(r.output.contains("the journal could not be fully checked"), r.output)
+        XCTAssertEqual(kill(supervisor, 0), 0, "the supervisor is still there, stopped")
+        XCTAssertFalse(try fx.lockIsFree())
+
+        kill(supervisor, SIGCONT)
+        stopped = nil
+        XCTAssertTrue(r.readWhileRunning(for: 20), "the run exits once the supervisor goes on: \(r.output)")
+        r.readUntilExit(thenFor: 2)
+        XCTAssertEqual(r.status, 1, r.output)
+        XCTAssertNotNil(r.endedAfter, r.output)
+        XCTAssertTrue(r.output.contains("the journal could not be fully checked: 'plutil -convert json' on state.json did not answer within 5s, and whether it has ended is not known"), r.output)
+        XCTAssertFalse(r.output.contains("printed after its supervisor stopped"), r.output)
+        for kept in [fx.app, fx.plist, fx.state, fx.sudoers] {
+            XCTAssertTrue(fx.exists(kept), "nothing was removed: \(kept.path)")
+        }
+        XCTAssertTrue(try fx.waitUntilLockIsFree(15))
+    }
+
+    /// SIGTERM to the uninstall while the parse of its journal copy waits
+    /// on a stopped supervisor (see
+    /// testUninstallStopsWithoutKeepingItsOutputWhenItsJournalParseDoesNotSettle).
+    /// uninstall.sh sets an EXIT trap, so bash 3.2 catches SIGTERM and acts
+    /// on it once the `$(journal_problems)` capture it is reading ends. That
+    /// capture, a subshell that shares the run's standard error, ends at the
+    /// read's own deadline (the limit, 5 s, plus 5 s), so the run and its
+    /// output, read through one pipe, end within 20 s of the stop, while the
+    /// supervisor is still stopped and keeps the recovery lock. Nothing is
+    /// removed. Once the supervisor goes on, it ends and the lock is free.
+    func testUninstallCancelledWhileItsJournalParseDoesNotSettleEndsItsOutputByTheReadsDeadline() throws {
+        let tmp = try fx.privateTmp()
+        let started = try startUninstallWithItsJournalParseStopped(tmp: tmp)
+        let r = started.run
+        var stopped = started.supervisor
+        defer { finishStoppedRun(r, continuing: &stopped) }
+        let supervisor = try XCTUnwrap(stopped, "the parse's supervisor was stopped: \(fx.calls()) \(r.output)")
+        let stoppedAt = ProcessInfo.processInfo.systemUptime
+
+        XCTAssertEqual(r.process.signal(SIGTERM), 0)
+        XCTAssertTrue(r.readWhileRunning(for: 20 - (ProcessInfo.processInfo.systemUptime - stoppedAt)), "the run ends by the read's deadline: \(r.output)")
+        r.readUntilExit(thenFor: 0)
+        XCTAssertNotEqual(r.status, 0, r.output)
+        XCTAssertTrue(r.drain(within: 20 - (ProcessInfo.processInfo.systemUptime - stoppedAt)), "the output ends by the read's deadline: \(r.output)")
+        XCTAssertEqual(kill(supervisor, 0), 0, "the supervisor is still there, stopped")
+        XCTAssertFalse(try fx.lockIsFree(), "the stopped supervisor keeps the recovery lock")
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("sudo -n insomnia-sudoers-remove") }, "\(fx.calls())")
+        for kept in [fx.app, fx.plist, fx.state, fx.sudoers] {
+            XCTAssertTrue(fx.exists(kept), "nothing was removed: \(kept.path)")
+        }
+
+        kill(supervisor, SIGCONT)
+        stopped = nil
+        try assertLockHeldUntilGone(supervisor, within: 15)
+        XCTAssertFalse(r.output.contains("printed after its supervisor stopped"), r.output)
+    }
+
+    /// The parse of uninstall.sh's journal copy, the read that
+    /// testUninstallStopsWithoutKeepingItsOutputWhenItsJournalParseDoesNotSettle
+    /// stops, with a supervisor that finishes: a parse that never answers
+    /// (stopped at its limit, 124) and one that prints part of an answer
+    /// and fails (exit 2). Each run says why the journal could not be
+    /// fully checked, removes nothing, and exits 1; read through one pipe,
+    /// its output ends once it exits, and the lock is free.
+    func testUninstallsJournalParseThatHangsOrFailsAfterOutputEndsItsOutputWithTheRun() throws {
+        let rows: [(file: String, says: String)] = [
+            ("plutil.hang", "the journal could not be fully checked: 'plutil -convert json' on state.json did not answer within 5s\n"),
+            ("plutil.partial", "the journal could not be fully checked: 'plutil -convert json' on state.json exited 2\n"),
+        ]
+        for row in rows {
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.installMachinery()
+            try f.writeState(Self.parseJournal)
+            try (Self.journalParse.replacingOccurrences(of: "plutil ", with: "") + "\n")
+                .write(to: f.root.appendingPathComponent(row.file), atomically: true, encoding: .utf8)
+            let tmp = try f.privateTmp()
+
+            let r = try f.runThroughOnePipe(f.uninstall, extraEnvironment: ["TMPDIR": tmp.path], endWithin: 2)
+
+            let label = row.file + ": "
+            XCTAssertEqual(r.status, 1, label + r.output)
+            XCTAssertNotNil(r.endedAfter, label + "the output ends with the run (exit after \(r.exitedAfter) s): \(r.output)")
+            XCTAssertTrue(r.output.contains(row.says), label + r.output)
+            XCTAssertFalse(f.calls().contains { $0.hasPrefix("sudo -n insomnia-sudoers-remove") }, label + "\(f.calls())")
+            for kept in [f.app, f.plist, f.state, f.sudoers] {
+                XCTAssertTrue(f.exists(kept), label + "nothing was removed: \(kept.path)")
+            }
+            XCTAssertEqual(try f.contents(of: tmp).filter { $0.hasPrefix("insomnia-uninstall.") }, [], label + "the work folder goes")
+            XCTAssertTrue(try f.lockIsFree(), label)
+            if row.file == "plutil.hang" {
+                XCTAssertTrue(f.hungProcessGone("plutil", within: 5), label + "the hung parse was stopped at its limit")
+            }
+        }
+    }
+
     /// What a change printed is shown once the change has finished: the
     /// failed rename of the backstop's journal says why on the run's
     /// standard error, once. A run whose changes all finished, whether one
@@ -13773,7 +13979,12 @@ private final class ScriptFixture {
     /// as many such calls as its first line says have gone by, removes the
     /// file, logs "<name> SUPERVISOR-KILLED" and SIGKILLs its parent, the
     /// supervisor of the bounded call that runs it, before it does what it
-    /// would have done.
+    /// would have done. Likewise, while the fixture has supervisor.stop
+    /// (see stopSupervisor), the first fake whose "<name> <arguments>"
+    /// matches the glob in it removes the file, writes its parent's pid to
+    /// supervisor.stopped, logs "<name> SUPERVISOR-STOPPED", SIGSTOPs its
+    /// parent, prints "<name>: printed after its supervisor stopped" and
+    /// goes on.
     private static let fakePreamble = """
     [[ "${1-}" != \(SharedFakes.readyArgument) ]] || exit 0
     FAKE_ROOT="${0%/bin/*}"
@@ -13787,6 +13998,15 @@ private final class ScriptFixture {
           printf '%s SUPERVISOR-KILLED\\n' "${0##*/}" >> "$FAKE_ROOT/calls.log"
           kill -KILL "$PPID"
         fi
+      fi
+    fi
+    if [[ -f "$FAKE_ROOT/supervisor.stop" ]]; then
+      IFS= read -r stop_pattern < "$FAKE_ROOT/supervisor.stop"
+      if [[ "${0##*/} $*" == $stop_pattern ]] && /bin/rm "$FAKE_ROOT/supervisor.stop" 2>/dev/null; then
+        printf '%s\\n' "$PPID" > "$FAKE_ROOT/supervisor.stopped"
+        printf '%s SUPERVISOR-STOPPED\\n' "${0##*/}" >> "$FAKE_ROOT/calls.log"
+        kill -STOP "$PPID"
+        printf '%s: printed after its supervisor stopped\\n' "${0##*/}" >&2
       fi
     fi
 
@@ -14994,6 +15214,24 @@ private final class ScriptFixture {
 
     var supervisorKill: URL { root.appendingPathComponent("supervisor.kill") }
 
+    /// Makes one bounded call's supervisor stop where it stands, as one
+    /// stuck on a stalled disk does: the first fake call whose "<name>
+    /// <arguments>" matches the bash glob `pattern` SIGSTOPs its parent,
+    /// the supervisor (see fakePreamble). stoppedSupervisor then has its
+    /// pid. A stopped process cannot exit, so that pid stays the
+    /// supervisor's until something sends it SIGCONT.
+    func stopSupervisor(of pattern: String) throws {
+        try "\(pattern)\n".write(to: root.appendingPathComponent("supervisor.stop"), atomically: true, encoding: .utf8)
+    }
+
+    /// The pid of the supervisor a fake stopped (see stopSupervisor), once
+    /// the fake has logged that it did.
+    func stoppedSupervisor() -> pid_t? {
+        guard calls().contains(where: { $0.hasSuffix(" SUPERVISOR-STOPPED") }),
+              let text = try? String(contentsOf: root.appendingPathComponent("supervisor.stopped"), encoding: .utf8) else { return nil }
+        return pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
     /// Lets the named fakes read or change access control lists the way the
     /// real tools do (see each fake's comment): "perl" runs root's real
     /// reader, "chmod" runs -N and the other ACL options, and "ditto" runs
@@ -15631,6 +15869,12 @@ private final class ScriptFixture {
         /// pipe (nil while it has not ended).
         private(set) var exitedAfter: Double = 0
         private(set) var endedAfter: Double?
+        /// The errno of a read of the pipe that failed. The pipe is closed
+        /// then, but its end was not seen: endedAfter stays nil.
+        private(set) var readError: Int32?
+        /// Whether readUntilExit gave up on a run that had not exited
+        /// within its bound, and sent it SIGKILL.
+        private(set) var killedAtBound = false
 
         init(process: Spawned, fd: Int32, started: TimeInterval) {
             self.process = process
@@ -15646,14 +15890,31 @@ private final class ScriptFixture {
         var output: String { String(decoding: data, as: UTF8.self) }
 
         /// Reads the pipe while the run lives, reaps the run, and reads on
-        /// for at most `bound` seconds more or until the pipe ends.
-        func readUntilExit(thenFor bound: Double) {
-            pump { !self.process.hasExited }
+        /// for at most `bound` seconds more or until the pipe ends. A run
+        /// still there after `limit` seconds is sent SIGKILL (killedAtBound)
+        /// and then reaped, so a run that never exits fails its test instead
+        /// of holding it; what it started may still be running then.
+        func readUntilExit(thenFor bound: Double, limit: Double = 600) {
+            let last = ProcessInfo.processInfo.systemUptime + limit
+            pump { !self.process.hasExited && ProcessInfo.processInfo.systemUptime < last }
+            if !process.hasExited {
+                killedAtBound = true
+                _ = process.signal(SIGKILL)
+            }
             let raw = process.wait()
             status = raw != -1 && (raw & 0x7f) == 0 ? (raw >> 8) & 0xff : -1
             exitedAfter = ProcessInfo.processInfo.systemUptime - started
             let deadline = ProcessInfo.processInfo.systemUptime + bound
             pump { ProcessInfo.processInfo.systemUptime < deadline }
+        }
+
+        /// Reads the pipe while the run lives, for at most `seconds`, and
+        /// says whether the run has exited by then. It does not reap the
+        /// run (readUntilExit does).
+        func readWhileRunning(for seconds: Double) -> Bool {
+            let deadline = ProcessInfo.processInfo.systemUptime + seconds
+            pump { !self.process.hasExited && ProcessInfo.processInfo.systemUptime < deadline }
+            return process.hasExited
         }
 
         /// Reads on until the pipe ends, for at most `seconds`, and says
@@ -15674,10 +15935,15 @@ private final class ScriptFixture {
                 let ready = poll(&p, 1, 50)
                 guard ready > 0 else { continue }
                 let n = read(fd, &buffer, buffer.count)
+                let failure = errno
                 if n > 0 {
                     data.append(contentsOf: buffer[0..<n])
-                } else if n == 0 || (errno != EINTR && errno != EAGAIN) {
+                } else if n == 0 {
                     endedAfter = ProcessInfo.processInfo.systemUptime - started
+                    close(fd)
+                    fd = -1
+                } else if failure != EINTR && failure != EAGAIN {
+                    readError = failure
                     close(fd)
                     fd = -1
                 }
@@ -15690,6 +15956,14 @@ private final class ScriptFixture {
     /// and been reaped and the pipe has ended, or `endWithin` seconds have
     /// gone by since its exit. `lastPid` is the run's pid afterwards.
     func runThroughOnePipe(_ script: URL, extraEnvironment: [String: String] = [:], endWithin bound: Double) throws -> PipedRun {
+        let run = try startThroughOnePipe(script, extraEnvironment: extraEnvironment)
+        run.readUntilExit(thenFor: bound)
+        return run
+    }
+
+    /// Starts `script` as runThroughOnePipe does and returns without
+    /// reading the pipe or waiting for the run. `lastPid` is the run's pid.
+    func startThroughOnePipe(_ script: URL, extraEnvironment: [String: String] = [:]) throws -> PipedRun {
         var ends: [Int32] = [-1, -1]
         guard pipe(&ends) == 0 else { throw FixtureError("pipe failed: \(errno)") }
         for end in ends { _ = fcntl(end, F_SETFD, FD_CLOEXEC) }
@@ -15704,9 +15978,7 @@ private final class ScriptFixture {
         }
         close(ends[1])
         lastPid = child.pid
-        let run = PipedRun(process: child, fd: ends[0], started: started)
-        run.readUntilExit(thenFor: bound)
-        return run
+        return PipedRun(process: child, fd: ends[0], started: started)
     }
 
     /// Whether `url` exists, or comes to exist within `seconds`.
@@ -15765,9 +16037,10 @@ private final class ScriptFixture {
             if probe.terminationStatus == 75 { return holder }
             Thread.sleep(forTimeInterval: 0.05)
         }
-        p.terminate()
+        let running = p.isRunning
+        holder.stop()
         let text = (try? String(contentsOf: diagURL, encoding: .utf8)) ?? ""
-        throw FixtureError("could not take the recovery lock for the contention test; holder running=\(p.isRunning) probes=\(probes) output=\(text)")
+        throw FixtureError("could not take the recovery lock for the contention test; holder running=\(running) probes=\(probes) output=\(text)")
     }
 }
 
