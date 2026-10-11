@@ -122,9 +122,10 @@
 #                              defaults delete <bundleId> NSAppSleepDisabled
 #                              when the key was absent. A delete that fails
 #                              counts as done only when defaults read then
-#                              says the key does not exist; a read that
-#                              fails any other way proves nothing and the
-#                              entry stays.
+#                              exits 1 with defaults' whole line that the
+#                              key does not exist for that bundle
+#                              (defaults_said_absent); any other answer
+#                              proves nothing and the entry stays.
 #     A flag is cleared only after its undo succeeded. Unknown keys survive.
 #     Exit 0 only when the journal is clean afterwards; otherwise exit 1 so
 #     the failure is visible and the next periodic run retries.
@@ -168,8 +169,9 @@
 # built from that copy. A run killed with SIGKILL leaves its private
 # directory behind in TMPDIR. Not bounded here: the stat of fd 9 and of the
 # lock file that decides whether to share a caller's lock (a child with fd 9
-# closed cannot stat fd 9), and this run's own writes to WORK (mktemp, rm,
-# the notes of failed reads), to the log and to the journal it publishes.
+# closed cannot stat fd 9), and the mktemp -d that makes WORK. The notes of
+# failed reads are written and read by timed processes of their own; log
+# lines, the journal publish and removals are changes (see change).
 # install.sh and uninstall.sh bound the whole run instead (run_backstop).
 #
 # Version evidence: the run reads InsomniaResumeFrozenVersion and the
@@ -273,9 +275,11 @@ LOG="$LOG_DIR/insomnia.log"
 # the recovery lock. A line not written within CHANGE_TIMEOUT_SECONDS ends
 # the logging for the rest of the run (LOG_STALLED), and the run goes on:
 # an undo does not wait for its log line, and a line still being written
-# keeps the lock until it is done. A log that cannot be written does not
-# stop the run either. A log path that is not a regular file is not opened:
-# an append to a FIFO with no reader would block.
+# keeps the lock until it is done. Its process may still use WORK, where it
+# makes the file for its output (see change), so WORK then stays at exit
+# (see at_exit). A log that cannot be written does not stop the run
+# either. A log path that is not a regular file is not opened: an append
+# to a FIFO with no reader would block.
 LOG_STALLED=0
 log() { # level message
   local was=$CHANGE_UNSETTLED
@@ -284,10 +288,12 @@ log() { # level message
     LOG_STALLED=1
     echo "backstop: a line to $LOG did not finish within ${CHANGE_TIMEOUT_SECONDS}s; the rest of this run is not logged" >&2
   fi
-  # A log line still being written changes nothing the run goes on to use.
+  # A log line still being written changes nothing the run goes on to use,
+  # and the WORK it may use stays (see at_exit).
   CHANGE_UNSETTLED=$was
   return 0
 }
+# shellcheck disable=SC2317  # run through change (see log)
 log_line() { # level message
   "$MKDIR" -p "$LOG_DIR"
   [[ ! -e "$LOG" || -f "$LOG" ]] || return 0
@@ -295,9 +301,11 @@ log_line() { # level message
 }
 
 # --- Reads -------------------------------------------------------------------
-# Every read made under the recovery lock is a bounded call (below), so a
-# FIFO put where a file was, a stalled disk or a tool that hangs cannot keep
-# the lock waiting, and every read has an explicit result. session.json and
+# Every file read and ps call made under the recovery lock is a bounded call
+# (below), so a FIFO put where a file was, a stalled disk or a tool that
+# hangs stops the run instead of keeping it waiting, and every read has an
+# explicit result. A read that never ends keeps the lock, in its unit, until
+# it ends. session.json and
 # state.json are read once each, by a bounded cp into WORK, and every check
 # reads that private copy. The app's Info.plist is not read under the lock
 # (see read_info_version).
@@ -527,34 +535,41 @@ call_result() { # status
 # describes its standard input (fstat). A test of /dev/fd/N (-f, -s, -ef)
 # is not reliable: while another process looks up the same name, as another
 # of these scripts does for its own fds 3 and 4, macOS can give the wrong
-# type for it, or no answer at all.
+# type for it, or no answer at all. Each stat must exit 0 and print one
+# line, taken with an x after it as read_fd3 takes its stat.
 pin_output() { # file
   local four three
   [[ -f "$1" && ! -L "$1" ]] || return 1
   exec 4<>"$1" 3<>"$1" || return 1
-  four="$("$STAT" -f '%HT:%z:%d:%i' <&4)" && three="$("$STAT" -f '%HT:%z:%d:%i' <&3)" || return 1
-  [[ "$four" == "Regular File:0:"* && "$three" == "$four" ]] || return 1
+  four="$("$STAT" -f '%HT:%z:%d:%i' <&4 && printf x)" && three="$("$STAT" -f '%HT:%z:%d:%i' <&3 && printf x)" || return 1
+  [[ "$four" == "Regular File:0:"*$'\n'x && "${four%x}" != *$'\n'*$'\n' && "$three" == "$four" ]] || return 1
   "$RM" -f "$1" || return 1
   [[ ! -e "$1" && ! -L "$1" ]]
 } 2>/dev/null
 # Reads fd 3 from where it stands to its end into READ_TEXT byte for byte,
 # without $(...), which drops NUL bytes and trailing newlines. fd 3 must be a
-# regular file (checked by fstat, as pin_output does), and at most
+# regular file: stat of fd 3 as its standard input (fstat, as in pin_output)
+# must exit 0 and print exactly one line, "Regular File". Its output is taken
+# with an x after it, printed only once stat has exited 0, since $(...) would
+# drop newlines at its end. So a stat that printed that line and then failed,
+# or printed more or less than the one line, refuses the file. At most
 # READ_MAX_BYTES are taken from it, so a file that keeps growing cannot hold
 # the read. One more read after its end must find nothing: a byte there was
 # written while the file was read, by something the call left running, and
 # the text could stop anywhere.
 # Returns 0 when all of it was read; 1 when it has a NUL byte, which no shell
 # variable can hold (READ_TEXT is then the text without them and trailing
-# newlines, and READ_HEAD the text before the first); 2 when it is not a
-# regular file, is longer than READ_MAX_BYTES, could not be read (bash leaves
-# the variable of a read that failed unset, and sets it at the end of the
-# file), or grew while it was read. READ_HEAD is READ_TEXT otherwise.
+# newlines, and READ_HEAD the text before the first); 2 when stat did not
+# answer that it is a regular file as above, or it is longer than
+# READ_MAX_BYTES, could not be read (bash leaves the variable of a read that
+# failed unset, and sets it at the end of the file), or grew while it was
+# read. READ_HEAD is READ_TEXT otherwise.
 read_fd3() { # -> READ_TEXT, READ_HEAD
-  local LC_ALL=C part text="" head="" nul=0 left=$(( READ_MAX_BYTES + 1 ))
+  local LC_ALL=C part text="" head="" nul=0 left=$(( READ_MAX_BYTES + 1 )) kind
   READ_TEXT=""
   READ_HEAD=""
-  [[ "$("$STAT" -f %HT <&3)" == "Regular File" ]] || return 2
+  kind="$("$STAT" -f %HT <&3 && printf x)" || return 2
+  [[ "$kind" == $'Regular File\nx' ]] || return 2
   while :; do
     unset -v part
     if IFS= read -r -d '' -n "$left" -u 3 part; then
@@ -663,35 +678,54 @@ take_output() { # deadline
 }
 # A change made in this shell itself (a log line, a move, a removal) has no
 # limit: on a stalled disk it can wait without end, and so hold the
-# recovery lock. change makes the command in a process of its own instead,
-# started as a supervisor is (a process substitution starts it with `&`
-# and settles it, see settle), and waits for it no longer than
-# CHANGE_TIMEOUT_SECONDS: "settled" with its exit status, then the end of
-# the pipe. It returns that status, with CHANGE_SETTLED=1; or 124, with
+# recovery lock. change makes the command in a unit of its own instead
+# (change_unit), started as a supervisor is (a process substitution starts
+# it with `&` and settles it, see settle), and waits for it no longer than
+# CHANGE_TIMEOUT_SECONDS: the command's exit status, the four fields of
+# what it printed (see send_output), "settled 0", then the end of the pipe.
+# It returns that status, with CHANGE_SETTLED=1; or 124, with
 # CHANGE_SETTLED=0, when that did not all come in time, and whether the
 # change took place is then not known. Nothing signals the command, since a
-# removal or a move cut short can leave files half changed. It ignores
-# SIGTERM, SIGHUP and SIGPIPE, as a supervisor does (SIGINT and SIGQUIT are
-# ignored already in a background job of a script), and keeps fd 9, so a
-# change that has not finished keeps the recovery lock until it ends, also
-# once this run has exited. Its standard input is /dev/null, and its
-# standard output goes to standard error, which it shares with this run, so
-# what it says shows where this run's own messages do. CHANGE_UNSETTLED is
-# 1 from the start of a change until the change is seen to finish, and
-# stays 1 after one that was not: the run then changes nothing more (see
-# change_or_stop and tidy). change takes fd 5, so no caller makes one while
-# it reads another pipe there.
+# removal or a move cut short can leave files half changed. The unit and
+# the command ignore SIGTERM, SIGHUP and SIGPIPE, as a supervisor does
+# (SIGINT and SIGQUIT are ignored already in a background job of a
+# script), and keep fd 9, so a change that has not finished keeps the
+# recovery lock until it ends, also once this run has exited. Neither
+# keeps this run's standard output or standard error, which whatever
+# started this run may be reading to their end: the unit's standard input
+# and error are /dev/null and its standard output is the pipe to this
+# shell, and the command writes both of its outputs to a file with no name
+# (see pin_output) that the unit makes in WORK and reads back once the
+# command has exited. Only for a change seen to finish does this shell
+# then show what the command printed, on its own standard error. With no
+# WORK yet, or no file made there, the command's output goes to /dev/null
+# and nothing is shown. What it showed is in CHANGE_SAID, empty for a
+# change not seen to finish; with CHANGE_QUIET at 1 it is kept there and not
+# shown. A caller that wants it unshown sets that rather than send change's
+# standard error elsewhere: while a redirection of a function call is in
+# effect, bash 3.2 keeps the shell's own standard error on a descriptor of
+# its own, which the unit's processes would inherit and keep open for as
+# long as the command runs. READ_TEXT and READ_HEAD are as they were before
+# the change. CHANGE_UNSETTLED is 1 from the start of a change until the
+# change is seen to finish, and stays 1 after one that was not: the run
+# then changes nothing more (see change_or_stop and tidy). change takes fd
+# 5, so no caller makes one while it reads another pipe there.
 CHANGE_SETTLED=1
 CHANGE_UNSETTLED=0
+# shellcheck disable=SC2034  # backstop.sh's tighten uses it; the other scripts share this text
+CHANGE_SAID=""
+CHANGE_QUIET=0
 change() { # command args...
-  local was=$CHANGE_UNSETTLED rc=124 status form='^settled ([0-9]{1,3})$'
-  local deadline=$(( SECONDS + CHANGE_TIMEOUT_SECONDS ))
+  local was=$CHANGE_UNSETTLED rc=124 status took=0 said=""
+  local text="${READ_TEXT:-}" head="${READ_HEAD:-}" deadline=$(( SECONDS + CHANGE_TIMEOUT_SECONDS ))
   CHANGE_SETTLED=0
   CHANGE_UNSETTLED=1
-  if exec 5< <(exec </dev/null; trap '' TERM HUP PIPE; "$@" >&2 & settle "$!"); then
-    if pipe_field "$deadline" && [[ "$FIELD" =~ $form ]]; then
-      status=$(( 10#${BASH_REMATCH[1]} ))
-      if pipe_ends "$deadline"; then
+  if exec 5< <(exec </dev/null 2>/dev/null; change_unit "$@" & settle "$!"); then
+    if pipe_field "$deadline" && [[ "$FIELD" =~ ^[0-9]{1,3}$ ]] && (( 10#$FIELD <= 255 )); then
+      status=$(( 10#$FIELD ))
+      take_output "$deadline" || took=$?
+      (( took == 2 )) || said="$READ_TEXT"
+      if (( took != 3 )); then
         rc=$status
         CHANGE_SETTLED=1
         CHANGE_UNSETTLED=$was
@@ -699,7 +733,34 @@ change() { # command args...
     fi
     exec 5<&-
   fi
+  READ_TEXT="$text"
+  READ_HEAD="$head"
+  CHANGE_SAID=""
+  (( ! CHANGE_SETTLED )) || CHANGE_SAID="$said"
+  if (( ! CHANGE_QUIET )) && [[ -n "$CHANGE_SAID" ]]; then printf '%s\n' "${CHANGE_SAID%$'\n'}" >&2; fi
   return "$rc"
+}
+# The unit of one change (see change). The command runs as a job of its
+# own, so a function that exits ends only that job. errexit is off here: a
+# failed send must not end the unit while the command runs.
+change_unit() { # command args...
+  local base="" status=0
+  set +e
+  trap '' TERM HUP PIPE
+  [[ -z "${WORK:-}" ]] || base="$("$MKTEMP" "$WORK/call.XXXXXX")"
+  if [[ -n "$base" ]] && pin_output "$base"; then
+    "$@" </dev/null >&4 2>&4 3<&- 4>&- &
+    exec 4>&-
+    wait "$!" || status=$?
+    printf '%s\0' "$status" || return
+    send_output
+    return
+  fi
+  exec 3<&- 4>&-
+  [[ -z "$base" ]] || "$RM" -f "$base"
+  "$@" </dev/null >/dev/null 2>&1 &
+  wait "$!" || status=$?
+  printf '%s\0' "$status" 2 "" "" end
 }
 # change, and the end of the run when the change was not seen to finish:
 # stop_unsettled, which each script defines, says what it was and exits 1.
@@ -713,6 +774,7 @@ change_or_stop() { # what command args...
 }
 # A command with its standard error sent to /dev/null, for a change whose
 # own message is not shown (the run says what failed instead).
+# shellcheck disable=SC2317  # run through change, which shellcheck does not follow
 quietly() { # command args...
   "$@" 2>/dev/null
 }
@@ -722,6 +784,7 @@ quietly() { # command args...
 # to finish, goes to LEFT_BEHIND for the run to name. A step that fails is
 # not reported: it leaves things as a step not made would.
 LEFT_BEHIND=()
+# shellcheck disable=SC2317  # backstop.sh calls it only from its EXIT trap
 tidy() { # path command args...
   local path="$1"
   shift
@@ -959,7 +1022,23 @@ read_stopped() { # what was read, status
 }
 
 # --- Lock --------------------------------------------------------------------
-"$MKDIR" -p "$APP_SUPPORT"
+# No WORK until this run makes its own (below): one in the environment is
+# not used, so a change made before then sends its output to /dev/null.
+WORK=""
+# A change too (see change), with no WORK yet, so a stalled disk cannot
+# hold this run here for longer than CHANGE_TIMEOUT_SECONDS; a mkdir still
+# running then keeps the lock a caller shares with this run (fd 9) until it
+# ends. A mkdir that fails or is not seen to finish ends the run before it
+# reads or undoes anything, as a failed one did under set -e when it ran
+# here directly, and the next run retries.
+if ! change "$MKDIR" -p "$APP_SUPPORT"; then
+  if (( CHANGE_SETTLED )); then
+    log error "could not create $APP_SUPPORT; nothing was read or undone this run, and the next run will retry"
+  else
+    log error "recovery stopped: creating $APP_SUPPORT did not finish within ${CHANGE_TIMEOUT_SECONDS}s; nothing was read or undone this run, and the next run will retry"
+  fi
+  exit 1
+fi
 # An upgrade over an older build: tighten what it left loose (0644 files,
 # 0755 directories), since this run may write to them before the upgraded
 # app has opened them. umask only covers what this run creates. go-rwx
@@ -970,17 +1049,39 @@ read_stopped() { # what was read, status
 # through an allow entry, or a session a deny entry keeps unreadable, which
 # recovery treats as ended. A chmod that fails is logged as an error and
 # recovery goes on: a loose mode is no reason to leave the machine changed.
-tighten() { # path...
+# The checks of each path and the chmods run in one change of their own
+# (tighten_paths, see change), once WORK is there to hold what they print,
+# so a stalled disk cannot hold this run for longer than
+# CHANGE_TIMEOUT_SECONDS; a chmod still running then keeps the lock a
+# caller shares with this run (fd 9) until it ends. One not seen to finish
+# ends the run there, before it takes the lock or reads anything, and
+# nothing signals it; the next run retries.
+# shellcheck disable=SC2317  # run through change (see tighten)
+tighten_paths() { # path...
   local p err
   for p in "$@"; do
     if [[ -e "$p" && ! -L "$p" ]]; then
-      if ! err="$("$CHMOD" go-rwx "$p" 2>&1)"; then
-        log error "could not make $p owner-only: ${err:-chmod failed}" || true
-      fi
+      err="$("$CHMOD" go-rwx "$p" 2>&1)" || printf 'could not make %s owner-only: %s\n' "$p" "${err:-chmod failed}"
     fi
   done
+  return 0
 }
-tighten "$APP_SUPPORT" "$LOG_DIR" "$LOG" "$LOCK" "$STATE" "$SESSION"
+tighten() { # path...
+  local said
+  CHANGE_QUIET=1
+  change tighten_paths "$@" || true
+  CHANGE_QUIET=0
+  if (( ! CHANGE_SETTLED )); then
+    log error "recovery stopped: making $* owner-only did not finish within ${CHANGE_TIMEOUT_SECONDS}s; nothing was read or undone this run, and the next run will retry"
+    exit 1
+  fi
+  said="${CHANGE_SAID%$'\n'}"
+  while [[ -n "$said" ]]; do
+    log error "${said%%$'\n'*}"
+    [[ "$said" == *$'\n'* ]] || break
+    said="${said#*$'\n'}"
+  done
+}
 # This run's own folder for the output of its reads and its private copies
 # of session.json and state.json (mktemp -d: a new name, mode 0700), removed
 # when the run exits. One killed by SIGKILL stays in the temporary folder,
@@ -990,13 +1091,20 @@ if ! WORK="$("$MKTEMP" -d "${TMPDIR:-/tmp}/insomnia-backstop.XXXXXX" 2>/dev/null
   exit 1
 fi
 # At exit the folder goes as a change of its own (see tidy), unless a
-# change this run made was not seen to finish.
+# change this run made was not seen to finish, a log line's included (see
+# log). With the log stalled, standard error says what was left.
+# shellcheck disable=SC2317  # run by the EXIT trap
 at_exit() {
+  if (( LOG_STALLED )); then
+    echo "backstop: left $WORK in place: a log line this run wrote was not seen to finish and may still use it" >&2
+    return 0
+  fi
   tidy "$WORK" quietly "$RM" -rf "$WORK"
   (( ${#LEFT_BEHIND[@]} == 0 )) || log warn "left $WORK in place: a change this run made was not seen to finish and may still use it"
 }
 trap at_exit EXIT
 notes_reset
+tighten "$APP_SUPPORT" "$LOG_DIR" "$LOG" "$LOCK" "$STATE" "$SESSION"
 # The file for the app binary's answer (see run_app_bounded), made and
 # pinned here, before this run takes the recovery lock, so that no file is
 # made, opened or removed by this shell for the binary while it holds the
@@ -1204,6 +1312,7 @@ is_positive_int() {
 bounded_calls=0
 command_alive=0
 bounded_output=0   # 1: read back what the next bounded command prints
+# shellcheck disable=SC2317  # run through change_or_stop
 remove_old_status_files() {
   "$RM" -f "$APP_SUPPORT"/.backstop.*.pid "$APP_SUPPORT"/.backstop.*.rc
 }
@@ -1290,9 +1399,10 @@ run_bounded() { # command args...
 # SIGTERM, SIGHUP and SIGPIPE actions this script started with (the
 # defaults, under launchd), so it still stops on SIGTERM.
 # The command starts in a bash of its own (BASH_PATH) that sends its own pid
-# to the keeper and closes its end of the keeper's pipe before it runs the
-# command in its place (exec, so the pid stays the command's): no command
-# runs before its keeper has its pid. The supervisor sends the keeper
+# to the keeper and closes its end of the keeper's pipe (fd 8; see
+# keep_lock for a copy bash 3.2 leaves open) before it runs the command in
+# its place (exec, so the pid stays the command's): no command runs before
+# its keeper has its pid. The supervisor sends the keeper
 # "reaped" once it has reaped the command, on each way it ends, and the
 # keeper exits.
 # The command is the supervisor's only job (a process started with `&` gets
@@ -1391,17 +1501,27 @@ supervise_command() { # command args...
 # may take the pid before the next check, and the keeper then waits for that
 # one too. A pipe that ends before any pid, or with "reaped" first, says the
 # command never ran: it sends its pid before it runs the command and closes
-# its end of the pipe only then. The keeper's standard output is the
-# supervisor's pipe to run_bounded, so that pipe ends only once the keeper
-# is gone too; the keeper closes it as soon as the supervisor is gone, so
-# run_bounded is not kept waiting for a status that cannot come.
-keep_lock() {
+# its end of the pipe (fd 8) only then. Bash 3.2 also leaves the descriptor
+# it made for the process substitution (fd 63) open in the supervisor until
+# supervise_command returns, and each process the supervisor starts
+# inherits that copy of the pipe, the command too, so the pipe ends only
+# once every one of them that kept it is gone as well. That only makes the
+# keeper wait longer; sudo closes it before it runs its command, as it
+# closes fd 9. The keeper's standard output is the supervisor's pipe to
+# run_bounded, so that pipe ends only once the keeper is gone too; the
+# keeper closes it as soon as its own pipe ends, so run_bounded is not kept
+# waiting for a status that cannot come.
+# The "group" argument is for install.sh and uninstall.sh, which share this
+# function's text and define group_gone (see their supervise); this script
+# never passes it.
+# shellcheck disable=SC2120  # see above: only install.sh and uninstall.sh pass it
+keep_lock() { # [group]
   local cpid="" word=""
   IFS= read -r -d '' cpid || return 0
   [[ "$cpid" != reaped ]] || return 0
   if IFS= read -r -d '' word && [[ "$word" == reaped ]]; then return 0; fi
   exec 1>/dev/null
-  until [[ "$cpid" =~ ^[1-9][0-9]*$ ]] && pid_gone "$cpid"; do
+  until [[ "$cpid" =~ ^[1-9][0-9]*$ ]] && pid_gone "$cpid" && { [[ "${1:-}" != group ]] || group_gone "$cpid"; }; do
     sleep 0.5
   done
 }
@@ -2211,8 +2331,16 @@ observe() { # pid
     return 0
   fi
   (( rc == 0 )) || return 0
-  local w mon day time year stat uid rest
-  read -r w mon day time year stat uid rest <<< "$out"
+  local w mon day time year stat uid
+  local -a word
+  # The words of its first line, as read would split them, without the
+  # temporary file bash 3.2 writes for a here-string.
+  set -f
+  # shellcheck disable=SC2206  # split on purpose, with globbing off
+  word=(${out%%$'\n'*})
+  set +f
+  w="${word[0]:-}" mon="${word[1]:-}" day="${word[2]:-}" time="${word[3]:-}"
+  year="${word[4]:-}" stat="${word[5]:-}" uid="${word[6]:-}"
   [[ -n "$w" && -n "$mon" && -n "$day" && -n "$time" && -n "$year" && -n "$stat" && -n "$uid" ]] || return 0
   p_epoch="$("$DATE" -j -u -f '%a %b %d %H:%M:%S %Y' "$w $mon $day $time $year" +%s 2>/dev/null || true)"
   [[ -n "$p_epoch" ]] && [[ "$uid" =~ ^[0-9]+$ ]] || return 0
@@ -2234,6 +2362,7 @@ app_args=()
 # timeout included, keeps every entry of the call unsignaled by this run. The
 # binary may have resumed some of them before it went wrong; the next run
 # finds those running and clears them.
+# shellcheck disable=SC2317  # run through change_or_stop
 remove_old_resume_folders() {
   "$RM" -rf "$APP_SUPPORT"/.backstop-resume.*
 }
@@ -2448,10 +2577,31 @@ if [[ "$docker_frozen" == true ]] && (( kept_frozen_count == 0 && legacy_count =
   new_docker=false; changed=1
 fi
 
-# Whether what the last run_bounded command printed (with bounded_output=1)
-# holds the words $1. Output that was not read back holds nothing.
-probe_says() { # words
-  (( BOUNDED_READ != 2 )) && [[ "$READ_TEXT" == *"$1"* ]]
+# Whether the `defaults read <bundle> NSAppSleepDisabled` just made, which
+# exited with status $1 and whose output came back in READ_TEXT with
+# read_fd3's status in BOUNDED_READ, said in full that bundle $2 has no such
+# key: exit 1, all of its output read back with no NUL byte, and that output
+# exactly the line defaults prints for a key that does not exist, naming
+# this bundle and this key, once, after at most the one NSLog header line
+# ("<date> <time> defaults[<pid>:<thread>] ") defaults puts before it.
+# Nothing else says so: another status (a read stopped at its limit, one
+# that may still run, an error after it printed the line), output not read
+# back or with a NUL byte, a line cut short, another key or bundle, or any
+# other line before or after it. These are defaults' English words; where
+# they differ the key counts as not known to be absent, and the entry stays
+# until the app puts App Nap back itself (at a session end or its next
+# reconcile, through CFPreferences, where an absent key is no failure).
+# The text of this function is the same in uninstall.sh.
+defaults_said_absent() { # status bundle
+  local said header='^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3} defaults\[[0-9]+:[0-9]+\] $'
+  [[ "$1" == 1 ]] && (( BOUNDED_READ == 0 )) || return 1
+  [[ "$READ_TEXT" == *$'\n' ]] || return 1
+  said="${READ_TEXT%$'\n'}"
+  if [[ "$said" == *$'\n'* ]]; then
+    [[ "${said%%$'\n'*}" =~ $header ]] || return 1
+    said="${said#*$'\n'}"
+  fi
+  [[ "$said" == "The domain/default pair of ($2, NSAppSleepDisabled) does not exist" ]]
 }
 
 # App Nap. The app set NSAppSleepDisabled to YES in each listed agent app's
@@ -2495,11 +2645,12 @@ if (( app_nap_count > 0 )); then
     else
       # The key was absent before, so it goes. `defaults delete` fails when
       # the key is already gone, which is the wanted state. A failed delete
-      # clears the entry only when `defaults read` then says in so many
-      # words that the key does not exist. A read that succeeds means the
-      # key is still set; one that fails any other way (cfprefsd not
-      # answering, a timeout) proves nothing, so the entry stays for the
-      # next run.
+      # clears the entry only when `defaults read` then says in full that
+      # the key does not exist (defaults_said_absent). A read that succeeds
+      # means the key is still set; any other answer (cfprefsd not
+      # answering, a read stopped at its limit, words cut short or not
+      # read back whole) proves nothing, so the entry stays for the next
+      # run.
       if run_bounded "$DEFAULTS" delete "$bundle" NSAppSleepDisabled; then
         log info "defaults delete $bundle NSAppSleepDisabled ok"
         changed=1
@@ -2514,7 +2665,7 @@ if (( app_nap_count > 0 )); then
           log error "defaults delete $bundle NSAppSleepDisabled failed and the key is still set; keeping journal entry for retry"
           failures+=("App Nap is still off for $bundle: defaults delete failed")
           keep_app_nap_entry "$i"
-        elif probe_says "does not exist"; then
+        elif defaults_said_absent "$read_rc" "$bundle"; then
           log info "defaults delete $bundle NSAppSleepDisabled: the key is already absent"
           changed=1
         else

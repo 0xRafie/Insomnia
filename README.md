@@ -356,8 +356,8 @@ process enforces even if the installer is killed meanwhile. The call keeps
 the lock until it has exited or been stopped, so no `launchctl bootout` it
 started is still running once the lock is released. A call that does not
 answer in time gets SIGTERM, then SIGKILL one to two seconds later, and the
-install stops, so the lock is released and the app and the agent's backstop
-can take it again to undo a session. A read that fails or does not answer is
+install stops. Once that call has ended the lock is free, and the app and
+the agent's backstop can take it again to undo a session. A read that fails or does not answer is
 never taken as a clean answer. `sudo` only ever gets SIGTERM: one that
 ignores it keeps the lock until it ends, and the installer prints its pid.
 The `backstop.sh` the installer runs under the lock to end a stale session
@@ -368,8 +368,9 @@ call has exited, even if the backstop or the installer is killed first. A
 `sudo pmset` also has a keeper, a second process that holds the lock until
 its supervisor says the call has been reaped or, if a SIGKILL ended the
 supervisor, until no process has the call's pid, so a SIGKILL to the
-supervisor alone does not free the lock either. A signal that ends both
-does. When launchd runs the backstop, both are in the job's process group,
+supervisor alone does not free the lock either. The backstop's own call
+has a keeper too, which also waits until nothing is left in the
+backstop's process group. A signal that ends both does. When launchd runs the backstop, both are in the job's process group,
 which launchd signals once the backstop has exited; which signal it sends
 was not measured. The
 backstop leads a process group of its own, which everything it starts stays
@@ -766,7 +767,9 @@ The files in Application Support/Insomnia and Logs/Insomnia (config, session,
 journal, recovery lock, the record of a power command left running, the two
 logs) are owner-only, mode 0600 with those two directories 0700, and one left
 looser by an older build is tightened the next time the app or the backstop
-opens it. Insomnia sets only these modes and
+opens it. The backstop's `chmod` calls, and its `mkdir` of the folder, have a
+30 s limit: one that does not finish stops that run before it takes the
+recovery lock, and the next run tries again. Insomnia sets only these modes and
 leaves any access control list (ACL) on these files and folders as it is, so
 an ACL someone added, or one inherited from a parent folder, can still give
 another account access (`ls -le` shows it). The LaunchAgent plist and the installed
@@ -855,7 +858,8 @@ this build or an earlier one keeps the lock until that sudo has ended, even
 after the uninstaller or the backstop is gone. That includes the oldest
 copies in Application Support, which take no lock and run `sudo pmset` in
 the foreground: once the SIGTERM at the limit has ended such a copy, the
-uninstaller's supervisor keeps the lock until nothing is left in its group.
+uninstaller's supervisor keeps the lock until nothing is left in its group,
+and so does that supervisor's keeper if a SIGKILL ends the supervisor first.
 A process that leaves the group (with `setsid`, say) is not waited for.
 Without `/usr/bin/perl`, which starts that group and checks whether it is
 empty, the uninstaller runs no backstop, says so, and goes on to its own

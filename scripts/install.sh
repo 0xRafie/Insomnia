@@ -213,7 +213,8 @@ command_line() { local line; line="$(printf '%q ' "$@")"; printf '%s' "${line% }
 # to this run's process group reaches the call or anything it started; only
 # the supervisor's SIGTERM at the limit does. Its supervisor sends a status
 # only once nothing the call started is left in the call's group, and keeps
-# the lock until then: 125 when something is.
+# the lock until then: 125 when something is. Its keeper keeps the lock
+# until then too, should the supervisor be killed first.
 BOUNDED_OUTPUT=""
 BOUNDED_READ=2
 BOUNDED_PID=""
@@ -305,17 +306,28 @@ pid_gone() { # pid
 # before the next check, and the keeper then waits for that one too. A pipe
 # that ends before any pid, or with "reaped" first, says the call never ran:
 # it sends its pid before it runs the command and closes its end of the pipe
-# only then. The keeper's standard output is the supervisor's pipe to its
-# caller, so that pipe ends only once the keeper is gone too; the keeper
-# closes it as soon as the supervisor is gone, so the caller is not kept
-# waiting for a status that cannot come.
-keep_lock() {
+# (fd 8) only then. Bash 3.2 also leaves the descriptor it made for the
+# process substitution (fd 63) open in the supervisor until supervise
+# returns, and each process the supervisor starts inherits that copy of the
+# pipe, the call too, so the pipe ends only once every one of them that
+# kept it is gone as well. That only makes the keeper wait longer; sudo
+# closes it before it runs its command, as it closes fd 9. The keeper's
+# standard output is the supervisor's pipe to its caller, so that pipe ends
+# only once the keeper is gone too; the keeper closes it as soon as its own
+# pipe ends, so the caller is not kept waiting for a status that cannot
+# come.
+# With "group" as its argument (the backstop's call, which leads a process
+# group of its own: BOUNDED_OWN_GROUP), the supervisor sends "reaped" only
+# once that group is empty too, and a keeper whose pipe ends first also
+# waits until no process is left in the group whose id is that pid
+# (group_gone). A process that has left the group is not waited for.
+keep_lock() { # [group]
   local cpid="" word=""
   IFS= read -r -d '' cpid || return 0
   [[ "$cpid" != reaped ]] || return 0
   if IFS= read -r -d '' word && [[ "$word" == reaped ]]; then return 0; fi
   exec 1>/dev/null
-  until [[ "$cpid" =~ ^[1-9][0-9]*$ ]] && pid_gone "$cpid"; do
+  until [[ "$cpid" =~ ^[1-9][0-9]*$ ]] && pid_gone "$cpid" && { [[ "${1:-}" != group ]] || group_gone "$cpid"; }; do
     sleep 0.5
   done
 }
@@ -362,13 +374,15 @@ keep_lock() {
 # sudo closes every descriptor but its standard ones before it runs its
 # command, fd 9 too, and a sudo or a command still running after its
 # SIGTERM is never sent SIGKILL. So for each such call (BOUNDED_TERM_ONLY
-# or sudo, unless it has a group of its own) the supervisor first starts a
-# keeper (keep_lock), a second holder of fd 9 that outlives a supervisor
-# killed with SIGKILL, and the call starts in a bash of its own (BASH_PATH)
-# that sends its own pid to the keeper and closes its end of the keeper's
-# pipe before it runs the command in its place (exec, so the pid stays the
-# call's): no such call runs before its keeper has its pid. The supervisor
-# sends the keeper "reaped" once it has reaped the call.
+# or sudo) the supervisor first starts a keeper (keep_lock), a second
+# holder of fd 9 that outlives a supervisor killed with SIGKILL, and the
+# call starts in a bash of its own (BASH_PATH) that sends its own pid to
+# the keeper and closes its end of the keeper's pipe (fd 8; see keep_lock
+# for a copy bash 3.2 leaves open) before it runs the command in its place
+# (exec, so the pid stays the call's): no such call runs before its keeper
+# has its pid. The supervisor sends the keeper
+# "reaped" once it has reaped the call, and for a call with a group of its
+# own, once that group is empty too.
 # A call with BOUNDED_OWN_GROUP (the backstop) starts through perl, which
 # makes it the leader of a new process group, with its pid as the group's
 # id, before it runs the command. Bash's record of the job is unchanged, so
@@ -382,7 +396,13 @@ keep_lock() {
 # never signals the group. The group's id cannot go to another process while
 # the group has a process in it; once it is empty, another process can take
 # that pid and lead a group with it before the next check, and the
-# supervisor then waits for that group too.
+# supervisor then waits for that group too. The call's keeper (keep_lock
+# group) waits for the same group should the supervisor be gone first, so a
+# SIGKILL to the supervisor alone does not free the lock while the backstop,
+# or a process left in its group, runs without fd 9 (an older backstop's
+# sudo, one from before the recovery lock) once this run has gone too. The
+# call sends its pid to the keeper before perl makes the group, and the
+# keeper waits for that pid as well.
 supervise() { # limit term-only command args...
   local limit="$1" term_only="$2" base cpid rc=0 status deadline polls=0 kept=0
   shift 2
@@ -399,8 +419,8 @@ supervise() { # limit term-only command args...
     [[ -z "$base" ]] || "$RM" -f "$base" 2>/dev/null
     return 0
   fi
-  if (( term_only )) && [[ -z "${BOUNDED_OWN_GROUP:-}" ]]; then
-    if ! exec 8> >(exec 3<&- 4>&- 6<&- 7<&- 8>&-; keep_lock); then
+  if (( term_only )); then
+    if ! exec 8> >(exec 3<&- 4>&- 6<&- 7<&- 8>&-; keep_lock "${BOUNDED_OWN_GROUP:+group}"); then
       printf '%s\0' "" 126 2 "" "" end
       return 0
     fi
@@ -421,8 +441,9 @@ supervise() { # limit term-only command args...
       { : 1<>"$BOUNDED_NEW_FILE"; } 2>/dev/null && [[ -f "$BOUNDED_NEW_FILE" && ! -L "$BOUNDED_NEW_FILE" ]] || exit 1
     fi
     if [[ -n "${BOUNDED_OWN_GROUP:-}" ]]; then
-      exec "$PERL" -e 'setpgrp(0, 0) or exit 127; exec { $ARGV[0] } @ARGV; exit 127' -- "$@"
-    elif (( kept )); then
+      set -- "$PERL" -e 'setpgrp(0, 0) or exit 127; exec { $ARGV[0] } @ARGV; exit 127' -- "$@"
+    fi
+    if (( kept )); then
       exec "$BASH_PATH" -c 'printf "%s\0" "$$" >&8 && exec 8>&- && exec "$@"; exit 126' bash "$@"
     fi
     exec "$@"
@@ -452,8 +473,6 @@ supervise() { # limit term-only command args...
     status=0
     wait "$cpid" 2>/dev/null || status=$?
   done
-  (( ! kept )) || printf 'reaped\0' >&8
-  exec 8>&-
   (( rc == 124 )) || rc=$status
   if [[ -n "${BOUNDED_OWN_GROUP:-}" ]]; then
     polls=0
@@ -461,12 +480,15 @@ supervise() { # limit term-only command args...
       if (( polls >= 10 )); then
         exec 1>&-
         until group_gone "$cpid"; do sleep 0.5; done
+        (( ! kept )) || printf 'reaped\0' >&8
         return 0
       fi
       sleep 0.1
       polls=$((polls + 1))
     done
   fi
+  (( ! kept )) || printf 'reaped\0' >&8
+  exec 8>&-
   printf '%s\0' "$rc" || return
   send_output
 }
@@ -523,34 +545,41 @@ read_result() { # status
 # describes its standard input (fstat). A test of /dev/fd/N (-f, -s, -ef)
 # is not reliable: while another process looks up the same name, as another
 # of these scripts does for its own fds 3 and 4, macOS can give the wrong
-# type for it, or no answer at all.
+# type for it, or no answer at all. Each stat must exit 0 and print one
+# line, taken with an x after it as read_fd3 takes its stat.
 pin_output() { # file
   local four three
   [[ -f "$1" && ! -L "$1" ]] || return 1
   exec 4<>"$1" 3<>"$1" || return 1
-  four="$("$STAT" -f '%HT:%z:%d:%i' <&4)" && three="$("$STAT" -f '%HT:%z:%d:%i' <&3)" || return 1
-  [[ "$four" == "Regular File:0:"* && "$three" == "$four" ]] || return 1
+  four="$("$STAT" -f '%HT:%z:%d:%i' <&4 && printf x)" && three="$("$STAT" -f '%HT:%z:%d:%i' <&3 && printf x)" || return 1
+  [[ "$four" == "Regular File:0:"*$'\n'x && "${four%x}" != *$'\n'*$'\n' && "$three" == "$four" ]] || return 1
   "$RM" -f "$1" || return 1
   [[ ! -e "$1" && ! -L "$1" ]]
 } 2>/dev/null
 # Reads fd 3 from where it stands to its end into READ_TEXT byte for byte,
 # without $(...), which drops NUL bytes and trailing newlines. fd 3 must be a
-# regular file (checked by fstat, as pin_output does), and at most
+# regular file: stat of fd 3 as its standard input (fstat, as in pin_output)
+# must exit 0 and print exactly one line, "Regular File". Its output is taken
+# with an x after it, printed only once stat has exited 0, since $(...) would
+# drop newlines at its end. So a stat that printed that line and then failed,
+# or printed more or less than the one line, refuses the file. At most
 # READ_MAX_BYTES are taken from it, so a file that keeps growing cannot hold
 # the read. One more read after its end must find nothing: a byte there was
 # written while the file was read, by something the call left running, and
 # the text could stop anywhere.
 # Returns 0 when all of it was read; 1 when it has a NUL byte, which no shell
 # variable can hold (READ_TEXT is then the text without them and trailing
-# newlines, and READ_HEAD the text before the first); 2 when it is not a
-# regular file, is longer than READ_MAX_BYTES, could not be read (bash leaves
-# the variable of a read that failed unset, and sets it at the end of the
-# file), or grew while it was read. READ_HEAD is READ_TEXT otherwise.
+# newlines, and READ_HEAD the text before the first); 2 when stat did not
+# answer that it is a regular file as above, or it is longer than
+# READ_MAX_BYTES, could not be read (bash leaves the variable of a read that
+# failed unset, and sets it at the end of the file), or grew while it was
+# read. READ_HEAD is READ_TEXT otherwise.
 read_fd3() { # -> READ_TEXT, READ_HEAD
-  local LC_ALL=C part text="" head="" nul=0 left=$(( READ_MAX_BYTES + 1 ))
+  local LC_ALL=C part text="" head="" nul=0 left=$(( READ_MAX_BYTES + 1 )) kind
   READ_TEXT=""
   READ_HEAD=""
-  [[ "$("$STAT" -f %HT <&3)" == "Regular File" ]] || return 2
+  kind="$("$STAT" -f %HT <&3 && printf x)" || return 2
+  [[ "$kind" == $'Regular File\nx' ]] || return 2
   while :; do
     unset -v part
     if IFS= read -r -d '' -n "$left" -u 3 part; then
@@ -659,35 +688,54 @@ take_output() { # deadline
 }
 # A change made in this shell itself (a log line, a move, a removal) has no
 # limit: on a stalled disk it can wait without end, and so hold the
-# recovery lock. change makes the command in a process of its own instead,
-# started as a supervisor is (a process substitution starts it with `&`
-# and settles it, see settle), and waits for it no longer than
-# CHANGE_TIMEOUT_SECONDS: "settled" with its exit status, then the end of
-# the pipe. It returns that status, with CHANGE_SETTLED=1; or 124, with
+# recovery lock. change makes the command in a unit of its own instead
+# (change_unit), started as a supervisor is (a process substitution starts
+# it with `&` and settles it, see settle), and waits for it no longer than
+# CHANGE_TIMEOUT_SECONDS: the command's exit status, the four fields of
+# what it printed (see send_output), "settled 0", then the end of the pipe.
+# It returns that status, with CHANGE_SETTLED=1; or 124, with
 # CHANGE_SETTLED=0, when that did not all come in time, and whether the
 # change took place is then not known. Nothing signals the command, since a
-# removal or a move cut short can leave files half changed. It ignores
-# SIGTERM, SIGHUP and SIGPIPE, as a supervisor does (SIGINT and SIGQUIT are
-# ignored already in a background job of a script), and keeps fd 9, so a
-# change that has not finished keeps the recovery lock until it ends, also
-# once this run has exited. Its standard input is /dev/null, and its
-# standard output goes to standard error, which it shares with this run, so
-# what it says shows where this run's own messages do. CHANGE_UNSETTLED is
-# 1 from the start of a change until the change is seen to finish, and
-# stays 1 after one that was not: the run then changes nothing more (see
-# change_or_stop and tidy). change takes fd 5, so no caller makes one while
-# it reads another pipe there.
+# removal or a move cut short can leave files half changed. The unit and
+# the command ignore SIGTERM, SIGHUP and SIGPIPE, as a supervisor does
+# (SIGINT and SIGQUIT are ignored already in a background job of a
+# script), and keep fd 9, so a change that has not finished keeps the
+# recovery lock until it ends, also once this run has exited. Neither
+# keeps this run's standard output or standard error, which whatever
+# started this run may be reading to their end: the unit's standard input
+# and error are /dev/null and its standard output is the pipe to this
+# shell, and the command writes both of its outputs to a file with no name
+# (see pin_output) that the unit makes in WORK and reads back once the
+# command has exited. Only for a change seen to finish does this shell
+# then show what the command printed, on its own standard error. With no
+# WORK yet, or no file made there, the command's output goes to /dev/null
+# and nothing is shown. What it showed is in CHANGE_SAID, empty for a
+# change not seen to finish; with CHANGE_QUIET at 1 it is kept there and not
+# shown. A caller that wants it unshown sets that rather than send change's
+# standard error elsewhere: while a redirection of a function call is in
+# effect, bash 3.2 keeps the shell's own standard error on a descriptor of
+# its own, which the unit's processes would inherit and keep open for as
+# long as the command runs. READ_TEXT and READ_HEAD are as they were before
+# the change. CHANGE_UNSETTLED is 1 from the start of a change until the
+# change is seen to finish, and stays 1 after one that was not: the run
+# then changes nothing more (see change_or_stop and tidy). change takes fd
+# 5, so no caller makes one while it reads another pipe there.
 CHANGE_SETTLED=1
 CHANGE_UNSETTLED=0
+# shellcheck disable=SC2034  # backstop.sh's tighten uses it; the other scripts share this text
+CHANGE_SAID=""
+CHANGE_QUIET=0
 change() { # command args...
-  local was=$CHANGE_UNSETTLED rc=124 status form='^settled ([0-9]{1,3})$'
-  local deadline=$(( SECONDS + CHANGE_TIMEOUT_SECONDS ))
+  local was=$CHANGE_UNSETTLED rc=124 status took=0 said=""
+  local text="${READ_TEXT:-}" head="${READ_HEAD:-}" deadline=$(( SECONDS + CHANGE_TIMEOUT_SECONDS ))
   CHANGE_SETTLED=0
   CHANGE_UNSETTLED=1
-  if exec 5< <(exec </dev/null; trap '' TERM HUP PIPE; "$@" >&2 & settle "$!"); then
-    if pipe_field "$deadline" && [[ "$FIELD" =~ $form ]]; then
-      status=$(( 10#${BASH_REMATCH[1]} ))
-      if pipe_ends "$deadline"; then
+  if exec 5< <(exec </dev/null 2>/dev/null; change_unit "$@" & settle "$!"); then
+    if pipe_field "$deadline" && [[ "$FIELD" =~ ^[0-9]{1,3}$ ]] && (( 10#$FIELD <= 255 )); then
+      status=$(( 10#$FIELD ))
+      take_output "$deadline" || took=$?
+      (( took == 2 )) || said="$READ_TEXT"
+      if (( took != 3 )); then
         rc=$status
         CHANGE_SETTLED=1
         CHANGE_UNSETTLED=$was
@@ -695,7 +743,34 @@ change() { # command args...
     fi
     exec 5<&-
   fi
+  READ_TEXT="$text"
+  READ_HEAD="$head"
+  CHANGE_SAID=""
+  (( ! CHANGE_SETTLED )) || CHANGE_SAID="$said"
+  if (( ! CHANGE_QUIET )) && [[ -n "$CHANGE_SAID" ]]; then printf '%s\n' "${CHANGE_SAID%$'\n'}" >&2; fi
   return "$rc"
+}
+# The unit of one change (see change). The command runs as a job of its
+# own, so a function that exits ends only that job. errexit is off here: a
+# failed send must not end the unit while the command runs.
+change_unit() { # command args...
+  local base="" status=0
+  set +e
+  trap '' TERM HUP PIPE
+  [[ -z "${WORK:-}" ]] || base="$("$MKTEMP" "$WORK/call.XXXXXX")"
+  if [[ -n "$base" ]] && pin_output "$base"; then
+    "$@" </dev/null >&4 2>&4 3<&- 4>&- &
+    exec 4>&-
+    wait "$!" || status=$?
+    printf '%s\0' "$status" || return
+    send_output
+    return
+  fi
+  exec 3<&- 4>&-
+  [[ -z "$base" ]] || "$RM" -f "$base"
+  "$@" </dev/null >/dev/null 2>&1 &
+  wait "$!" || status=$?
+  printf '%s\0' "$status" 2 "" "" end
 }
 # change, and the end of the run when the change was not seen to finish:
 # stop_unsettled, which each script defines, says what it was and exits 1.
@@ -709,6 +784,7 @@ change_or_stop() { # what command args...
 }
 # A command with its standard error sent to /dev/null, for a change whose
 # own message is not shown (the run says what failed instead).
+# shellcheck disable=SC2317  # run through change, which shellcheck does not follow
 quietly() { # command args...
   "$@" 2>/dev/null
 }
@@ -718,6 +794,7 @@ quietly() { # command args...
 # to finish, goes to LEFT_BEHIND for the run to name. A step that fails is
 # not reported: it leaves things as a step not made would.
 LEFT_BEHIND=()
+# shellcheck disable=SC2317  # backstop.sh calls it only from its EXIT trap
 tidy() { # path command args...
   local path="$1"
   shift
@@ -841,7 +918,8 @@ read_info_version() { # file
 # reaped. One from before the recovery lock ran sudo pmset in the
 # foreground with no supervisor: once the SIGTERM at the limit has ended
 # it, its sudo, which closed its fd 9, runs on in the backstop's group, and
-# the supervisor here keeps the lock until that group is empty. The
+# the supervisor here keeps the lock until that group is empty, as does its
+# keeper should the supervisor be killed with SIGKILL first. The
 # InsomniaResumeFrozenVersion read before the lock, and the identity of the
 # file it came from, go down in its environment (see read_info_version).
 # Returns the backstop's status, or 124 when it was stopped at its limit,

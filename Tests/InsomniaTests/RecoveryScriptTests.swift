@@ -534,6 +534,134 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual((try fx.stateJSON()["appNapOverrides"] as? [Any])?.count, 0)
     }
 
+    /// A failed `defaults delete` clears its entry only when the `defaults
+    /// read` after it says in full that the key does not exist: exit 1, all
+    /// of its output read back, and that output exactly the tool's line for
+    /// this bundle and key, alone or after its NSLog header line. Each
+    /// answer (see defaultsReads) runs on a fresh journal whose entry for
+    /// Chrome has a field of its own and is followed by an entry for Zed.
+    /// An answer with a NUL byte, without its newline, cut short, naming
+    /// another key or bundle, with another line after or before it, ending
+    /// in exit 2, or from a read stopped by SIGTERM at its limit after it
+    /// printed the line, keeps Chrome's entry verbatim and the run dirty,
+    /// as does a read that finds the key still set; Zed's is put back all
+    /// the same. The read stopped at its limit has been reaped by the time
+    /// the run ends, and no run leaves the lock held.
+    func testAFailedDeleteClearsItsAppNapEntryOnlyOnTheWholeAbsentAnswer() throws {
+        let chrome = "com.google.Chrome"
+        let state = #"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"appNapOverrides":[{"bundleId":"com.google.Chrome","note":"custom"},{"bundleId":"dev.zed.Zed","previous":true}]}"#
+        // The read's status for an entry kept, nil for one cleared.
+        let cases: [(answer: String, keySet: Bool, kept: Int?)] = [
+            ("", false, nil), ("header", false, nil),
+            ("nul", false, 1), ("no-newline", false, 1), ("cut", false, 1), ("wrong-key", false, 1), ("wrong-bundle", false, 1),
+            ("value-after", false, 1), ("value-before", false, 1), ("exit-2", false, 2), ("stopped", false, 124),
+            ("", true, 0),
+        ]
+        for c in cases {
+            let label = c.answer.isEmpty ? (c.keySet ? "still set" : "plain") : c.answer
+            try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+            try fx.writeState(state)
+            try fx.defaultsTable(c.keySet ? [(chrome, "1"), ("dev.zed.Zed", "1")] : [("dev.zed.Zed", "1")])
+            fx.setMode("defaults", c.keySet ? "fail:\(chrome)" : "ok")
+            try fx.defaultsReads(c.answer.isEmpty ? [] : [(chrome, c.answer)])
+            try? FileManager.default.removeItem(at: fx.root.appendingPathComponent("defaults.hung.pid"))
+            fx.clearCalls()
+            let logStart = fx.log().utf8.count
+
+            let r = try fx.run(fx.backstop)
+
+            let log = String(decoding: Array(fx.log().utf8.dropFirst(logStart)), as: UTF8.self)
+            XCTAssertEqual(fx.calls(), [
+                "defaults delete \(chrome) NSAppSleepDisabled",
+                "defaults read \(chrome) NSAppSleepDisabled",
+                "defaults write dev.zed.Zed NSAppSleepDisabled -bool true",
+            ], label)
+            let kept = try XCTUnwrap(try fx.stateJSON()["appNapOverrides"] as? [[String: Any]], label)
+            XCTAssertTrue(try fx.lockIsFree(), label)
+            if let status = c.kept {
+                XCTAssertEqual(r.status, 1, "\(label): \(log)")
+                XCTAssertEqual(kept.count, 1, label)
+                XCTAssertEqual(kept.first?["bundleId"] as? String, chrome, label)
+                XCTAssertEqual(kept.first?["note"] as? String, "custom", "\(label): kept verbatim")
+                XCTAssertEqual(kept.first?.count, 2, "\(label): kept verbatim")
+                XCTAssertTrue(fx.exists(fx.session), "\(label): evidence stays while the journal is dirty")
+                XCTAssertFalse(log.contains("already absent"), "\(label): \(log)")
+                XCTAssertFalse(log.contains("journal cleared"), "\(label): \(log)")
+                if status == 0 {
+                    XCTAssertTrue(log.contains("defaults delete \(chrome) NSAppSleepDisabled failed and the key is still set"), "\(label): \(log)")
+                } else {
+                    XCTAssertTrue(log.contains("defaults read could not tell whether the key is still set (exit \(status))"), "\(label): \(log)")
+                }
+            } else {
+                XCTAssertEqual(r.status, 0, "\(label): \(r.stderr)\(log)")
+                XCTAssertEqual(kept.count, 0, label)
+                XCTAssertTrue(log.contains("defaults delete \(chrome) NSAppSleepDisabled: the key is already absent"), "\(label): \(log)")
+                XCTAssertTrue(log.contains("journal cleared"), "\(label): \(log)")
+                XCTAssertFalse(fx.exists(fx.session), label)
+            }
+            if c.answer == "stopped" {
+                XCTAssertTrue(log.contains("did not finish within 1s; terminated with SIGTERM"), log)
+                XCTAssertTrue(fx.hungProcessGone("defaults", within: 0), "the stopped read was reaped before the run ended")
+            }
+        }
+    }
+
+    /// A `defaults read` after a failed delete that prints the words for an
+    /// absent key and then outlives its limit and the SIGTERM that follows
+    /// proves nothing and may still run. The run stops at once: the journal
+    /// and the session stay as they were, and the entry after it gets no
+    /// command. The read keeps the recovery lock until it ends, so a second
+    /// run finds the lock held and runs nothing. Once the read has ended the
+    /// lock is free, and the next run clears the entry on a whole answer.
+    func testAnAppNapReadThatOutlivesItsLimitStopsTheRunWithTheJournalAsItWas() throws {
+        let chrome = "com.google.Chrome"
+        let state = #"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"appNapOverrides":[{"bundleId":"com.google.Chrome","note":"custom"},{"bundleId":"dev.zed.Zed","previous":true}]}"#
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(state)
+        try fx.defaultsTable([("dev.zed.Zed", "1")])
+        try fx.defaultsReads([(chrome, "alive")])
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        let read = try XCTUnwrap(fx.hungPid("defaults", within: 5), "\(fx.calls())")
+        XCTAssertEqual(fx.calls(), [
+            "defaults delete \(chrome) NSAppSleepDisabled",
+            "defaults read \(chrome) NSAppSleepDisabled",
+            "defaults FD9-OPEN",
+            "defaults SIGTERM",
+        ], "one SIGTERM, and no command for the entry after it")
+        XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), state, "the journal as it was")
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertEqual(fx.defaultsValues(), ["dev.zed.Zed": "1"])
+        let log = fx.log()
+        XCTAssertTrue(log.contains("did not finish within 1s and did not stop on SIGTERM"), log)
+        XCTAssertTrue(log.contains("recovery stopped after 'defaults read \(chrome) NSAppSleepDisabled'"), log)
+        XCTAssertFalse(log.contains("already absent"), log)
+        XCTAssertNil(fx.commandEnded(), "nothing ended the read")
+        XCTAssertFalse(try fx.lockIsFree(), "the read keeps the recovery lock")
+
+        fx.clearCalls()
+        let blocked = try fx.run(fx.backstop)
+        XCTAssertEqual(blocked.status, 75, "no run beside the live read: \(blocked.stderr)")
+        XCTAssertEqual(fx.calls(), [], "the second run ran nothing")
+
+        fx.releaseCommand()
+        try assertLockHeldUntilGone(read, within: 10)
+        XCTAssertEqual(fx.commandEnded(), "released")
+
+        try fx.defaultsReads([])
+        fx.clearCalls()
+        let after = try fx.run(fx.backstop)
+        XCTAssertEqual(after.status, 0, after.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), [
+            "defaults delete \(chrome) NSAppSleepDisabled",
+            "defaults read \(chrome) NSAppSleepDisabled",
+            "defaults write dev.zed.Zed NSAppSleepDisabled -bool true",
+        ])
+        XCTAssertEqual((try fx.stateJSON()["appNapOverrides"] as? [Any])?.count, 0)
+    }
+
     /// An entry without a usable bundle id is never passed to `defaults`
     /// (a leading dash would be read as an option) and stays journaled.
     func testAppNapEntryWithoutUsableBundleIdIsKeptWithoutCommands() throws {
@@ -1544,6 +1672,28 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stdout.contains("  defaults delete com.example.My\\ App NSAppSleepDisabled\n"), r.stdout)
         XCTAssertTrue(r.stdout.contains("could not read NSAppSleepDisabled for com.example.Broken; check it yourself with: defaults read com.example.Broken NSAppSleepDisabled"), r.stdout)
         XCTAssertTrue(r.stdout.contains("1 could not be read"), r.stdout)
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("defaults write") || $0.hasPrefix("defaults delete") }, "\(fx.calls())")
+    }
+
+    /// Only a read that says in full that the key does not exist counts an
+    /// app as checked and clear: the tool's line for that app and key,
+    /// alone or after its NSLog header line. The same words with a NUL byte
+    /// in them, or followed by a value, are reported as not read.
+    func testUninstallCountsAnAppNapReadAsClearOnlyOnTheWholeAbsentAnswer() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try fx.writeConfig(#"{"agentList":["com.example.Header","com.example.Nul","com.example.Extra"]}"#)
+        try fx.defaultsReads([("com.example.Header", "header"), ("com.example.Nul", "nul"), ("com.example.Extra", "value-after")])
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        for id in ["com.example.Nul", "com.example.Extra"] {
+            XCTAssertTrue(r.stdout.contains("could not read NSAppSleepDisabled for \(id); check it yourself with: defaults read \(id) NSAppSleepDisabled"), r.stdout)
+        }
+        XCTAssertFalse(r.stdout.contains("for com.example.Header;"), r.stdout)
+        XCTAssertTrue(r.stdout.contains("none of the \(Config.defaultAgentList.count + 1) agent apps checked has NSAppSleepDisabled set"), r.stdout)
+        XCTAssertTrue(r.stdout.contains("2 could not be read"), r.stdout)
         XCTAssertFalse(fx.calls().contains { $0.hasPrefix("defaults write") || $0.hasPrefix("defaults delete") }, "\(fx.calls())")
     }
 
@@ -2912,22 +3062,243 @@ final class RecoveryScriptTests: XCTestCase {
         ], r.stdout)
     }
 
-    /// pin_output and read_fd3 check each descriptor with a stat of the
-    /// descriptor itself (stat with no file named), not with bash's -f, -s
-    /// or -ef on /dev/fd/N: macOS can answer a stat of /dev/fd/N with the
-    /// wrong type, or fail it, while another process looks up the same
-    /// /dev/fd name, as a second script's own checks do when two run at
-    /// once (the launchd backstop beside an install, say). Here four shells
-    /// each test their own fds 3 and 4 through /dev/fd over and over, while
+    /// read_fd3 reads fd 3 only when a stat of it (its standard input)
+    /// exits 0 and prints exactly the one line "Regular File", and
+    /// pin_output pins a file only when each of its two stats exits 0 and
+    /// prints one line. Here STAT is a fake that runs the real stat of the
+    /// same descriptor and then, by the mode named for that kind of call,
+    /// passes the answer on whole (real), prints it and exits 1 with
+    /// nothing after it (fail-after) or with an error line after it
+    /// (error-after), prints only an error and exits 1 (fail-silent),
+    /// prints it twice (extra), without its newline (no-newline) or with a
+    /// second one (two-newlines), prints nothing and exits 0 (empty), or
+    /// names a folder instead (directory). Every answer but the real one
+    /// refuses: read_fd3 returns 2 with READ_TEXT and READ_HEAD empty and
+    /// reads no byte of the file (the next byte on fd 3 is still its first),
+    /// and pin_output returns 1 and leaves the name. read_fd3 refuses as
+    /// well a closed fd 3, which no stat can describe, and a pipe, which
+    /// the real stat names as one. The layer's text from each script runs.
+    func testTheReadBackLayerTakesOnlyAWholeAnswerFromAStatThatExited0() throws {
+        let dir = fx.root.appendingPathComponent("stat-answers", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let stat = dir.appendingPathComponent("stat")
+        try #"""
+        #!/bin/bash
+        # The mode for a stat of a descriptor's type alone (read_fd3's) is in
+        # how.read, and for any other stat (pin_output's) in how.pin.
+        d="${0%/*}"
+        case "$*" in
+          '-f %HT') how="$(/bin/cat "$d/how.read")" ;;
+          *) how="$(/bin/cat "$d/how.pin")" ;;
+        esac
+        [[ "$how" != real ]] || exec /usr/bin/stat "$@"
+        out="$(/usr/bin/stat "$@")"
+        case "$how" in
+          fail-after) printf '%s\n' "$out"; exit 1 ;;
+          error-after) printf '%s\n' "$out"; echo "stat: (stdin): Input/output error" >&2; exit 1 ;;
+          fail-silent) echo "stat: (stdin): Bad file descriptor" >&2; exit 1 ;;
+          extra) printf '%s\n%s\n' "$out" "$out"; exit 0 ;;
+          no-newline) printf '%s' "$out"; exit 0 ;;
+          two-newlines) printf '%s\n\n' "$out"; exit 0 ;;
+          empty) exit 0 ;;
+          directory) printf '%s\n' "${out/Regular File/Directory}"; exit 0 ;;
+        esac
+        echo "stat: no mode $how" >&2
+        exit 3
+
+        """#.write(to: stat, atomically: true, encoding: .utf8)
+        XCTAssertEqual(chmod(stat.path, 0o755), 0)
+        let refusals = ["fail-after", "error-after", "fail-silent", "extra", "no-newline", "two-newlines", "empty", "directory"]
+        let expected = ["read real 0 $'abc\\n' $'abc\\n' next ''", "pin real 0 removed"]
+            + refusals.flatMap { ["read \($0) 2 '' '' next a", "pin \($0) 1 kept"] }
+            + ["read closed 2 '' ''", "read a-pipe 2 '' '' next a", ""]
+        for name in ["backstop.sh", "install.sh", "uninstall.sh"] {
+            let text = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent(name), encoding: .utf8)
+            var layer = ""
+            for function in Self.readBackFunctions { layer += try Self.shellFunction(function, in: text, name) }
+            let script = dir.appendingPathComponent("layer.\(name)")
+            try ("""
+            set -uo pipefail
+            READ_MAX_BYTES=8
+            RM=/bin/rm
+            STAT='\(stat.path)'
+            d='\(dir.path)'
+
+            """ + layer + #"""
+            # The first byte fd 3 still has, after a read.
+            next() {
+              local first=""
+              IFS= read -r -d '' -n 1 -u 3 first
+              printf 'next %q\n' "$first"
+            }
+            for how in real fail-after error-after fail-silent extra no-newline two-newlines empty directory; do
+              echo real > "$d/how.pin"
+              echo "$how" > "$d/how.read"
+              : > "$d/read"
+              pin_output "$d/read" || echo "pin for the read failed"
+              printf 'abc\n' >&4
+              rc=0
+              read_fd3 || rc=$?
+              printf 'read %s %s %q %q ' "$how" "$rc" "$READ_TEXT" "$READ_HEAD"
+              next
+              exec 3<&- 4>&-
+              echo "$how" > "$d/how.pin"
+              : > "$d/pin"
+              rc=0
+              pin_output "$d/pin" || rc=$?
+              exec 3<&- 4>&-
+              printf 'pin %s %s %s\n' "$how" "$rc" "$([[ -e "$d/pin" ]] && echo kept || echo removed)"
+              /bin/rm -f "$d/pin"
+            done
+            echo real > "$d/how.read"
+            rc=0
+            read_fd3 || rc=$?
+            printf 'read closed %s %q %q\n' "$rc" "$READ_TEXT" "$READ_HEAD"
+            exec 3< <(printf abc)
+            rc=0
+            read_fd3 || rc=$?
+            printf 'read a-pipe %s %q %q ' "$rc" "$READ_TEXT" "$READ_HEAD"
+            next
+            exec 3<&-
+
+            """#).write(to: script, atomically: true, encoding: .utf8)
+
+            let r = try fx.run(script)
+
+            XCTAssertEqual(r.status, 0, "\(name): " + r.stderr)
+            XCTAssertEqual(r.stdout.components(separatedBy: "\n"), expected, name)
+        }
+    }
+
+    /// pin_output checks each descriptor with a stat of the descriptor
+    /// itself (stat with no file named), never through a name. A stand-in
+    /// stat puts another file at the name pin_output has just opened, on
+    /// its first call: 7 bytes, then a FIFO. A stat of the name then
+    /// describes that file (another inode, 7 bytes or a FIFO), while fd 4
+    /// is still the empty regular file opened there, and pin_output's
+    /// check describes fd 4. So pin_output pins the file it opened and
+    /// removes the name, and read_fd3 reads back what went through fd 4.
+    func testThePinnedOutputIsTheFileOpenedThereWhateverItsNameNamesLater() throws {
+        let text = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent("install.sh"), encoding: .utf8)
+        let dir = fx.root.appendingPathComponent("swap", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let stat = dir.appendingPathComponent("stat")
+        try #"""
+        #!/bin/bash
+        # With a "swap" file here, this call first puts what it names at
+        # "out" and logs a stat of that name and this stat of the descriptor.
+        d="${0%/stat}"
+        if [[ -f "$d/swap" ]]; then
+          how="$(< "$d/swap")"
+          /bin/rm -f "$d/swap" "$d/out" || exit
+          if [[ "$how" == fifo ]]; then /usr/bin/mkfifo "$d/out"; else printf planted > "$d/out"; fi || exit
+          name="$(/usr/bin/stat -f '%HT:%z:%d:%i' "$d/out")" || exit
+          answer="$(/usr/bin/stat "$@" && printf x)" || exit
+          printf '%s name %s\n%s descriptor %s\n' "$how" "$name" "$how" "${answer%$'\n'x}" >> "$d/answers"
+          printf '%s' "${answer%x}"
+          exit 0
+        fi
+        exec /usr/bin/stat "$@"
+
+        """#.write(to: stat, atomically: true, encoding: .utf8)
+        XCTAssertEqual(chmod(stat.path, 0o755), 0)
+        let script = fx.root.appendingPathComponent("swap.sh")
+        var layer = ""
+        for name in ["pin_output", "read_fd3"] { layer += try Self.shellFunction(name, in: text, "install.sh") }
+        try ("""
+        set -uo pipefail
+        READ_MAX_BYTES=8
+        RM=/bin/rm
+        STAT='\(stat.path)'
+        d='\(dir.path)'
+
+        """ + layer + #"""
+        for how in bytes fifo; do
+          : > "$d/out"
+          printf '%s' "$how" > "$d/swap"
+          if pin_output "$d/out"; then
+            printf abc >&4
+            read_fd3
+            rc=$?
+            left=no
+            [[ ! -e "$d/out" && ! -L "$d/out" ]] || left=yes
+            printf '%s pinned, read %s %q, name left %s\n' "$how" "$rc" "$READ_TEXT" "$left"
+          else
+            printf '%s refused\n' "$how"
+          fi
+          exec 3<&- 4>&-
+        done
+
+        """#).write(to: script, atomically: true, encoding: .utf8)
+
+        let r = try fx.run(script)
+
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(r.stdout, "bytes pinned, read 0 abc, name left no\nfifo pinned, read 0 abc, name left no\n", r.stderr)
+        let answers = try String(contentsOf: dir.appendingPathComponent("answers"), encoding: .utf8).split(separator: "\n").map(String.init)
+        XCTAssertEqual(answers.count, 4, "\(answers)")
+        guard answers.count == 4 else { return }
+        for (i, how, planted) in [(0, "bytes", "Regular File:7:"), (2, "fifo", "Fifo File:0:")] {
+            let name = answers[i], descriptor = answers[i + 1]
+            XCTAssertTrue(name.hasPrefix("\(how) name \(planted)"), name)
+            XCTAssertTrue(descriptor.hasPrefix("\(how) descriptor Regular File:0:"), descriptor)
+            let nameID = name.split(separator: ":").suffix(2), descriptorID = descriptor.split(separator: ":").suffix(2)
+            XCTAssertNotEqual(Array(nameID), Array(descriptorID), "the name and fd 4 are other files: \(name) / \(descriptor)")
+        }
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dir.path).sorted(), ["answers", "stat"], "nothing is left at the name")
+    }
+
+    /// The same checks while other shells look up the same /dev/fd names:
+    /// macOS can answer a stat of /dev/fd/N with the wrong type, or fail
+    /// it, while another process looks up that name, as a second script's
+    /// own checks do when two run at once (the launchd backstop beside an
+    /// install, say). Four shells the test starts and reaps itself each
+    /// test their own fds 3 and 4 through /dev/fd over and over, while
     /// install.sh's layer pins 150 files, writes "abc" through fd 4 and
-    /// reads it back. Every pin and every read succeeds. Between them the
-    /// same shell tests a file of its own on fds 3 and 4 through /dev/fd,
-    /// the way pin_output did before; at least one of those tests must
-    /// answer wrongly, or this run did not meet the race at all.
+    /// reads it back. Every pin and every read succeeds; whether a lookup
+    /// through /dev/fd answered wrongly meanwhile is not asked. Every
+    /// competitor is stopped, has exited 0 and has been reaped before the
+    /// test returns, whether the run passed, failed, threw or ran out of
+    /// time.
     func testTheReadBackLayerChecksEachDescriptorItselfWhileOtherShellsLookUpTheSameNames() throws {
         let text = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent("install.sh"), encoding: .utf8)
         let dir = fx.root.appendingPathComponent("devfd", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let stop = dir.appendingPathComponent("stop")
+        let other = fx.root.appendingPathComponent("devfd-other.sh")
+        try ("""
+        d='\(dir.path)'
+
+        """ + #"""
+        exec 4<>"$d/other.$OTHER" 3<>"$d/other.$OTHER" || exit 1
+        : > "$d/ready.$OTHER" || exit 1
+        n=0
+        while [[ ! -e "$d/stop" ]] && (( n < 2000000 )); do
+          [[ -f /dev/fd/4 && /dev/fd/3 -ef /dev/fd/4 ]] || :
+          n=$(( n + 1 ))
+        done
+        exit 0
+
+        """#).write(to: other, atomically: true, encoding: .utf8)
+        var others: [ScriptFixture.Spawned] = []
+        // Stops and reaps every competitor started so far: each that has
+        // not exited within 10 s of the stop file is sent SIGKILL (a child
+        // of this test, not yet reaped, so its pid is still its own).
+        func drain() -> [Int32] {
+            FileManager.default.createFile(atPath: stop.path, contents: nil)
+            let deadline = Date(timeIntervalSinceNow: 10)
+            return others.map { o in
+                while !o.hasExited && Date() < deadline { Thread.sleep(forTimeInterval: 0.05) }
+                if !o.hasExited { _ = o.signal(SIGKILL) }
+                return o.wait()
+            }
+        }
+        defer { _ = drain() }
+        for i in 1...4 {
+            others.append(try fx.spawn(other, extraEnvironment: ["OTHER": "\(i)"]))
+        }
+        XCTAssertTrue(waitUntil(10) { (1...4).allSatisfy { FileManager.default.fileExists(atPath: dir.appendingPathComponent("ready.\($0)").path) } },
+                      "the competitors did not start")
         let script = fx.root.appendingPathComponent("devfd.sh")
         var layer = ""
         for name in ["pin_output", "read_fd3"] { layer += try Self.shellFunction(name, in: text, "install.sh") }
@@ -2939,19 +3310,9 @@ final class RecoveryScriptTests: XCTestCase {
         d='\(dir.path)'
 
         """ + layer + #"""
-        trap ': > "$d/stop"' EXIT
-        others=()
-        for i in 1 2 3 4; do
-          ( exec 4<>"$d/other.$i" 3<>"$d/other.$i"
-            n=0
-            while [[ ! -e "$d/stop" ]] && (( n < 2000000 )); do
-              [[ -f /dev/fd/4 && /dev/fd/3 -ef /dev/fd/4 ]] || :
-              n=$(( n + 1 ))
-            done ) &
-          others+=("$!")
-        done
-        pin_failed=0 read_failed=0 wrong=0 tests=0
+        pin_failed=0 read_failed=0
         for (( i = 0; i < 150; i++ )); do
+          [[ ! -e "$d/stop" ]] || break
           : > "$d/out.$i"
           if pin_output "$d/out.$i"; then
             printf abc >&4
@@ -2960,33 +3321,29 @@ final class RecoveryScriptTests: XCTestCase {
             pin_failed=$(( pin_failed + 1 ))
             "$RM" -f "$d/out.$i"
           fi
-          exec 4<>"$d/control" 3<>"$d/control"
-          for (( j = 0; j < 20; j++ )); do
-            tests=$(( tests + 1 ))
-            [[ -f /dev/fd/4 && ! -s /dev/fd/4 && /dev/fd/3 -ef /dev/fd/4 ]] || wrong=$(( wrong + 1 ))
-          done
           exec 3<&- 4>&-
         done
-        : > "$d/stop"
-        wait "${others[@]}"
-        echo "pin_output failed $pin_failed of 150, read_fd3 $read_failed"
-        echo "$wrong of $tests"
+        echo "pin_output failed $pin_failed of $i, read_fd3 $read_failed"
 
         """#).write(to: script, atomically: true, encoding: .utf8)
 
         let run = try fx.start(script)
-        let ended = waitUntil(60) { run.process.hasExited }
-        if !ended { _ = run.process.signal(SIGKILL) }
+        var ended = waitUntil(60) { run.process.hasExited }
+        if !ended {
+            // Out of time: the stop file ends the loop at its next file.
+            FileManager.default.createFile(atPath: stop.path, contents: nil)
+            ended = waitUntil(10) { run.process.hasExited }
+            if !ended { _ = run.process.signal(SIGKILL) }
+        }
         let r = run.finish()
+        let statuses = drain()
 
         XCTAssertTrue(ended, r.stdout)
         XCTAssertEqual(r.status, 0, r.stderr)
-        let lines = r.stdout.components(separatedBy: "\n")
-        XCTAssertEqual(lines.first, "pin_output failed 0 of 150, read_fd3 0", r.stdout)
-        let control = lines.count > 1 ? lines[1].components(separatedBy: " of ") : []
-        XCTAssertEqual(control.count, 2, r.stdout)
-        XCTAssertGreaterThan(Int(control.first ?? "") ?? 0, 0, "no test through /dev/fd answered wrongly, so this run did not meet the race: \(r.stdout)")
-        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dir.path).sorted(), ["control", "other.1", "other.2", "other.3", "other.4", "stop"], "every pinned file lost its name")
+        XCTAssertEqual(r.stdout, "pin_output failed 0 of 150, read_fd3 0\n", r.stderr)
+        XCTAssertEqual(statuses, [0, 0, 0, 0], "each competitor exited 0 and was reaped (wait statuses)")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dir.path).sorted(),
+                       ["other.1", "other.2", "other.3", "other.4", "ready.1", "ready.2", "ready.3", "ready.4", "stop"], "every pinned file lost its name")
     }
 
     /// What a caller makes of a supervisor that sends a status and its
@@ -9894,6 +10251,45 @@ final class RecoveryScriptTests: XCTestCase {
         }
     }
 
+    /// The number of a stat that `f`'s fake stat logged in the calls log
+    /// (with stat.mark there) when it is a stat of a descriptor's type alone
+    /// ("stat-call <n> -f %HT"), which only read_fd3 makes; nil for any
+    /// other line.
+    private static func readBackStatNumber(_ line: String) -> Int? {
+        let parts = line.split(separator: " ")
+        guard parts.count == 4, parts[0] == "stat-call", parts[2] == "-f", parts[3] == "%HT" else { return nil }
+        return Int(parts[1])
+    }
+
+    /// The read_fd3 stat logged first after the first call that starts with
+    /// `call`: the one that reads back that call's output.
+    private func readBackStat(_ f: ScriptFixture, after call: String) -> Int? {
+        let lines = f.calls()
+        guard let at = lines.firstIndex(where: { $0.hasPrefix(call) }) else { return nil }
+        return lines[(at + 1)...].lazy.compactMap { Self.readBackStatNumber($0) }.first
+    }
+
+    /// The read_fd3 stats with no pin_output stat ("-f %HT:%z:%d:%i") and
+    /// no call of the app binary logged since the read_fd3 stat before
+    /// them: the reads of the notes (notes_send). Every other reader pins
+    /// a file of its own just before it reads it, but for the reader of
+    /// the app binary's answer, whose file the backstop pins at its start
+    /// (see run_app_bounded).
+    private func unpinnedReadBackStats(_ f: ScriptFixture) -> [Int] {
+        var pinned = false
+        var found: [Int] = []
+        for line in f.calls() {
+            if line.hasPrefix("Insomnia ") { pinned = true }
+            guard line.hasPrefix("stat-call ") else { continue }
+            if line.hasSuffix(" -f %HT:%z:%d:%i") { pinned = true }
+            if let n = Self.readBackStatNumber(line) {
+                if !pinned { found.append(n) }
+                pinned = false
+            }
+        }
+        return found
+    }
+
     /// Root trusts no stat answer it has not checked in full (r_stat): one
     /// line of the eight fields asked for, from a stat that exits 0. With
     /// every answer right (the matched control, through the script and
@@ -10046,6 +10442,80 @@ final class RecoveryScriptTests: XCTestCase {
                 if install {
                     XCTAssertFalse(f.calls().contains { $0.hasPrefix("osascript") || $0.hasPrefix("launchctl bootout") || $0.hasPrefix("launchctl bootstrap") }, "\(label): \(f.calls())")
                 }
+            }
+        }
+    }
+
+    /// The reader of a bounded call's output in install.sh and uninstall.sh
+    /// (supervise) refuses an output file whose stat prints "Regular File"
+    /// and then exits 1. pgrep's answer is then not read back, so whether
+    /// Insomnia runs is unknown, and each script stops there, before it
+    /// changes anything or makes any other call. uninstall.sh's reader of
+    /// the notes (notes_send) refuses it too: the agent list in
+    /// config.json, whose read fails, is reported with its note not read
+    /// back, and the run goes on. The matched control, every stat answered
+    /// in full and the same config.json read failing, completes and finds
+    /// the stat to fail: the first read_fd3 stat logged after pgrep, or
+    /// the one read_fd3 stat with no pin_output stat since the read before
+    /// it. Each failing run is a fresh fixture with the same files, and the
+    /// stat it fails has the same place there.
+    func testInstallAndUninstallRefuseOutputWhoseStatSaysRegularFileAndThenFails() throws {
+        let pgrep = "pgrep -x Insomnia"
+        for install in [true, false] {
+            let name = install ? "install" : "uninstall"
+            // A fixture ready to run: the rule there with its lock, every
+            // stat logged in the calls as well, and for uninstall.sh a
+            // config.json whose every read fails.
+            func fixture() throws -> ScriptFixture {
+                let f = try ruleFixture(install: install, fakes: install ? ["stat"] : ["stat", "plutil"])
+                try f.prepareSudoersLock()
+                try "".write(to: f.root.appendingPathComponent("stat.mark"), atomically: true, encoding: .utf8)
+                if !install {
+                    try f.writeConfig(#"{"agentList":["com.example.Listed"]}"#)
+                    try f.plutilCalls(matching: f.config.path, hang: false)
+                }
+                return f
+            }
+            let control = try fixture()
+            defer { control.destroy() }
+            let ok = try runRuleScript(control, install: install)
+            XCTAssertEqual(ok.status, 0, "\(name): " + ok.stderr + ok.stdout)
+            var readers: [(call: String, n: Int?)] = [(pgrep, readBackStat(control, after: pgrep))]
+            let unpinned = unpinnedReadBackStats(control)
+            if install {
+                XCTAssertEqual(unpinned, [], "install.sh reads no notes: \(control.calls())")
+            } else {
+                XCTAssertTrue(ok.stdout.contains("could not read all of the agent list in \(control.config.path) ('plutil -extract agentList.0' on config.json exited 2), so agent apps listed only there may not have been checked"), ok.stdout)
+                XCTAssertEqual(unpinned.count, 1, "one read of the notes: \(control.calls())")
+                readers.append(("the notes", unpinned.first))
+            }
+            for reader in readers {
+                let n = try XCTUnwrap(reader.n, "\(name): \(reader.call) in \(control.calls())")
+                let label = "\(name), \(reader.call), stat \(n)"
+                let f = try fixture()
+                defer { f.destroy() }
+                let inode = try f.inode(f.sudoers)
+                let hadApp = f.exists(f.app)
+                try "\(n)|fail-after".write(to: f.root.appendingPathComponent("stat.answer"), atomically: true, encoding: .utf8)
+
+                let r = try runRuleScript(f, install: install)
+
+                if reader.call == pgrep {
+                    XCTAssertEqual(r.status, 1, "\(label): " + r.stderr + r.stdout)
+                    XCTAssertEqual(readBackStat(f, after: pgrep), n, "\(label): the stat that failed read back pgrep's output")
+                    XCTAssertTrue(r.stderr.contains("pgrep exited 1, but its output could not be read back, so whether Insomnia runs in this or another account is unknown. Rerun once it answers. Nothing was \(install ? "changed" : "removed")."), "\(label): " + r.stderr)
+                    let calls = f.callsBesideScratchFiles().filter { !$0.hasPrefix("stat-call ") }
+                    XCTAssertEqual(calls.last, pgrep, "\(label): no call after pgrep: \(calls)")
+                    XCTAssertFalse(calls.contains { $0.hasPrefix("sudo") || $0.hasPrefix("osascript") }, "\(label): \(calls)")
+                    XCTAssertEqual(try String(contentsOf: f.sudoers, encoding: .utf8), f.sudoersRule, label)
+                    XCTAssertEqual(try f.inode(f.sudoers), inode, label)
+                    XCTAssertEqual(f.exists(f.app), hadApp, "\(label): nothing installed or removed")
+                } else {
+                    XCTAssertEqual(r.status, 0, "\(label): " + r.stderr + r.stdout)
+                    XCTAssertEqual(unpinnedReadBackStats(f), [n], "\(label): the stat that failed read the notes")
+                    XCTAssertTrue(r.stdout.contains("could not read all of the agent list in \(f.config.path) (its note could not be read back), so agent apps listed only there may not have been checked"), "\(label): " + r.stdout)
+                }
+                XCTAssertTrue(try f.lockIsFree(), label)
             }
         }
     }
@@ -11249,6 +11719,110 @@ final class RecoveryScriptTests: XCTestCase {
         }
     }
 
+    /// Each reader of a call's output in backstop.sh refuses an output file
+    /// whose stat prints "Regular File" and then exits 1, and the run keeps
+    /// what that output would have cleared: the ps line for a frozen pid
+    /// (read_unit, through bounded), the app binary's answer for an entry
+    /// with microseconds (run_app_bounded), the `defaults read` after a
+    /// failed delete of an App Nap entry (supervise_command, through
+    /// run_bounded), and the notes that say why a read of the journal
+    /// failed (notes_send). A matched control, every stat answered in full,
+    /// clears all three entries of one journal and finds the stat to fail
+    /// for each: the first read_fd3 stat logged after that call. A second
+    /// control, a read of the journal that fails after an undo, finds the
+    /// one read_fd3 stat with no pin_output stat since the read before it,
+    /// the read of the notes. Each failing run starts from its control's
+    /// files and fails that stat alone, which comes after the same call
+    /// there; the other entries are cleared as in the control. No run
+    /// leaves the lock held.
+    func testBackstopRefusesOutputWhoseStatSaysRegularFileAndThenFails() throws {
+        let backstop = try readingBackstop()
+        let chrome = "com.google.Chrome"
+        let entries = """
+        {"sleepDisabledByUs":false,"lowPowerSetByUs":false,"dockerFrozen":false,
+         "frozenProcesses":[{"pid":4242,"startedAt":1789388423,"bootSession":"\(fx.bootUUID)"},
+          {"pid":5106,"startedAt":1789388423,"startedAtMicros":5,"bootSession":"\(fx.bootUUID)"}],
+         "appNapOverrides":[{"bundleId":"\(chrome)"}]}
+        """
+        let undone = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":true,"frozenProcesses":[],"dockerFrozen":false}"#
+        try "".write(to: fx.root.appendingPathComponent("stat.mark"), atomically: true, encoding: .utf8)
+        // A run from a fresh start: `journal`, an ended session, no key in
+        // the defaults table, no stat log, call or log line, and stat `n`
+        // failed after it answers, if any.
+        func run(_ journal: String, failing n: Int?) throws -> (status: Int32, log: String) {
+            for name in ["stat.calls", "stat.count", "stat.answer", "plutil.fail.count"] {
+                try? FileManager.default.removeItem(at: fx.root.appendingPathComponent(name))
+            }
+            try? FileManager.default.removeItem(at: fx.logFile)
+            fx.clearCalls()
+            try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+            try fx.writeState(journal)
+            try fx.defaultsTable([])
+            if let n { try "\(n)|fail-after".write(to: fx.root.appendingPathComponent("stat.answer"), atomically: true, encoding: .utf8) }
+            let r = try fx.run(backstop)
+            XCTAssertTrue(try fx.lockIsFree(), "stat \(n.map(String.init) ?? "none") failed")
+            return (r.status, fx.log())
+        }
+        func kept() throws -> (frozen: [Int]?, appNap: [String]?) {
+            let state = try fx.stateJSON()
+            return ((state["frozenProcesses"] as? [[String: Any]])?.compactMap { $0["pid"] as? Int },
+                    (state["appNapOverrides"] as? [[String: Any]])?.compactMap { $0["bundleId"] as? String })
+        }
+
+        let control = try run(entries, failing: nil)
+
+        XCTAssertEqual(control.status, 0, control.log)
+        let ps = "ps -o lstart=,stat=,uid= -p 4242"
+        let resume = "Insomnia --resume-frozen 2 < 5106 1789388423 5 \(fx.bootUUID)"
+        let read = "defaults read \(chrome) NSAppSleepDisabled"
+        XCTAssertEqual(fx.calls().filter { !$0.hasPrefix("stat-call ") }, [ps, resume, "defaults delete \(chrome) NSAppSleepDisabled", read])
+        for line in ["pid 4242 is gone; cleared without signal", "defaults delete \(chrome) NSAppSleepDisabled: the key is already absent", "journal cleared"] {
+            XCTAssertTrue(control.log.contains(line), "\(line): " + control.log)
+        }
+        XCTAssertEqual(try kept().frozen, [])
+        XCTAssertEqual(try kept().appNap, [])
+        XCTAssertEqual(unpinnedReadBackStats(fx), [], "no read of the notes")
+        let readers: [(call: String, n: Int?, refused: String, frozen: [Int], appNap: [String])] = [
+            (ps, readBackStat(fx, after: ps), "pid 4242 could not be observed (ps failed or unparseable); kept, not signaled", [4242], []),
+            (resume, readBackStat(fx, after: resume), "for pid(s) 5106 (exit 0, output ''); all kept, not signaled", [5106], []),
+            (read, readBackStat(fx, after: read), "defaults read could not tell whether the key is still set (exit 1)", [], [chrome]),
+        ]
+        for reader in readers {
+            let n = try XCTUnwrap(reader.n, "\(reader.call) in \(fx.calls())")
+            let label = "\(reader.call), stat \(n)"
+
+            let r = try run(entries, failing: n)
+
+            XCTAssertEqual(r.status, 1, "\(label): " + r.log)
+            XCTAssertEqual(readBackStat(fx, after: reader.call), n, "\(label): the stat that failed read back that call's output")
+            XCTAssertTrue(r.log.contains(reader.refused), "\(label): " + r.log)
+            XCTAssertFalse(r.log.contains("journal cleared"), "\(label): " + r.log)
+            XCTAssertEqual(try kept().frozen, reader.frozen, label)
+            XCTAssertEqual(try kept().appNap, reader.appNap, label)
+        }
+
+        try fx.plutilCalls(matching: "-type keptDisplayUnderLowPower -o - */insomnia-backstop.*/state.json", hang: false, fromCall: 2)
+        let failed = "could not read keptDisplayUnderLowPower in \(fx.state.path) ("
+        let stopped = "); recovery stopped here, nothing further undone this run, journal and session kept; will retry"
+
+        let noted = try run(undone, failing: nil)
+
+        XCTAssertEqual(noted.status, 1, noted.log)
+        XCTAssertTrue(noted.log.contains(failed + "'plutil -type keptDisplayUnderLowPower' on state.json exited 2" + stopped), noted.log)
+        let unpinned = unpinnedReadBackStats(fx)
+        XCTAssertEqual(unpinned.count, 1, "one read of the notes: \(fx.calls())")
+        let n = try XCTUnwrap(unpinned.first)
+
+        let r = try run(undone, failing: n)
+
+        XCTAssertEqual(r.status, 1, r.log)
+        XCTAssertEqual(unpinnedReadBackStats(fx), [n], "the stat that failed read the notes")
+        XCTAssertTrue(r.log.contains(failed + "the note saying why could not be read back" + stopped), r.log)
+        XCTAssertEqual(fx.calls().filter { !$0.hasPrefix("stat-call ") }, ["sudo -n \(fx.fakePmset) -a disablesleep 0"])
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
+        XCTAssertEqual(try fx.stateJSON()["lowPowerSetByUs"] as? Bool, true)
+    }
+
     /// A stand-in for backstop.sh at `url`. It records the version evidence
     /// it was given as "backstop env <path>|<evidence>|<version>" ("unset"
     /// for a variable not set), closes its fd 9, so only its caller's
@@ -11759,6 +12333,61 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(fx.log().contains("pmset -a disablesleep 0 ok"), fx.log())
     }
 
+    /// That first backstop at its limit again, now with uninstall.sh's
+    /// supervisor for it killed with SIGKILL once the backstop has ended:
+    /// the fake perl SIGKILLs its parent, the supervisor, at the
+    /// supervisor's first check of the backstop's group, where the sudo
+    /// runs on. That sudo closed fd 9 and every other descriptor above 2,
+    /// as sudo does, so it does not keep the keeper's pipe open either
+    /// (see keep_lock). The uninstall gets no status (125),
+    /// stops with nothing removed and exits, so neither it nor the backstop
+    /// holds the lock any more. The supervisor's keeper (keep_lock group),
+    /// which it started before the backstop, does: the app's Start
+    /// (RecoveryLock.tryAcquire) is refused while the sudo runs, and
+    /// nothing signals the sudo. Once the sudo has ended and its group is
+    /// empty, the keeper lets go, Start can take the lock, and the next
+    /// uninstall runs the undo again.
+    func testABackstopFromBeforeTheLockKeepsItThroughItsSupervisorsSigkillUntilItsSudoEnds() throws {
+        try fx.writeUninstallCopy(extraConstants: ["BACKSTOP_TIMEOUT_SECONDS": "2"])
+        try fx.installMachinery()
+        try fx.writeConfig(#"{"agentList":[]}"#)
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try writeBackstopAt346c150(in: fx, at: fx.backstop)
+        fx.setMode("sudo", "drops-fd9-logs-signals")
+        try fx.killSupervisor(of: "perl -e kill(0, *")
+        defer { fx.releaseCommand() }
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(fx.calls().contains("perl SUPERVISOR-KILLED"), "\(fx.calls())")
+        XCTAssertTrue(r.stderr.contains(") or a process it started is still running."), r.stderr)
+        XCTAssertFalse(r.stdout.contains("==> Verifying the recovery journal"), r.stdout)
+        for kept in [fx.plist, fx.app, fx.sudoers, fx.state] { XCTAssertTrue(fx.exists(kept), kept.path) }
+        let sudo = try XCTUnwrap(fx.hungPid("sudo", within: 0), "\(fx.calls())")
+        XCTAssertFalse(try fx.lockIsFree(), "with the uninstall, its supervisor and the backstop gone, the keeper holds the lock for the sudo")
+        XCTAssertNil(try RecoveryLock(url: fx.lock).tryAcquire(), "Start cannot take the lock while the sudo runs")
+        let senders = try fx.signalSenders(of: sudo)
+        XCTAssertEqual(senders.term, [], "no SIGTERM reached the sudo")
+        XCTAssertEqual(senders.hup, [])
+        XCTAssertFalse(fx.calls().contains("sudo FD9-OPEN"), "\(fx.calls())")
+        XCTAssertNil(fx.commandEnded(), "the keeper signaled nothing")
+
+        fx.releaseCommand()
+        try assertLockHeldUntilGone(sudo, within: 10)
+        XCTAssertEqual(fx.commandEnded(), "released")
+        let start = try RecoveryLock(url: fx.lock).tryAcquire()
+        XCTAssertNotNil(start, "Start takes the lock once the keeper has let go")
+        start?.release()
+
+        fx.clearCalls()
+        fx.setMode("sudo", "ok")
+        let next = try fx.run(fx.uninstall)
+        XCTAssertTrue(fx.calls().contains("sudo -n \(fx.fakePmset) -a disablesleep 0"), next.stderr + "\(fx.calls())")
+        XCTAssertTrue(fx.log().contains("backstop: pmset -a disablesleep 0 ok"), fx.log())
+        XCTAssertTrue(try fx.waitUntilLockIsFree(5), "the next run leaves nothing holding the lock")
+    }
+
     /// perl starts the backstop in a process group of its own and tells its
     /// supervisor when that group is empty. With no perl at $PERL neither
     /// can happen, and a supervisor that never gets an answer would keep
@@ -11889,8 +12518,9 @@ final class RecoveryScriptTests: XCTestCase {
 
     /// What the scripts share is the same text in each, so a fix to one
     /// cannot miss another: backstop.sh and uninstall.sh read through the
-    /// same layer and check the journal and the session with the same
-    /// functions, all three read an Info.plist's version the same way and
+    /// same layer, check the journal and the session with the same
+    /// functions and take a `defaults read` for an absent key the same way,
+    /// all three read an Info.plist's version the same way and
     /// read back what a bounded call printed through the same text (from
     /// the comment on it to take_output) and keep the recovery lock for a
     /// privileged command that outlives its supervisor with the same keeper
@@ -11905,7 +12535,7 @@ final class RecoveryScriptTests: XCTestCase {
         }
         let backstop = try text("backstop.sh"), uninstall = try text("uninstall.sh"), install = try text("install.sh")
         XCTAssertEqual(try Self.sharedReadLayer(in: backstop, "backstop.sh"), try Self.sharedReadLayer(in: uninstall, "uninstall.sh"))
-        for name in ["journal_shape_problems", "session_shape_problems", "epoch_of", "epoch_at"] {
+        for name in ["journal_shape_problems", "session_shape_problems", "epoch_of", "epoch_at", "defaults_said_absent"] {
             XCTAssertEqual(try Self.shellFunction(name, in: backstop, "backstop.sh"), try Self.shellFunction(name, in: uninstall, "uninstall.sh"), name)
         }
         func infoBlock(_ t: String, _ script: String) throws -> String {
@@ -11955,7 +12585,10 @@ final class RecoveryScriptTests: XCTestCase {
     /// signalling the mv and changes nothing more: the session stays, and
     /// its work folder is left, since the mv may still use it. The mv keeps
     /// the recovery lock until it ends, so a second run in the meantime
-    /// finds the lock held. Once it ends the lock is free, the journal is
+    /// finds the lock held. It does not keep the run's output: a caller
+    /// that reads the run's standard output and error, one pipe, to their
+    /// end finds the end once the run exits, and never gets what the mv
+    /// prints later. Once the mv ends the lock is free, the journal is
     /// the one the stopped run published, and the next run finishes.
     func testBackstopStopsWhenItsJournalRenameDoesNotFinishInTime() throws {
         try fx.writeBackstopCopy(extraConstants: ["CHANGE_TIMEOUT_SECONDS": "2"])
@@ -11965,9 +12598,10 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.hold("mv", "*/.state.json.backstop.*|\(fx.state.path)")
         let tmp = try fx.privateTmp()
 
-        let r = try fx.run(fx.backstop)
+        let r = try fx.runThroughOnePipe(fx.backstop, endWithin: 2)
 
-        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertEqual(r.status, 1, r.output + fx.log())
+        XCTAssertNotNil(r.endedAfter, "the output ends with the run (exit after \(r.exitedAfter) s), while the mv is held: \(r.output)")
         let log = fx.log()
         XCTAssertTrue(log.contains("recovery stopped: publishing "), log)
         XCTAssertTrue(log.contains("did not finish within 2s, so whether it took place is not known"), log)
@@ -11991,6 +12625,8 @@ final class RecoveryScriptTests: XCTestCase {
         fx.releaseCommand()
         try assertLockHeldUntilGone(mv, within: 10)
         XCTAssertEqual(fx.commandEnded(), "released")
+        XCTAssertTrue(r.drain(within: 5), "the output has not ended")
+        XCTAssertFalse(r.output.contains("printed after its hold"), r.output)
         XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false, "the held rename took place once it was let go")
         let after = try fx.run(fx.backstop)
         XCTAssertEqual(after.status, 0, after.stderr + fx.log())
@@ -11999,10 +12635,12 @@ final class RecoveryScriptTests: XCTestCase {
 
     /// A backstop log line that takes longer than CHANGE_TIMEOUT_SECONDS
     /// (its date stamp is held) does not stop the undo: the run says on
-    /// standard error that the rest of it is not logged and goes on, and
-    /// its work folder goes, since nothing it uses is still in use. The
-    /// line's process keeps the recovery lock until it ends, and then
-    /// writes the line.
+    /// standard error that the rest of it is not logged and goes on. Its
+    /// work folder stays, since the line's process makes the file for its
+    /// output there and may still use it, and the run says so. The line's
+    /// process keeps the recovery lock until it ends, and then writes the
+    /// line, but not the run's output: read through one pipe, that ends
+    /// once the run exits, without what the held command prints later.
     func testBackstopGoesOnUnloggedWhenALogLineDoesNotFinishInTime() throws {
         try fx.writeBackstopCopy(extraConstants: ["CHANGE_TIMEOUT_SECONDS": "2"])
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
@@ -12010,10 +12648,11 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.hold("date", "log line")
         let tmp = try fx.privateTmp()
 
-        let r = try fx.run(fx.backstop)
+        let r = try fx.runThroughOnePipe(fx.backstop, endWithin: 2)
 
-        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
-        XCTAssertTrue(r.stderr.contains("did not finish within 2s; the rest of this run is not logged"), r.stderr)
+        XCTAssertEqual(r.status, 0, r.output + fx.log())
+        XCTAssertNotNil(r.endedAfter, "the output ends with the run (exit after \(r.exitedAfter) s), while the line is held: \(r.output)")
+        XCTAssertTrue(r.output.contains("did not finish within 2s; the rest of this run is not logged"), r.output)
         XCTAssertEqual(fx.calls(), [
             "date FD9-OPEN",
             "date HELD -u +%Y-%m-%dT%H:%M:%SZ",
@@ -12021,7 +12660,9 @@ final class RecoveryScriptTests: XCTestCase {
         ])
         XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
         XCTAssertFalse(fx.exists(fx.session))
-        XCTAssertEqual(try fx.contents(of: tmp).filter { $0.hasPrefix("insomnia-backstop.") }, [], "the work folder goes")
+        let work = try fx.contents(of: tmp).filter { $0.hasPrefix("insomnia-backstop.") }
+        XCTAssertEqual(work.count, 1, "the work folder stays")
+        XCTAssertTrue(r.output.contains("backstop: left \(tmp.path)/\(work.first ?? "-") in place: a log line this run wrote was not seen to finish and may still use it"), r.output)
         XCTAssertEqual(fx.log(), "", "the held line is not written yet")
         XCTAssertFalse(try fx.lockIsFree(), "the held line keeps the recovery lock")
         let line = try XCTUnwrap(fx.hungPid("date", within: 5))
@@ -12030,17 +12671,110 @@ final class RecoveryScriptTests: XCTestCase {
         fx.releaseCommand()
         try assertLockHeldUntilGone(line, within: 10)
         XCTAssertEqual(fx.commandEnded(), "released")
+        XCTAssertTrue(r.drain(within: 5), "the output has not ended")
+        XCTAssertFalse(r.output.contains("printed after its hold"), r.output)
         let lines = fx.log().split(separator: "\n")
         XCTAssertEqual(lines.count, 1, fx.log())
         XCTAssertTrue(lines.first?.hasSuffix("restoring from journal") == true, fx.log())
+    }
+
+    /// The backstop's tightening of what an older build left loose (one
+    /// change for every path, see tighten) takes longer than
+    /// CHANGE_TIMEOUT_SECONDS: the chmod of the journal is held. The run
+    /// stops there, before it opens the lock or reads anything, and nothing
+    /// signals the chmod. Its work folder is left, since the change keeps
+    /// the file for its output there. Read through one pipe, the run's
+    /// output ends once it exits, without what the chmod prints later.
+    /// Once the chmod ends the journal is owner-only, and the next run
+    /// undoes what it records.
+    func testBackstopStopsBeforeTheLockWhenItsTighteningDoesNotFinishInTime() throws {
+        try fx.writeBackstopCopy(extraConstants: ["CHANGE_TIMEOUT_SECONDS": "2"])
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        let dirty = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#
+        try fx.writeState(dirty)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: fx.state.path)
+        try fx.hold("chmod", fx.state.path)
+        let tmp = try fx.privateTmp()
+        let logsDir = fx.logFile.deletingLastPathComponent()
+        let paths = [fx.home, logsDir, fx.logFile, fx.lock, fx.state, fx.session].map(\.path).joined(separator: " ")
+
+        let r = try fx.runThroughOnePipe(fx.backstop, endWithin: 2)
+
+        XCTAssertEqual(r.status, 1, r.output + fx.log())
+        XCTAssertNotNil(r.endedAfter, "the output ends with the run (exit after \(r.exitedAfter) s), while the chmod is held: \(r.output)")
+        let log = fx.log()
+        XCTAssertTrue(log.contains("[error] backstop: recovery stopped: making \(paths) owner-only did not finish within 2s; nothing was read or undone this run, and the next run will retry\n"), log)
+        XCTAssertTrue(log.contains("in place: a change this run made was not seen to finish"), log)
+        XCTAssertEqual(fx.calls(), ["chmod HELD \(fx.state.path)"], "nothing after the held chmod")
+        XCTAssertEqual(fx.chmodCalls(), ["chmod go-rwx \(fx.home.path)", "chmod go-rwx \(fx.state.path)"])
+        XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), dirty)
+        XCTAssertEqual(try fx.mode(fx.state), 0o644, "the held chmod has not happened yet")
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertEqual(try fx.contents(of: tmp).filter { $0.hasPrefix("insomnia-backstop.") }.count, 1, "the work folder is left")
+        XCTAssertFalse(fx.exists(fx.lock), "the run stopped before it opened the lock")
+        XCTAssertNotNil(fx.hungPid("chmod", within: 5), "\(fx.calls())")
+        XCTAssertNil(fx.commandEnded(), "nothing signalled the chmod")
+
+        fx.releaseCommand()
+        XCTAssertTrue(fx.hungProcessGone("chmod", within: 10), "the chmod ends once let go")
+        XCTAssertEqual(fx.commandEnded(), "released")
+        XCTAssertTrue(r.drain(within: 5), "the output has not ended")
+        XCTAssertFalse(r.output.contains("printed after its hold"), r.output)
+        XCTAssertEqual(try fx.mode(fx.state), 0o600, "the held chmod took place once it was let go")
+        let after = try fx.run(fx.backstop)
+        XCTAssertEqual(after.status, 0, after.stderr + fx.log())
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertFalse(fx.exists(fx.session), "the next run removes the session")
+    }
+
+    /// The backstop's mkdir of its own folder (a change made before it has
+    /// a work folder, so what the mkdir prints goes to /dev/null) takes
+    /// longer than CHANGE_TIMEOUT_SECONDS. The run logs that and stops
+    /// there, before it makes its work folder, tightens anything, opens the
+    /// lock or reads anything, and nothing signals the mkdir. Read through
+    /// one pipe, the run's output ends once it exits. Once the mkdir ends,
+    /// the next run undoes what the journal records.
+    func testBackstopStopsWhenMakingItsFolderDoesNotFinishInTime() throws {
+        try fx.writeBackstopCopy(extraConstants: ["CHANGE_TIMEOUT_SECONDS": "2", "MKDIR": fx.bin.appendingPathComponent("mkdir").path])
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        let dirty = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#
+        try fx.writeState(dirty)
+        try fx.hold("mkdir", fx.home.path)
+        let tmp = try fx.privateTmp()
+        let logsDir = fx.logFile.deletingLastPathComponent()
+
+        let r = try fx.runThroughOnePipe(fx.backstop, endWithin: 2)
+
+        XCTAssertEqual(r.status, 1, r.output + fx.log())
+        XCTAssertNotNil(r.endedAfter, "the output ends with the run (exit after \(r.exitedAfter) s), while the mkdir is held: \(r.output)")
+        XCTAssertTrue(fx.log().contains("[error] backstop: recovery stopped: creating \(fx.home.path) did not finish within 2s; nothing was read or undone this run, and the next run will retry\n"), fx.log())
+        XCTAssertEqual(fx.calls(), ["mkdir -p \(fx.home.path)", "mkdir HELD \(fx.home.path)", "mkdir -p \(logsDir.path)"])
+        XCTAssertEqual(fx.chmodCalls(), [], "nothing was tightened")
+        XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), dirty)
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertEqual(try fx.contents(of: tmp).filter { $0.hasPrefix("insomnia-backstop.") }, [], "no work folder was made")
+        XCTAssertFalse(fx.exists(fx.lock), "the run stopped before it opened the lock")
+        XCTAssertNotNil(fx.hungPid("mkdir", within: 5), "\(fx.calls())")
+        XCTAssertNil(fx.commandEnded(), "nothing signalled the mkdir")
+
+        fx.releaseCommand()
+        XCTAssertTrue(fx.hungProcessGone("mkdir", within: 10), "the mkdir ends once let go")
+        XCTAssertEqual(fx.commandEnded(), "released")
+        XCTAssertTrue(r.drain(within: 5), "the output has not ended")
+        XCTAssertFalse(r.output.contains("printed after its hold"), r.output)
+        let after = try fx.run(fx.backstop)
+        XCTAssertEqual(after.status, 0, after.stderr + fx.log())
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertFalse(fx.exists(fx.session), "the next run removes the session")
     }
 
     /// install.sh's rename of the new LaunchAgent plist into place takes
     /// longer than CHANGE_TIMEOUT_SECONDS. The install stops there without
     /// signalling the mv: it removes neither the set-aside bundle nor its
     /// own scratch files, says what it left, and the mv keeps the recovery
-    /// lock until it ends. A rerun after that installs as usual and removes
-    /// what the stopped run left.
+    /// lock until it ends, but not the run's output (see
+    /// testBackstopStopsWhenItsJournalRenameDoesNotFinishInTime). A rerun
+    /// after that installs as usual and removes what the stopped run left.
     func testInstallStopsWhenItsPlistRenameDoesNotFinishInTime() throws {
         try fx.writeInstallCopies(extraConstants: ["CHANGE_TIMEOUT_SECONDS": "2"])
         try fx.prepareInstall()
@@ -12050,13 +12784,14 @@ final class RecoveryScriptTests: XCTestCase {
         fx.setMode("launchctl", "loaded")
         try fx.hold("mv", "*/com.insomnia.backstop.candidate-*|\(fx.plist.path)")
 
-        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": ScriptFixture.account])
+        let r = try fx.runThroughOnePipe(fx.installRedirected, extraEnvironment: ["USER": ScriptFixture.account], endWithin: 2)
 
-        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
-        XCTAssertTrue(r.stderr.contains("Install stopped: publishing "), r.stderr)
-        XCTAssertTrue(r.stderr.contains("did not finish within 2s, so whether it took place"), r.stderr)
-        XCTAssertTrue(r.stderr.contains("Left in place, since a change this run made was not seen to finish"), r.stderr)
-        XCTAssertFalse(r.stdout.contains("replaced the previous"), r.stdout)
+        XCTAssertEqual(r.status, 1, r.output)
+        XCTAssertNotNil(r.endedAfter, "the output ends with the run (exit after \(r.exitedAfter) s), while the mv is held: \(r.output)")
+        XCTAssertTrue(r.output.contains("Install stopped: publishing "), r.output)
+        XCTAssertTrue(r.output.contains("did not finish within 2s, so whether it took place"), r.output)
+        XCTAssertTrue(r.output.contains("Left in place, since a change this run made was not seen to finish"), r.output)
+        XCTAssertFalse(r.output.contains("replaced the previous"), r.output)
         let calls = fx.calls()
         XCTAssertTrue(calls.contains("mv FD9-OPEN"), "the held mv has the recovery lock: \(calls)")
         XCTAssertTrue(calls.last?.hasPrefix("mv HELD ") == true && calls.last?.hasSuffix(" \(fx.plist.path)") == true,
@@ -12072,6 +12807,8 @@ final class RecoveryScriptTests: XCTestCase {
         fx.releaseCommand()
         try assertLockHeldUntilGone(mv, within: 10)
         XCTAssertEqual(fx.commandEnded(), "released")
+        XCTAssertTrue(r.drain(within: 5), "the output has not ended")
+        XCTAssertFalse(r.output.contains("printed after its hold"), r.output)
         XCTAssertEqual(try fx.plistOnDisk()["StartInterval"] as? Int, 60, "the held rename took place once it was let go")
 
         fx.setMode("kill.fail", "\(stopped)")   // the fake kill: the stopped run is gone
@@ -12086,8 +12823,9 @@ final class RecoveryScriptTests: XCTestCase {
     /// uninstall.sh's removal of the app bundle takes longer than
     /// CHANGE_TIMEOUT_SECONDS. The run stops there without signalling the
     /// rm and removes nothing more: the journal and its work folder stay.
-    /// The rm keeps the recovery lock until it ends. A rerun after that
-    /// finishes the uninstall.
+    /// The rm keeps the recovery lock until it ends, but not the run's
+    /// output (see testBackstopStopsWhenItsJournalRenameDoesNotFinishInTime).
+    /// A rerun after that finishes the uninstall.
     func testUninstallStopsWhenItsBundleRemovalDoesNotFinishInTime() throws {
         try fx.writeUninstallCopy(extraConstants: ["RM": fx.bin.appendingPathComponent("rm").path, "CHANGE_TIMEOUT_SECONDS": "2"])
         try fx.installMachinery()
@@ -12095,12 +12833,13 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         try fx.hold("rm", fx.app.path)
 
-        let r = try fx.run(fx.uninstall)
+        let r = try fx.runThroughOnePipe(fx.uninstall, endWithin: 2)
 
-        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
-        XCTAssertTrue(r.stderr.contains("Uninstall stopped: removing the app bundle ("), r.stderr)
-        XCTAssertTrue(r.stderr.contains("did not finish within 2s, so whether it took place is not known"), r.stderr)
-        XCTAssertTrue(r.stderr.contains("in place, since a change this run made was not seen to finish"), r.stderr)
+        XCTAssertEqual(r.status, 1, r.output)
+        XCTAssertNotNil(r.endedAfter, "the output ends with the run (exit after \(r.exitedAfter) s), while the rm is held: \(r.output)")
+        XCTAssertTrue(r.output.contains("Uninstall stopped: removing the app bundle ("), r.output)
+        XCTAssertTrue(r.output.contains("did not finish within 2s, so whether it took place is not known"), r.output)
+        XCTAssertTrue(r.output.contains("in place, since a change this run made was not seen to finish"), r.output)
         let calls = fx.calls()
         XCTAssertTrue(calls.contains("sudo -n \(fx.fakePmset) -a disablesleep 0"), "\(calls)")
         XCTAssertTrue(calls.contains("rm FD9-OPEN"), "the held rm has the recovery lock: \(calls)")
@@ -12116,6 +12855,8 @@ final class RecoveryScriptTests: XCTestCase {
         fx.releaseCommand()
         try assertLockHeldUntilGone(rm, within: 10)
         XCTAssertEqual(fx.commandEnded(), "released")
+        XCTAssertTrue(r.drain(within: 5), "the output has not ended")
+        XCTAssertFalse(r.output.contains("printed after its hold"), r.output)
         XCTAssertFalse(fx.exists(fx.app), "the held removal took place once it was let go")
 
         let again = try fx.run(fx.uninstall)
@@ -12123,6 +12864,42 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(fx.exists(fx.state))
         XCTAssertTrue(fx.exists(fx.config), "config.json survives without --purge")
         XCTAssertTrue(try fx.lockIsFree())
+    }
+
+    /// What a change printed is shown once the change has finished: the
+    /// failed rename of the backstop's journal says why on the run's
+    /// standard error, once. A run whose changes all finished, whether one
+    /// failed or none, leaves nothing that holds the recovery lock, its
+    /// work folder or its output: read through one pipe, that ends once
+    /// the run exits.
+    func testBackstopShowsWhatAChangePrintedOnceTheChangeHasFinished() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try fx.failMoves([("*/.state.json.backstop.*", fx.state.path)])
+        let tmp = try fx.privateTmp()
+
+        let failed = try fx.runThroughOnePipe(fx.backstop, endWithin: 2)
+
+        XCTAssertEqual(failed.status, 1, failed.output + fx.log())
+        XCTAssertNotNil(failed.endedAfter, "the output ends with the run (exit after \(failed.exitedAfter) s): \(failed.output)")
+        let why = failed.output.split(separator: "\n").filter { $0.hasPrefix("mv: rename ") }
+        XCTAssertEqual(why.count, 1, failed.output)
+        XCTAssertTrue(why.first?.hasPrefix("mv: rename \(fx.home.path)/.state.json.backstop.") == true, failed.output)
+        XCTAssertTrue(why.first?.hasSuffix(" to \(fx.state.path): Permission denied") == true, failed.output)
+        XCTAssertTrue(fx.log().contains("could not publish the updated journal to \(fx.state.path); previous journal kept, will retry"), fx.log())
+        XCTAssertTrue(try fx.lockIsFree())
+        XCTAssertEqual(try fx.contents(of: tmp).filter { $0.hasPrefix("insomnia-backstop.") }, [], "the work folder goes")
+
+        try FileManager.default.removeItem(at: fx.root.appendingPathComponent("mv.fail"))
+        let done = try fx.runThroughOnePipe(fx.backstop, endWithin: 2)
+
+        XCTAssertEqual(done.status, 0, done.output + fx.log())
+        XCTAssertNotNil(done.endedAfter, "the output ends with the run (exit after \(done.exitedAfter) s): \(done.output)")
+        XCTAssertFalse(done.output.contains("mv: "), done.output)
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertTrue(try fx.lockIsFree())
+        XCTAssertEqual(try fx.contents(of: tmp).filter { $0.hasPrefix("insomnia-backstop.") }, [], "the work folder goes")
     }
 
     // MARK: - A process named Insomnia whose owner cannot be read
@@ -13123,6 +13900,13 @@ private final class ScriptFixture {
           fi
           exec "$@"
         }
+        # Closes every descriptor above 2 but bash's own (255, which no
+        # command it runs inherits), as sudo does before it runs its
+        # command: fd 9, the recovery lock, and any pipe the shell that
+        # started it left open, such as the copy of a keeper's pipe that
+        # bash 3.2 keeps as fd 63 in the supervisor of this call (see
+        # keep_lock).
+        close_inherited() { local fd; for (( fd = 3; fd < 255; fd++ )); do eval "exec $fd>&-"; done; }
         # "ignore-term" and "closes-fd9" behave like a pmset that ignores
         # SIGTERM: they live until the test creates the release file (or the
         # fixture is destroyed, or a 60 s wall-clock watchdog), so a test decides when
@@ -13159,22 +13943,24 @@ private final class ScriptFixture {
                 # "logs-term": like "ignore-term", and every SIGTERM it gets
                 # is logged as "sudo SIGTERM" (see sudoHangHere).
                 logs-term) hang_on_term ignore ;;
-                # "drops-fd9-logs-signals": closes its fd 9 the way sudo
-                # does, then waits like "logs-term", logging every SIGTERM
-                # and SIGHUP with its sender (see signalReceiverHere).
-                drops-fd9-logs-signals) exec 9<&-; receive_signals ;;
+                # "drops-fd9-logs-signals": closes fd 9 and every other
+                # descriptor above 2 the way sudo does (close_inherited),
+                # then waits like "logs-term", logging every SIGTERM and
+                # SIGHUP with its sender (see signalReceiverHere).
+                drops-fd9-logs-signals) close_inherited; receive_signals ;;
                 # "signals-self": for SIGTERM, SIGHUP and SIGPIPE, a shell that
                 # inherits this command's signal actions sends itself the
                 # signal and, if it is still there afterwards, logs "sudo
                 # SURVIVED <signal>". Then it exits 0.
                 signals-self) for s in TERM HUP PIPE; do /bin/bash -c "kill -$s \\$\\$; echo 'sudo SURVIVED $s' >> '\(calls)'"; done
                   printf 'sudo SIGNALS-CHECKED\\n' >> "\(calls)"; exit 0 ;;
-                # "kills-supervisor": closes its fd 9 the way sudo does,
+                # "kills-supervisor": closes fd 9 and every other
+                # descriptor above 2 the way sudo does (close_inherited),
                 # then, half a second on (time for its supervisor to have
                 # sent its pid), SIGKILLs its parent, the supervisor of the
                 # backstop call that runs it, logs "sudo SUPERVISOR-KILLED"
                 # and waits like "logs-term".
-                kills-supervisor) exec 9<&-; /bin/sleep 0.5; kill -KILL "$PPID"
+                kills-supervisor) close_inherited; /bin/sleep 0.5; kill -KILL "$PPID"
                   printf 'sudo SUPERVISOR-KILLED\\n' >> "\(calls)"
                   hang_on_term ignore ;;
                 *) exit 1 ;;
@@ -13315,7 +14101,9 @@ private final class ScriptFixture {
         // and then ends by SIGTERM, logging "rm KILLED <path>". One of a
         // path that matches the glob in rm.hold waits for releaseCommand
         // first (see holdHere). uninstall.sh's RM is the real rm unless a
-        // test patches in this one.
+        // test patches in this one. A mkdir of a path that matches the glob
+        // in mkdir.hold waits the same way; backstop.sh's MKDIR is the
+        // real mkdir unless a test patches in this one.
         for (tool, real) in [("rm", "/bin/rm"), ("rmdir", "/bin/rmdir"), ("mktemp", "/usr/bin/mktemp"), ("mkdir", "/bin/mkdir")] {
             let killed = tool != "rm" ? "" : """
             \(holdHere("rm"))
@@ -13340,9 +14128,22 @@ private final class ScriptFixture {
               done
             fi
             """
+            let held = tool != "mkdir" ? "" : """
+            \(holdHere("mkdir"))
+            if [[ -f "\(r)/mkdir.hold" && ! -e "\(r)/mkdir.hung.pid" ]]; then
+              IFS= read -r pattern < "\(r)/mkdir.hold" || true
+              for a in "$@"; do
+                if [[ -n "$pattern" && "$a" != -* && "$a" == $pattern ]]; then
+                  hold_here "$a"
+                  break
+                fi
+              done
+            fi
+            """
             try writeFake(tool, """
             printf '\(tool)%s\\n' "${*:+ $*}" >> "\(calls)"
             \(killed)
+            \(held)
             exec \(real) "$@"
             """)
         }
@@ -13472,7 +14273,9 @@ private final class ScriptFixture {
         // succeeds without running, and one with another ACL option (+a,
         // -a, =a, -E, -C, -i, -I) exits 2 without running, so no test
         // changes an ACL through it; with chmod.native-acl (see
-        // useNativeACLs) both run for real.
+        // useNativeACLs) both run for real. A call whose path matches the
+        // bash glob in chmod.hold waits for releaseCommand first (see
+        // holdHere).
         try writeFake("chmod", """
         if [[ ! -f "\(r)/chmod.native-acl" ]]; then
           for a in "$@"; do
@@ -13483,6 +14286,11 @@ private final class ScriptFixture {
           done
         fi
         printf 'chmod %s\\n' "$*" >> "\(r)/chmod.calls"
+        \(holdHere("chmod"))
+        if [[ -f "\(r)/chmod.hold" && ! -e "\(r)/chmod.hung.pid" ]]; then
+          IFS= read -r pattern < "\(r)/chmod.hold" || true
+          if [[ -n "$pattern" && "${2:-}" == $pattern ]]; then hold_here "${2:-}"; fi
+        fi
         if [[ -f "\(r)/chmod.fail" ]]; then
           while IFS= read -r p || [[ -n "$p" ]]; do
             if [[ -n "$p" && "${2:-}" == $p ]]; then
@@ -13548,8 +14356,10 @@ private final class ScriptFixture {
         // rule calls it, counts those calls in cat.stdin.count; on the call
         // cat.stdin.fail names, it copies all of its input and then exits 1.
         // stat counts every call in stat.count and logs it in stat.calls as
-        // "<n> <arguments>" (a stat of standard input has none). On the
-        // call stat.answer names ("<n>|<how>"), it answers wrongly: with the
+        // "<n> <arguments>" (a stat of standard input has none), and while
+        // stat.mark exists also in the calls log, as "stat-call <n>
+        // <arguments>", so a test can tell which call a stat came after. On
+        // the call stat.answer names ("<n>|<how>"), it answers wrongly: with the
         // real answer and then exit 1 (fail-after), the real answer less its
         // last field (partial), the real answer and a second line (extra),
         // nothing (empty), the real answer without its newline (no-newline),
@@ -13559,6 +14369,7 @@ private final class ScriptFixture {
             n=$(( $(/bin/cat "\(r)/stat.count" 2>/dev/null || echo 0) + 1 ))
             echo "$n" > "\(r)/stat.count"
             printf '%s %s\\n' "$n" "$*" >> "\(r)/stat.calls"
+            [[ ! -e "\(r)/stat.mark" ]] || printf 'stat-call %s %s\\n' "$n" "$*" >> "\(calls)"
             if [[ -f "\(r)/stat.answer" ]]; then
               IFS='|' read -r at how < "\(r)/stat.answer"
               if [[ "$at" == "$n" ]]; then
@@ -13788,7 +14599,8 @@ private final class ScriptFixture {
         // "unreachable" (or "unreachable:<domain>") fails every command,
         // read included, the way a cfprefsd that does not answer would:
         // non-zero without the "does not exist" message. Mode "hang" (or
-        // "hang:<domain>") never answers; see hangHere.
+        // "hang:<domain>") never answers; see hangHere. defaults.read (see
+        // defaultsReads) gives a `read` of a domain another answer.
         try writeFake("defaults", """
         printf 'defaults %s\\n' "$*" >> "\(calls)"
         mode="$(cat "\(r)/defaults.mode" 2>/dev/null || echo ok)"
@@ -13813,6 +14625,40 @@ private final class ScriptFixture {
         if [[ "$mode" == unreachable || "$mode" == "unreachable:$domain" ]]; then
           echo "fake defaults: cfprefsd did not answer for $domain" >&2; exit 1
         fi
+        answer=""
+        if [[ "$cmd" == read && -f "\(r)/defaults.read" ]]; then
+          while IFS='|' read -r d a; do
+            if [[ "$d" == "$domain" || "$d" == "*" ]]; then answer="$a"; break; fi
+          done < "\(r)/defaults.read"
+        fi
+        absent="The domain/default pair of ($domain, $key) does not exist"
+        case "$answer" in
+          "") ;;
+          header) printf '2026-10-10 07:17:00.123 defaults[4242:56789] \\n%s\\n' "$absent" >&2; exit 1 ;;
+          nul) printf 'The domain/default pair of (%s, %s) does not\\0 exist\\n' "$domain" "$key" >&2; exit 1 ;;
+          no-newline) printf '%s' "$absent" >&2; exit 1 ;;
+          cut) printf '%s\\n' "${absent% exist}" >&2; exit 1 ;;
+          wrong-key) printf 'The domain/default pair of (%s, %sX) does not exist\\n' "$domain" "$key" >&2; exit 1 ;;
+          wrong-bundle) printf 'The domain/default pair of (%s.other, %s) does not exist\\n' "$domain" "$key" >&2; exit 1 ;;
+          value-after) printf '%s\\n1\\n' "$absent" >&2; exit 1 ;;
+          value-before) printf '1\\n%s\\n' "$absent" >&2; exit 1 ;;
+          exit-2) printf '%s\\n' "$absent" >&2; exit 2 ;;
+          stopped)
+            printf '%s\\n' "$absent" >&2
+            echo $$ > "\(r)/defaults.hung.pid"
+            exec /bin/sleep 30 ;;
+          alive)
+            printf '%s\\n' "$absent" >&2
+            if { : >&9; } 2>/dev/null; then echo 'defaults FD9-OPEN' >> "\(calls)"; fi
+            trap 'echo "defaults SIGTERM" >> "\(calls)"' TERM
+            deadline=$(( SECONDS + 60 ))
+            echo $$ > "\(r)/defaults.hung.pid"
+            while [[ ! -e "\(r)/release" && -d "\(r)" ]] && (( SECONDS < deadline )); do /bin/sleep 0.1; done
+            if [[ -e "\(r)/release" ]]; then echo released > "\(r)/command.ended"
+            elif [[ -d "\(r)" ]]; then echo watchdog > "\(r)/command.ended"; fi
+            exit 1 ;;
+          *) echo "fake defaults: unknown answer '$answer'" >&2; exit 2 ;;
+        esac
         case "$cmd" in
           read)
             v="$(lookup)" || { echo "The domain/default pair of ($domain, $key) does not exist" >&2; exit 1; }
@@ -14130,8 +14976,9 @@ private final class ScriptFixture {
 
     /// Holds the first change the fake `tool` makes that `pattern`
     /// matches until releaseCommand (see holdHere): for mv a
-    /// "<from>|<to>" pair of bash globs, for rm one glob for a path, for
-    /// date any text (it holds the stamp of a backstop log line).
+    /// "<from>|<to>" pair of bash globs, for rm, mkdir and chmod one glob
+    /// for a path, for date any text (it holds the stamp of a backstop log
+    /// line).
     func hold(_ tool: String, _ pattern: String) throws {
         try "\(pattern)\n".write(to: root.appendingPathComponent("\(tool).hold"), atomically: true, encoding: .utf8)
     }
@@ -14228,7 +15075,9 @@ private final class ScriptFixture {
     /// watchdog's deadline is in place, and writes command.ended, as
     /// hang_on_term does. It holds once per fixture: a fake that finds
     /// `<tool>.hung.pid` already there makes its change at once. Like
-    /// hang_on_term, its wait reads SECONDS and runs no `$(...)`.
+    /// hang_on_term, its wait reads SECONDS and runs no `$(...)`. Once let
+    /// go it prints "<tool>: printed after its hold" on standard error,
+    /// which no run may show: the run has given the change up by then.
     func holdHere(_ tool: String) -> String {
         """
         hold_here() {
@@ -14239,6 +15088,7 @@ private final class ScriptFixture {
           while [[ ! -e "\(root.path)/release" && -d "\(root.path)" ]] && (( SECONDS < deadline )); do /bin/sleep 0.1; done
           if [[ -e "\(root.path)/release" ]]; then echo released > "\(root.path)/command.ended"
           elif [[ -d "\(root.path)" ]]; then echo watchdog > "\(root.path)/command.ended"; fi
+          echo "\(tool): printed after its hold" >&2
         }
         """
     }
@@ -14360,6 +15210,29 @@ private final class ScriptFixture {
     func defaultsTable(_ rows: [(domain: String, value: String)]) throws {
         let text = rows.map { "\($0.domain)|\($0.value)" }.joined(separator: "\n") + "\n"
         try text.write(to: root.appendingPathComponent("defaults.table"), atomically: true, encoding: .utf8)
+    }
+
+    /// Another answer from the fake `defaults read` of a domain ("*" for
+    /// every domain), whatever its table holds. Each prints the words the
+    /// real tool prints for a key that does not exist, or words close to
+    /// them, to standard error: "header", after an NSLog header line, and
+    /// exit 1; "nul", with a NUL byte in them; "no-newline", with no
+    /// newline at the end; "cut", cut short before " exist"; "wrong-key"
+    /// and "wrong-bundle", naming another key or another domain;
+    /// "value-after" and "value-before", with a line "1" after or before
+    /// them; "exit-2", with exit 2. "stopped" prints them, records its pid
+    /// in defaults.hung.pid and sleeps 30 s, so it ends on the SIGTERM at
+    /// the call's limit. "alive" prints them, notes an inherited fd 9,
+    /// logs and ignores SIGTERM, records its pid and waits for
+    /// releaseCommand (or the fixture going, or a 60 s watchdog), then
+    /// writes command.ended and exits 1. An empty list removes the file.
+    func defaultsReads(_ rows: [(domain: String, answer: String)]) throws {
+        let url = root.appendingPathComponent("defaults.read")
+        guard !rows.isEmpty else {
+            if fm.fileExists(atPath: url.path) { try fm.removeItem(at: url) }
+            return
+        }
+        try rows.map { "\($0.domain)|\($0.answer)\n" }.joined().write(to: url, atomically: true, encoding: .utf8)
     }
 
     /// The fake's table after a run: domain to value; absent means no key.
@@ -14664,14 +15537,21 @@ private final class ScriptFixture {
     /// and returns without waiting for it. Like a Process, the child gets
     /// no other descriptor of the test process, an empty signal mask and
     /// default signal actions. With `ownProcessGroup` it leads a new process
-    /// group, as launchd starts a job, instead of joining the test's.
-    func spawn(_ script: URL, extraEnvironment: [String: String] = [:], ownProcessGroup: Bool = false) throws -> Spawned {
+    /// group, as launchd starts a job, instead of joining the test's. With
+    /// `output` its standard output and error are that descriptor instead
+    /// (see runThroughOnePipe).
+    func spawn(_ script: URL, extraEnvironment: [String: String] = [:], ownProcessGroup: Bool = false, output: Int32? = nil) throws -> Spawned {
         var actions: posix_spawn_file_actions_t?
         posix_spawn_file_actions_init(&actions)
         defer { posix_spawn_file_actions_destroy(&actions) }
         posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0)
-        posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", O_WRONLY, 0)
-        posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0)
+        if let output {
+            posix_spawn_file_actions_adddup2(&actions, output, 1)
+            posix_spawn_file_actions_adddup2(&actions, output, 2)
+        } else {
+            posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", O_WRONLY, 0)
+            posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0)
+        }
         posix_spawn_file_actions_addchdir(&actions, root.path)
 
         var attr: posix_spawnattr_t?
@@ -14732,6 +15612,101 @@ private final class ScriptFixture {
         guard ![script, out, err].contains(where: { $0.path.contains("'") }) else { throw FixtureError("fixture path contains a quote: \(script.path)") }
         try "exec /bin/bash '\(script.path)' >'\(out.path)' 2>'\(err.path)'\n".write(to: wrapper, atomically: true, encoding: .utf8)
         return Started(process: try spawn(wrapper, extraEnvironment: extraEnvironment), stdout: out, stderr: err)
+    }
+
+    /// A run whose standard output and standard error are the write end of
+    /// one pipe, which this side reads to its end, as a caller that takes a
+    /// script's combined output does (`out=$(script 2>&1)`, a CI log). The
+    /// pipe ends only once every process that holds its write end has
+    /// exited or closed it, so a process the run leaves behind with the
+    /// write end keeps the caller waiting after the run has exited.
+    final class PipedRun {
+        let process: Spawned
+        private var fd: Int32
+        private var data = Data()
+        private let started: TimeInterval
+        /// The run's exit status, or -1 if a signal ended it.
+        private(set) var status: Int32 = -1
+        /// Seconds from the start to the run's exit, and to the end of the
+        /// pipe (nil while it has not ended).
+        private(set) var exitedAfter: Double = 0
+        private(set) var endedAfter: Double?
+
+        init(process: Spawned, fd: Int32, started: TimeInterval) {
+            self.process = process
+            self.fd = fd
+            self.started = started
+        }
+
+        deinit {
+            if fd >= 0 { close(fd) }
+        }
+
+        /// What came down the pipe so far.
+        var output: String { String(decoding: data, as: UTF8.self) }
+
+        /// Reads the pipe while the run lives, reaps the run, and reads on
+        /// for at most `bound` seconds more or until the pipe ends.
+        func readUntilExit(thenFor bound: Double) {
+            pump { !self.process.hasExited }
+            let raw = process.wait()
+            status = raw != -1 && (raw & 0x7f) == 0 ? (raw >> 8) & 0xff : -1
+            exitedAfter = ProcessInfo.processInfo.systemUptime - started
+            let deadline = ProcessInfo.processInfo.systemUptime + bound
+            pump { ProcessInfo.processInfo.systemUptime < deadline }
+        }
+
+        /// Reads on until the pipe ends, for at most `seconds`, and says
+        /// whether it ended. A pipe that ends is closed here.
+        @discardableResult
+        func drain(within seconds: Double) -> Bool {
+            let deadline = ProcessInfo.processInfo.systemUptime + seconds
+            pump { ProcessInfo.processInfo.systemUptime < deadline }
+            return endedAfter != nil
+        }
+
+        /// Reads what comes, 50 ms at most between checks of `going`, until
+        /// the pipe ends or `going` says to stop.
+        private func pump(while going: () -> Bool) {
+            var buffer = [UInt8](repeating: 0, count: 65536)
+            while fd >= 0 && going() {
+                var p = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+                let ready = poll(&p, 1, 50)
+                guard ready > 0 else { continue }
+                let n = read(fd, &buffer, buffer.count)
+                if n > 0 {
+                    data.append(contentsOf: buffer[0..<n])
+                } else if n == 0 || (errno != EINTR && errno != EAGAIN) {
+                    endedAfter = ProcessInfo.processInfo.systemUptime - started
+                    close(fd)
+                    fd = -1
+                }
+            }
+        }
+    }
+
+    /// Runs `script` like `start`, its standard output and error one pipe
+    /// that this side reads (see PipedRun), and returns once it has exited
+    /// and been reaped and the pipe has ended, or `endWithin` seconds have
+    /// gone by since its exit. `lastPid` is the run's pid afterwards.
+    func runThroughOnePipe(_ script: URL, extraEnvironment: [String: String] = [:], endWithin bound: Double) throws -> PipedRun {
+        var ends: [Int32] = [-1, -1]
+        guard pipe(&ends) == 0 else { throw FixtureError("pipe failed: \(errno)") }
+        for end in ends { _ = fcntl(end, F_SETFD, FD_CLOEXEC) }
+        let started = ProcessInfo.processInfo.systemUptime
+        let child: Spawned
+        do {
+            child = try spawn(script, extraEnvironment: extraEnvironment, output: ends[1])
+        } catch {
+            close(ends[0])
+            close(ends[1])
+            throw error
+        }
+        close(ends[1])
+        lastPid = child.pid
+        let run = PipedRun(process: child, fd: ends[0], started: started)
+        run.readUntilExit(thenFor: bound)
+        return run
     }
 
     /// Whether `url` exists, or comes to exist within `seconds`.

@@ -164,7 +164,11 @@ recovery; newly written journals use `frozenProcesses`.
   value unknown, and kept entries then stop it after the backstop.
   `install.sh` reads the Info.plist of the bundle that will be at the app's
   path when the backstop runs: the set-aside previous bundle when an
-  interrupted install left only that.
+  interrupted install left only that. A `plutil` that exits 1 counts as a
+  file without the key only when all of its output, read back, is plutil's
+  own line for a missing key path; any other answer leaves the value
+  unknown. The same holds for install's check of which bundle the agent's
+  plist pins, so an unknown answer there moves no bundle.
 - Each script runs the backstop as one bounded call with a 300 s limit and
   SIGTERM only. A backstop still running 3 s after its SIGTERM, or one that
   has ended with a process it started still in its group, is reported with
@@ -193,7 +197,9 @@ recovery; newly written journals use `frozenProcesses`.
   `$APP_SUPPORT`, which take no lock and run `sudo pmset` in the
   foreground, keep the lock through this supervisor after the SIGTERM at
   the limit has ended them, until their sudo has ended (the sudo closes its
-  own fd 9). Costs: about 4 ms for the perl start and 8 ms for each check
+  own fd 9). The backstop's call has a keeper too (see below), which waits
+  for the same group, so a SIGKILL to this supervisor alone does not free
+  the lock while such a sudo runs. Costs: about 4 ms for the perl start and 8 ms for each check
   on a test Mac; a process that stays in the group keeps the lock as long
   as it runs; and once the group is empty, another process can take its id
   as its pid and lead a group with it before the next check, and the
@@ -213,11 +219,17 @@ recovery; newly written journals use `frozenProcesses`.
   check in its earlier sudoers step needs perl and stops it first. A perl that
   runs but cannot answer leaves the group unknown, and the supervisor keeps
   the lock.
-  Every read the backstop makes under the lock (`cp`, `plutil`, `cat`,
-  `stat`, `ps`) has 30 s, a checked status, and its output in a private
-  directory. One that fails, is cut short, holds a NUL byte or does not
-  answer stops the run: what was undone stays undone and the rest stays
-  journaled. A backstop sealed in a bundle from an earlier release ignores
+  Every file read and `ps` call the backstop makes under the lock (`cp`,
+  `plutil`, `cat`, `stat`, `ps`) has 30 s, a checked status, and its
+  output in a private directory. One that fails, is cut short, holds a
+  NUL byte or does not answer stops the run: what was undone stays undone
+  and the rest stays journaled. These run directly, without a limit: the
+  `stat` of fd 9 and of the lock file that decides whether to share a
+  caller's lock, the `date` conversions and the `sysctl` boot reads, which
+  read only the kernel, and the `mktemp -d` of its private directory. Its
+  log lines, journal publish and removals are changes with a limit of
+  their own (below). A backstop that `install.sh` or `uninstall.sh` runs
+  has a 300 s limit on the whole run; one the LaunchAgent runs has none. A backstop sealed in a bundle from an earlier release ignores
   these variables and reads the Info.plist and the journal itself, without
   a limit on each read; only the 300 s limit applies to it.
 - Each bounded call in the three scripts has a process of its own that keeps
@@ -226,7 +238,10 @@ recovery; newly written journals use `frozenProcesses`.
   output file comes out of it: when that takes the whole limit, the call is
   not made (126; a backstop read reports 124, as for a read that did not
   answer). That process makes the call's output file with `mktemp` in the
-  run's private folder, opens it twice, removes its name before the call
+  run's private folder, opens it twice, checks both descriptors with a
+  `stat` of each descriptor itself (only a whole answer from a `stat` that
+  exited 0 counts; a test of a `/dev/fd` name can answer wrongly on macOS
+  while another process looks up the same name), removes its name before the call
   starts, reads it back through its own descriptor once the call has ended
   (at most 1 MiB; a NUL byte is found and reported), and sends the status
   and the text down a pipe. The text goes in four fields (status, text, the
@@ -251,14 +266,24 @@ recovery; newly written journals use `frozenProcesses`.
   calls, `rm` and then `cp -X`, and the empty copy is made and checked to be
   a regular file by cp's own process before cp runs, inside cp's limit.
   `sudo` closes its copy of fd 9, so for each `sudo` call in the installers,
-  and each command the backstop runs through `run_bounded` (`sudo pmset`,
-  `defaults`), the process first starts a keeper, a second holder of fd 9.
+  the backstop they run, and each command the backstop runs through
+  `run_bounded` (`sudo pmset`, `defaults`), the process first starts a
+  keeper, a second holder of fd 9.
   The call starts in a bash of its own that sends its pid to the keeper
   before it runs the command with the same pid. The keeper exits when the
   process says it has reaped the call; when the process is gone without
   saying so (a SIGKILL), the keeper keeps the lock until no process has that
   pid, checking every half second, and signals nothing. A pid taken by
   another process before the next check keeps the lock longer, not shorter.
+  For the backstop, which leads a group of its own, the process says so
+  only once that group is empty, and the keeper also waits until no process
+  is left in the group (perl's `kill(0, -pgid)`). A process that has left
+  the group is not waited for. Bash 3.2 also leaves its own descriptor for
+  the keeper's pipe (fd 63) open in the process until the call has been
+  reaped, and every process it starts inherits that copy, so the keeper
+  sees the pipe end only once each of them has closed it or exited. That
+  only makes the keeper wait longer; `sudo` closes it, with every
+  descriptor above 2.
   The installers' other calls keep their own copy of fd 9. So a SIGKILL to
   the process alone no longer frees the lock while its call runs, and a
   second Start or install waits. The backstop's reads close their copy, so a
@@ -272,15 +297,39 @@ recovery; newly written journals use `frozenProcesses`.
   notes are files at a name in the private folder (mode 0700), not pinned
   descriptors, so another process of this account can change one between its
   write and its read. cp's process opens the copy's name with `1<>`, which
-  follows a link and makes a missing file. The backstop's main shell still
-  writes the log, publishes the journal with `mv` and removes its temporary
-  file, and its exit trap removes the private folder, all without a limit.
-  Kernel work that never returns (a stalled `mktemp` or open) keeps its
-  process, and the lock, for as long as it lasts. Costs on a test Mac: a
+  follows a link and makes a missing file. Kernel work that never returns
+  (a stalled `mktemp` or open) keeps its process, and the lock, for as long
+  as it lasts. Costs on a test Mac: a
   `plutil` read through the shared layer takes about 7 ms in the backstop
   and 8.7 ms in uninstall (6.9 and 8.4 ms at 6526105), and a journal copy 12
   ms and 16.5 ms (6.9 and 9.3 ms with one bounded `cp`); the first 10000
   `kill -0` checks of a wait cost up to 25 to 50 ms of CPU time.
+- Each change the three scripts make on disk outside a bounded call is a
+  change of its own (`change`), with a 30 s limit
+  (`CHANGE_TIMEOUT_SECONDS`): the backstop's log lines, the `mkdir` of its
+  folder and the tightening of files an older build left loose (both before
+  it takes the lock), its journal publish and removals, the installers'
+  plist publish and removals, and each cleanup step at exit. The command
+  runs in a process of its own that keeps fd 9, with its output in a file
+  made and pinned in the run's private folder (in /dev/null before that
+  folder exists), and that process sends the status and the text down a
+  pipe as a bounded call's does. What the command printed is shown only
+  once the change is seen to finish. A change not seen to finish in time
+  stops the run before it reads or undoes anything more (a log line stops
+  only the logging); its process keeps the lock until it ends, nothing
+  signals it, and the folders it may still use are left in place and
+  named. No caller runs a change under a redirection of its own standard
+  output or error: while one is in effect, bash 3.2 keeps the shell's own
+  copy on a descriptor of its own, the change's processes would inherit
+  it, and the caller's output would stay open until the command ends.
+  Still without a limit of their own: the backstop's `mktemp -d` for its
+  private folder, the answer file it makes and pins for the app binary
+  before the lock (the binary must be a direct child of its shell), the
+  `stat` of fd 9 and of the lock file, the open of the lock file, its
+  `date` conversions and `sysctl kern.bootsessionuuid` reads, and the
+  installers' here-documents and here-strings, which bash 3.2 writes to a
+  temporary file (root's are part of the text root runs, which this build
+  does not change).
 - `uninstall.sh`'s own journal check reads each file once, by a bounded `cp`
   into a private directory, and runs every check on that copy, each with an
   explicit status that does not depend on `set -e`. A read that fails, is
@@ -1147,7 +1196,9 @@ Backstop, independent of the app:
   limit gets SIGTERM, then SIGKILL one to two seconds later; `sudo` only ever gets
   SIGTERM, and one that ignores it keeps the lock until it ends, reported
   with its pid. A sudoers check or `pgrep` that does not answer stops the
-  run, which releases the lock so the app and the agent can recover. A `launchctl print` that does not answer counts as unknown, never
+  run. The lock is free once that call has ended, and the app and the
+  agent can recover then; a `sudo` that ignores SIGTERM keeps it until it
+  ends. A `launchctl print` that does not answer counts as unknown, never
   as unloaded. A `codesign --verify` that does not answer leaves it unknown
   which bundle the plist on disk pins, so the run stops and moves neither
   bundle. uninstall.sh runs the
@@ -1290,8 +1341,14 @@ Backstop, independent of the app:
 - The shell puts `appNapOverrides` back with `defaults write <id>
   NSAppSleepDisabled -bool <previous>` or `defaults delete` when the key was
   absent. A delete that fails counts as done only when `defaults read` then
-  says the key does not exist; a read that succeeds or fails any other way
-  keeps the entry.
+  exits 1 and all of its output, read back with no NUL byte, is exactly
+  defaults' line for that bundle and key, `The domain/default pair of
+  (<bundle id>, NSAppSleepDisabled) does not exist`, after at most the one
+  log header line defaults puts before it. Any other answer keeps the
+  entry: another status (a read stopped at its limit, or one that may still
+  run), output not read back in full, a line cut short, another bundle or
+  key, or any other line. These are defaults' English words; where they
+  differ, the entry stays until the app puts App Nap back itself.
 - The agent is a recovery mechanism, not a guarantee of crash/reboot behavior
   or a replacement for battery/thermal observers. These scenarios require
   the separate hardware validation record.
