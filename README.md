@@ -101,13 +101,18 @@ file and explains how upgrades replace them.
 2. **Add time.** Click the eye or the countdown during a session.
 3. **End early.** Press and hold the end control next to the countdown.
 4. **Settings and status.** Right-click the eye. Quit asks Insomnia to undo
-   the session first, and it refuses while something is still waiting to be
-   undone.
+   the session first, and it refuses while a change is still waiting to be
+   undone. Saved audio for an output that isn't connected doesn't hold it up.
+   That output is restored when it reconnects.
 
 You don't have to close the lid, and opening it doesn't end the session.
-Below 40% battery Insomnia turns on Low Power Mode, and below 10% it ends the
-session. Heat works the same way: serious turns on Low Power Mode, critical
-ends the session. These rules only work while the app runs.
+
+On battery power, Insomnia turns on Low Power Mode below 40% and ends the
+session below 10%. Those are the defaults. You can change both in Settings,
+and an end floor of 0 turns the battery end off. The heat rules turn on Low Power
+Mode when the Mac gets seriously hot and end the session at critical heat.
+They are on by default, and Settings can turn them off. All of these rules
+only work while the app runs.
 
 Before your first session, check Settings. Then run a short session you can
 watch, and read `~/Library/Logs/Insomnia/insomnia.log` afterward.
@@ -208,9 +213,11 @@ details.
 <summary><strong>Configuration and privacy</strong></summary>
 
 Settings live in `~/Library/Application Support/Insomnia/config.json` and logs
-in `~/Library/Logs/Insomnia/`. Insomnia makes both folders and their files
-owner-only. Logs can contain Wi-Fi names, process details and tmux targets, so
-check them before you share one.
+in `~/Library/Logs/Insomnia/`. Insomnia sets both folders and their files to
+owner-only permissions. It leaves symlinks and access control lists (ACLs,
+extra per-account permission entries) as they are, so another account can
+still have access through one. Logs can contain Wi-Fi names, process details
+and tmux targets, so check them before you share one.
 [docs/extras.md](docs/extras.md#configuration-and-privacy) has the details.
 
 </details>

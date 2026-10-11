@@ -30,8 +30,18 @@ Reference pages in https://github.com/krishhgg/Insomnia:
    the recovery agent did last.
 2. `pmset -g | grep -i sleepdisabled` shows `1` while sleep is turned off.
 3. `cat ~/Library/Application\ Support/Insomnia/state.json` shows what is
-   still waiting to be undone. Any `true` value, saved number or non-empty list
-   is pending.
+   still waiting to be undone. These entries are pending:
+   - `sleepDisabledByUs`, `lowPowerSetByUs` or `dockerFrozen` set to `true`
+   - a non-empty `frozenProcesses`, `appNapOverrides` or `savedAudioOutputs`
+   - `savedOutputVolume` or `savedMuted`
+   - `savedDisplayBrightness` or `savedKeyboardBrightness`, unless
+     `displayRestoreRefused` or `keyboardRestoreRefused` is `true`
+
+   Other keys, such as `keptDisplayReadLit`, `keptDisplayUnderLowPower` and
+   `displayRestoredUnderLowPower`, are records the app keeps, not changes to
+   undo. A brightness value kept after a refused restore blocks nothing.
+   Saved audio for an output that isn't connected waits for it to reconnect
+   and doesn't block ending a session.
 4. `launchctl print gui/$(id -u)/com.insomnia.backstop` shows whether the
    recovery agent is loaded.
 
