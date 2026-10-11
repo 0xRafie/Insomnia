@@ -4201,7 +4201,8 @@ final class RecoveryScriptTests: XCTestCase {
         // Round 39 (item 3): an account name the rule or chmod +a would
         // misread, one that is not this uid's, or no name stops the install
         // before it asks for the password or changes anything (a fake id
-        // answers -un, and -u for that name). The rule and the receipt
+        // answers -un and `-u -- root`; the rest, which reads only this
+        // account, goes to /usr/bin/id). The rule and the receipt
         // name one account, checked once.
         let rule = FileManager.default.contents(atPath: fx.sudoers.path)
         let receipt = fx.receiptText()
@@ -4213,9 +4214,9 @@ final class RecoveryScriptTests: XCTestCase {
             ("another uid's", "echo root", "root"),
             ("none", "exit 1", "none"),
         ]
-        for n in names {
-            let id = fx.bin.appendingPathComponent("id-\(n.name.replacingOccurrences(of: " ", with: "-"))")
-            try FakeTool.write("#!/bin/bash\nif [[ \"$*\" == -un ]]; then \(n.id); exit 0; fi\nexec /usr/bin/id \"$@\"\n", at: id.path)
+        for (row, n) in names.enumerated() {
+            let id = fx.bin.appendingPathComponent("id-\(row)")
+            try FakeTool.write("#!/bin/bash\nif [[ \"$*\" == -un ]]; then \(n.id); exit 0; fi\nif [[ \"$*\" == \"-u -- root\" ]]; then echo 0; exit 0; fi\nexec /usr/bin/id \"$@\"\n", at: id.path)
             try fx.writeInstallCopies(extraConstants: ["ID": id.path])
             fx.clearCalls()
             let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
