@@ -61,7 +61,7 @@ option must be on the pane itself (`-p`). One set on the session or window
 does not count. Pane options need tmux 3.0 or later. Ending a session cancels
 pending automation but cannot retract keystrokes already sent.
 
-## Chrome, Chromium and Arc throttling
+## Chrome, Chromium, Arc and Comet throttling
 
 Chromium browsers can throttle windows macOS considers occluded, including
 when the lid is closed. Insomnia detects supported running browsers missing

@@ -196,7 +196,7 @@ It doesn't press Enter unless you turn that on. Mark a pane you don't type in.
 </details>
 
 <details>
-<summary><strong>Chrome, Chromium and Arc throttling</strong></summary>
+<summary><strong>Chrome, Chromium, Arc and Comet throttling</strong></summary>
 
 These browsers slow down windows that macOS reports as hidden, which includes
 every window while the lid is closed. If a running browser lacks
@@ -205,7 +205,7 @@ every window while the lid is closed. If a running browser lacks
 [browser] unthrottled". It asks first, because relaunching quits the browser,
 and tabs come back only if the browser reopens them on startup. Some web apps
 may still stop with the lid closed.
-[docs/extras.md](docs/extras.md#chrome-chromium-and-arc-throttling) has the
+[docs/extras.md](docs/extras.md#chrome-chromium-arc-and-comet-throttling) has the
 details.
 
 </details>
