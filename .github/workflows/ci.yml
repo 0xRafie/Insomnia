@@ -20,21 +20,53 @@ concurrency:
 
 jobs:
   swift:
-    name: Swift test and release build (macOS 26)
-    # macos-26 (arm64) hosted image: Xcode 26.6 is the image default; 26.4.1 is
-    # also installed. The image default is used as-is (no xcode-select).
-    runs-on: macos-26
-    timeout-minutes: 30
+    name: Swift test and release build (${{ matrix.label }})
+    # One job per macOS major release GitHub hosts, each on its image's
+    # default Xcode (no xcode-select). GitHub picks the point release and
+    # moves it forward, so the first step records the one each run used.
+    #   macos-26 (arm64): Xcode 26.6 default, 26.4.1 also installed.
+    #   xcode-27 (arm64, public preview): Xcode 27 on macOS 27. Its failures
+    #   are reported but do not fail the run until the macOS 27 fixes land.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: macos-26
+            label: macOS 26
+            experimental: false
+          - image: xcode-27
+            label: macOS 27
+            experimental: true
+    runs-on: ${{ matrix.image }}
+    continue-on-error: ${{ matrix.experimental }}
+    # The test watchdog below allows 50 minutes; the rest covers the build
+    # before it and the release build and lid simulation check after it.
+    timeout-minutes: 60
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Print toolchain versions
+      - name: Print macOS and toolchain versions
+        # Also written to the job summary, so each run names the macOS
+        # build it tested without opening the log.
+        env:
+          LABEL: ${{ matrix.label }}
         run: |
+          sw_vers
           xcodebuild -version
           swift --version
+          {
+            echo "### $LABEL runner"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| macOS | $(sw_vers -productVersion) ($(sw_vers -buildVersion)) |"
+            echo "| Xcode | $(xcodebuild -version | paste -sd ' ' -) |"
+            echo "| Swift | $(swift --version 2>&1 | grep -m1 'Swift version') |"
+            echo "| Runner image | ${ImageOS:-unknown} ${ImageVersion:-unknown} |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Syntax-check scripts with /bin/bash 3.2
         # The LaunchAgent runs backstop.sh with macOS /bin/bash 3.2, and
@@ -94,7 +126,7 @@ jobs:
         # NSUnbufferedIO makes XCTest write each line as it happens. With
         # the default 16 KB stdout buffer the log of a hung run stops up to
         # 16 KB before the test that hung, which has already misled one
-        # investigation. If the run is still going after 20 minutes (a
+        # investigation. If the run is still going after 50 minutes (a
         # normal run takes about 3), the watchdog samples every xctest
         # process so the log shows what the hung test is waiting on, then
         # fails the step instead of waiting for the job timeout.
@@ -103,12 +135,12 @@ jobs:
         run: |
           swift test &
           test_pid=$!
-          for ((i = 0; i < 1200; i++)); do
+          for ((i = 0; i < 3000; i++)); do
             kill -0 "$test_pid" 2>/dev/null || break
             sleep 1
           done
           if kill -0 "$test_pid" 2>/dev/null; then
-            echo "::error::swift test still running after 20 minutes; sampling xctest"
+            echo "::error::swift test still running after 50 minutes; sampling xctest"
             echo "::group::processes"
             ps -axo pid,ppid,stat,etime,command
             echo "::endgroup::"
