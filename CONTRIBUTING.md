@@ -43,3 +43,11 @@ certification. Real-machine validation requires a supervised, separately
 approved run on a ventilated surface with recoverable work. Record the exact
 revision, macOS/hardware versions, observed result, and remaining limitations
 in the release validation record. Never stress or heat a machine in a bag.
+
+The app icon is the menu bar's open eye on a charcoal tile.
+[AppIconArtwork](Sources/Insomnia/UI/AppIconArtwork.swift) draws it from the
+same [vector geometry](Sources/Insomnia/UI/EyeMarkGeometry.swift) as the menu
+bar's closed eye, which opens while a session runs. After changing the
+artwork, run `./scripts/generate-app-icon.sh`. It regenerates the packaged PNG
+and ICNS assets and the README's SVG offline, with Xcode's swiftc and
+iconutil.
