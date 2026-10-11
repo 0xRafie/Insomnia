@@ -1746,7 +1746,7 @@ run_app_bounded() { # command args...
       if wait_for_job "$cpid" "$KILL_GRACE_SECONDS"; then
         wait "$cpid" || rc=$?
       else
-        how=kill
+        how="kill"
         signal_job KILL "$cpid" || true
         if wait_for_job "$cpid" "$KILL_GRACE_SECONDS"; then
           wait "$cpid" || rc=$?

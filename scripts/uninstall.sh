@@ -101,6 +101,11 @@ READ_MAX_BYTES=1048576
 # How long bounded() waits for a call's output once its status has come: the
 # supervisor reads it back in that time, or it counts as not read back.
 READ_GRACE_SECONDS=5
+# What root's shell sets the rule aside with, and puts it back with when it
+# changed meanwhile: a rename, and one link(2) call, which fails when
+# anything has the name (see r_remove).
+MV=/bin/mv
+LINK=/bin/link
 # The shell sudoers_remove runs as root.
 ROOT_BASH=/bin/bash
 LOCK_TIMEOUT_SECONDS=10
@@ -2401,38 +2406,80 @@ r_recheck() { # absent|same rule
 # compare and the removal are one call to sudo, run as root while it holds
 # $SUDOERS_LOCK (r_guard), the lock install.sh takes for its compare and
 # write. Root reads the rule through a descriptor it opened and checked
-# (r_pin), and judges that text again with sudoers_not_ours. Last,
-# r_recheck checks the folders, the lock and
-# the access control lists again and reads the rule again through a new
-# descriptor; the removal follows only when the path still names the file
-# root opened and holds the bytes root read first. The lock keeps out only
-# the runs that take it, as install.sh says, and the moments between that
-# reread and the removal stay open to a writer that takes no lock. Exit
-# status: 0 removed; 3 the lock was not free within LOCK_TIMEOUT_SECONDS; 4
-# the rule changed since it was read, or is not a regular file of root's
-# with one link that only root can change (an access control list that
-# lets anyone but root change it, or one not read in full, counts), or a
-# stat of it failed or gave an answer not in the form asked for; 5 rm
-# reported that the removal failed; 7 the lock file, or a folder above it,
-# is not one only root can change, or its access control list or a stat of
-# it could not be read in full; 8 the rule as root read it could not be
-# read in full (cat failed, or the stat after the read failed), holds a NUL
-# byte, changed while it was read, or is not this account's. 1 is sudo's
-# own (no valid timestamp, say)
-# or a shell error before the removal. In all of these the rule was not
-# removed, though the lock file may have been created. Any other status (the
-# root shell, or its rm, was killed by a signal), or a call that did not
-# finish in time, leaves it unknown whether the removal happened.
+# (r_pin), and judges that text again with sudoers_not_ours. Then
+# r_recheck checks the folders, the lock and the access control lists again
+# and reads the rule again through a new descriptor. Only when the path
+# still names the file root opened and holds the bytes root read first is
+# the rule renamed to a name mktemp gives beside it (sudo skips a name with
+# a dot), and read there once more. When it is still that file, with the
+# same bytes, owner, mode, links and size, that name is removed. When it is
+# not (a writer changed the rule between the reread and the rename), or
+# cannot be read there, what the rename moved is linked back to the rule's
+# name with link(2), which fails when anything has that name, and then its
+# dotted name is removed. A rule written at the rule's name after the
+# rename is never touched.
+#
+# The lock keeps out only the runs that take it, as install.sh says. Against
+# a writer that takes no lock, this is what stays open. Bytes written
+# through a descriptor opened before the rename that land after the last
+# read go with the rule. A changed rule is missing from sudo's folder
+# between the rename and the link back, and stays at the dotted name when
+# something has taken the rule's name meanwhile. A root shell killed
+# outright (SIGKILL) after the rename leaves the rule at the dotted name,
+# where sudo does not read it, or, between the link back and the removal,
+# with two names, which both scripts then refuse (one link) until one is
+# removed.
+#
+# Exit status: 0 removed; 3 the lock was not free within
+# LOCK_TIMEOUT_SECONDS; 4 the rule changed since it was read (after the
+# rename, it was put back, or the message says where it was kept), or is
+# not a regular file of root's with one link that only root can change (an
+# access control list that lets anyone but root change it, or one not read
+# in full, counts), or a stat of it failed or gave an answer not in the
+# form asked for; 5 mktemp or mv reported a failure (mktemp's answer is
+# not a name beside the rule counts), and the rule was not moved; 7 the
+# lock file, or a folder above it, is not one only root can change, or its
+# access control list or a stat of it could not be read in full; 8 the rule
+# as root read it could not be read in full (cat failed, or the stat after
+# the read failed), holds a NUL byte, changed while it was read, or is not
+# this account's. 1 is sudo's own (no valid timestamp, say) or a shell
+# error before the rename. In all of these this run did not remove the
+# rule, though the lock file may have been created. 9: the rule was renamed
+# to its dotted name, out of sudo's reading, but removing that name failed
+# (the message gives it). Any other status (the root shell, or its mv, link
+# or rm, was killed by a signal), or a call that did not finish in time,
+# leaves it unknown whether the removal happened.
 r_remove() { # rule text
+  local a rc why
+  ASIDE="" MOVED=0
+  # Only a name mktemp gives beside the rule is removed on exit, and only
+  # while the rule has not been moved there.
+  trap '(( MOVED )) || [[ -z "$ASIDE" ]] || "$RM" -f "$ASIDE"' EXIT
   umask 077
   r_guard "$1"
   r_pin "$1" "$2"
   [[ -z "$(sudoers_not_ours "$P_TEXT")" ]] || exit 8
+  a="$("$MKTEMP" "$1.XXXXXX")" || exit 5
+  [[ "${a%.*}" == "$1" && ${#a} == $(( ${#1} + 7 )) ]] || exit 5
+  ASIDE="$a"
   r_recheck same "$1"
-  # An rm killed by a signal may have removed the rule already, so its
-  # status goes on as it is, an unknown result, not as a failed removal.
-  "$RM" -f "$1" || { rc=$?; (( rc > 128 )) && exit "$rc"; exit 5; }
-  exit 0
+  # A tool killed by a signal may have made its change already, so its
+  # status goes on as it is, an unknown result, not as a failure.
+  MOVED=1
+  # shellcheck disable=SC2034  # MOVED is read by the EXIT trap
+  "$MV" -f "$1" "$ASIDE" || { rc=$?; (( rc > 128 )) && exit "$rc"; MOVED=0; [[ -e "$1" || -L "$1" ]] || r_die 4 "$1 is gone now"; exit 5; }
+  # The same file, unchanged but for the change time the rename sets.
+  if ( r_read "$ASIDE"; [[ "$R_ID" == "${P_META%% *}" && "${R_META% *}" == "${P_META% *}" && "$R_RAW" == "$P_RAW" ]] ); then
+    "$RM" -f "$ASIDE" || { rc=$?; (( rc > 128 )) && exit "$rc"; r_die 9 "$1 was renamed to $ASIDE, which sudo does not read, but removing $ASIDE failed: remove it with 'sudo rm $ASIDE'"; }
+    exit 0
+  fi
+  why="$1 changed after root read it, or could not be read again once renamed to $ASIDE"
+  # link(2) would link what a symbolic link points to, so only a regular
+  # file goes back.
+  [[ -f "$ASIDE" && ! -L "$ASIDE" ]] || r_die 4 "$why; it is not a regular file there, so it is kept at $ASIDE, where sudo does not read it"
+  "$LINK" "$ASIDE" "$1" || { rc=$?; (( rc > 128 )) && exit "$rc"; r_die 4 "$why; putting it back failed (see the line above), so it is kept at $ASIDE, where sudo does not read it"; }
+  "$RM" -f "$ASIDE" || { rc=$?; (( rc > 128 )) && exit "$rc"; r_die 4 "$why; it was put back, but removing its second name $ASIDE failed: remove it with 'sudo rm $ASIDE'"; }
+  r_die 4 "$why; it was put back as it was"
 }
 # The functions named, as `declare -f` prints them, with the spaces that
 # start each line cut, for the text a root shell runs: sudo logs that text
@@ -2459,7 +2506,7 @@ sudoers_remove() { # text
   bounded "$SUDO" -n "$ROOT_BASH" -c "set -u
 $(printf '%s=%q\n' SUDOERS_LOCK "$SUDOERS_LOCK" ROOT_UID "$ROOT_UID" ACCOUNT "$ACCOUNT" \
     LOCK_TIMEOUT_SECONDS "$LOCK_TIMEOUT_SECONDS" LOCKF "$LOCKF" STAT "$STAT" CAT "$CAT" PERL "$PERL" \
-    DSMEMBERUTIL "$DSMEMBERUTIL" RM "$RM")
+    DSMEMBERUTIL "$DSMEMBERUTIL" MKTEMP "$MKTEMP" MV "$MV" LINK "$LINK" RM "$RM")
 $(root_functions r_die r_stat r_file r_root r_acl_reader r_acl r_dirs r_guard r_read r_pin r_recheck \
     sudoers_not_ours r_remove)
 r_remove \"\$@\"" insomnia-sudoers-remove "$SUDOERS" "$1"
@@ -3125,6 +3172,8 @@ if (( sudoers_present )); then
     sudoers_remove "$sudoers_text" || remove_rc=$?
     case "$remove_rc" in
       0) ;;
+      9) echo "Removed $SUDOERS from sudo's reading, but not in full (${BOUNDED_OUTPUT:-no detail}). sudo does not read a name with a dot, so that copy grants nothing." >&2
+         remove_rc=0 ;;
       3) echo "Kept $SUDOERS: $SUDOERS_LOCK stayed taken for ${LOCK_TIMEOUT_SECONDS}s, so another install.sh or uninstall.sh, perhaps in another account, is changing it." >&2 ;;
       4) echo "Kept $SUDOERS: it changed after this uninstall read it, or could not be shown to be a regular file of root's with one link that only root can change (${BOUNDED_OUTPUT:-no detail}). Another install.sh or uninstall.sh, perhaps in another account, may have written or removed it meanwhile, and a rule written then may be another account's." >&2 ;;
       5) echo "Kept $SUDOERS: removing it failed (${BOUNDED_OUTPUT:-no detail})." >&2 ;;

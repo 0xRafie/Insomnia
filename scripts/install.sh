@@ -86,6 +86,9 @@ READ_MAX_BYTES=1048576
 READ_GRACE_SECONDS=5
 CHOWN=/usr/sbin/chown
 VISUDO=/usr/sbin/visudo
+# What root's shell puts a new rule in place with where none was: one
+# link(2) call, which fails when anything has the name (see r_replace).
+LINK=/bin/link
 # The shell sudoers_replace runs as root.
 ROOT_BASH=/bin/bash
 LOCK_TIMEOUT_SECONDS=10
@@ -1659,29 +1662,38 @@ sudoers_rule_text() {
 # The new rule is written from sudoers_rule_text beside the old one (sudo
 # skips a name with a dot), owned by root with mode 0440, and checked there
 # with visudo. Last, r_recheck checks the folders, the lock and the
-# access control lists again and reads the rule again through a new
-# descriptor; the rename follows only when the path still names the file
-# root opened and holds the bytes root read first. The rename puts the new
-# rule over the old one: the rule is the old one or the new one, never a
-# mix. The copy is removed when the root shell exits without renaming it;
-# a root shell killed outright (SIGKILL) leaves it, under a dotted name sudo
-# never reads.
+# access control lists again and, for a rule that was there, reads it again
+# through a new descriptor; the copy goes in only when nothing is at the
+# path ("absent"), or when the path still names the file root opened and
+# holds the bytes root read first ("same"). Where no rule was, the copy is
+# linked to the rule's name with link(2), which fails when anything has
+# that name, so a rule another writer made after the last check is never
+# overwritten, and then the copy's dotted name is removed. Where one was, a
+# rename puts the new rule over the old one: the rule is the old one or the
+# new one, never a mix. A copy not put in place is removed when the root
+# shell exits; a root shell killed outright (SIGKILL) leaves it, a name sudo
+# never reads, and after a link that name is a second link to the rule,
+# which both scripts then refuse (one link) until it is removed.
 #
 # The lock keeps out only the runs that take it: install.sh and uninstall.sh
 # of this version. Scripts of earlier releases take no lock, and neither does
-# an administrator's own sudo. Against those, the checks above leave only the
-# moments between root's last check (the reread in r_recheck) and its
-# rename open; they do not close them. An identity or byte check cannot: a
-# writer that takes no lock can still change the rule after the last read.
+# an administrator's own sudo. Against those, the checks above leave the
+# moments between root's last check (the reread in r_recheck) and the
+# rename over a rule that was there open; they do not close them. An
+# identity or byte check cannot: a writer that takes no lock can still
+# change the rule after the last read. Without a system call that swaps two
+# names (renameatx_np, which no tool here makes), any other order leaves
+# the account with no rule for a moment.
 #
 # Exit status: 0 replaced; 3 the lock was not free within
-# LOCK_TIMEOUT_SECONDS; 4 the rule changed since it was read, or is not a
+# LOCK_TIMEOUT_SECONDS; 4 the rule changed since it was read (a rule made
+# where none was counts), or is not a
 # regular file of root's with one link that only root can change (an access
 # control list that lets anyone but root change it, or one not read in
 # full, counts), or a stat of it failed or gave an answer not in the form
 # asked for; 5 staging the new rule failed (mktemp's answer is not a name
-# beside the rule counts), or mv reported that the rename failed; 6 the new
-# rule failed
+# beside the rule counts), or mv or link reported that putting it in place
+# failed; 6 the new rule failed
 # visudo's check; 7 the lock file, or a folder above it, is not one only
 # root can change, or its access control list or a stat of it could not be
 # read in full; 8 the rule as root read it could not be read in full (cat
@@ -1689,9 +1701,11 @@ sudoers_rule_text() {
 # while it was read, or has a line for someone else; 2 a bad call. 1 is
 # sudo's own (a wrong password) or a shell error before the rename. In all
 # of these the rule was not replaced, though the lock file may have been
-# created. Any other status (the root shell, or its mv, was killed by a
-# signal), or a call that never returns, leaves it unknown whether the
-# rename happened.
+# created. 9: the new rule was linked into place where none was, but
+# removing the copy's dotted name failed, so the rule has two names. Any
+# other status (the root shell, or its mv, link or rm, was killed by a
+# signal), or a call that never returns, leaves it unknown whether the rule
+# was replaced.
 r_replace() { # absent|same rule [text]
   local t
   STAGED=""
@@ -1713,8 +1727,16 @@ r_replace() { # absent|same rule [text]
   { "$CHOWN" root:wheel "$STAGED" && "$CHMOD" 0440 "$STAGED"; } || exit 5
   "$VISUDO" -cf "$STAGED" >/dev/null || exit 6
   r_recheck "$1" "$2"
-  # An mv killed by a signal may have renamed already, so its status goes
-  # on as it is, an unknown result, not as a failed rename.
+  # A tool killed by a signal may have made its change already, so its
+  # status goes on as it is, an unknown result, not as a failure.
+  if [[ "$1" == absent ]]; then
+    # link(2) makes the name only where nothing is, so a rule another
+    # writer put there after the check stays. Then the copy's own name goes.
+    "$LINK" "$STAGED" "$2" || { rc=$?; (( rc > 128 )) && exit "$rc"; [[ ! -e "$2" && ! -L "$2" ]] || r_die 4 "$2 is there now"; exit 5; }
+    "$RM" -f "$STAGED" || { rc=$?; (( rc > 128 )) && exit "$rc"; r_die 9 "$2 is in place, but removing $STAGED, a second name for it, failed: remove it with 'sudo rm $STAGED'"; }
+    STAGED=""
+    exit 0
+  fi
   "$MV" -f "$STAGED" "$2" || { rc=$?; (( rc > 128 )) && exit "$rc"; exit 5; }
   STAGED=""
   exit 0
@@ -1742,7 +1764,7 @@ sudoers_replace() { # absent|same [text]
   "$SUDO" "$ROOT_BASH" -c "set -u
 $(printf '%s=%q\n' SUDOERS_LOCK "$SUDOERS_LOCK" ROOT_UID "$ROOT_UID" USER "$USER" UID_NUM "$UID_NUM" \
     LOCK_TIMEOUT_SECONDS "$LOCK_TIMEOUT_SECONDS" LOCKF "$LOCKF" STAT "$STAT" CAT "$CAT" PERL "$PERL" \
-    DSMEMBERUTIL "$DSMEMBERUTIL" MKTEMP "$MKTEMP" CHOWN "$CHOWN" CHMOD "$CHMOD" VISUDO "$VISUDO" MV "$MV" RM "$RM")
+    DSMEMBERUTIL "$DSMEMBERUTIL" MKTEMP "$MKTEMP" CHOWN "$CHOWN" CHMOD "$CHMOD" VISUDO "$VISUDO" MV "$MV" LINK "$LINK" RM "$RM")
 $(root_functions r_die r_stat r_file r_root r_acl_reader r_acl r_dirs r_guard r_read r_pin r_recheck \
     sudoers_for_others sudoers_rule_text r_replace)
 r_replace \"\$@\"" insomnia-sudoers-replace "$1" "$SUDOERS" "${2-}"
@@ -2039,6 +2061,8 @@ replace_rc=0
 sudoers_replace "$sudoers_expect" "$sudoers_text" || replace_rc=$?
 case "$replace_rc" in
   0) ;;
+  9)
+    echo "The new rule is in place at $SUDOERS, but the copy it was linked from is still beside it (see the line above): a second name for the same file. sudo does not read a name with a dot, so the copy grants nothing more, but install.sh and uninstall.sh refuse a rule with two names until that copy is removed with the 'sudo rm' above. The install goes on." >&2 ;;
   3)
     echo "$SUDOERS was not replaced: $SUDOERS_LOCK stayed taken for ${LOCK_TIMEOUT_SECONDS}s, so another install.sh or uninstall.sh, perhaps in another account, is changing it. Rerun in a moment. The app and the LaunchAgent were not touched." >&2
     exit 1 ;;

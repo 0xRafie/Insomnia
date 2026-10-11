@@ -197,14 +197,21 @@ or removed: one that fails a check stops the run and is left for you to look
 at. Root then checks the rule the same way, opens it, and checks that its
 exact text is the text the run read and judged (passed to root as an
 argument, not read again from a file). It has `visudo` check a new copy
-beside it. Just before it renames that copy over the rule, root checks the
-folders, the lock file and their ACLs again and reads the rule a second time
-through a new descriptor. It renames the copy only when that read completes,
-finds no NUL byte, and gives the same bytes from the same file. The
-uninstaller removes the rule the same way, under the same lock. So when two
-accounts run these scripts at once, neither overwrites or removes a rule the
-other wrote after its read: the run that finds the rule changed stops, and
-asks you to rerun it.
+beside it. Just before it puts that copy in place, root checks the folders,
+the lock file and their ACLs again and reads the rule a second time through
+a new descriptor. It renames the copy over the rule only when that read
+completes, finds no NUL byte, and gives the same bytes from the same file.
+Where no rule was, it gives the copy the rule's name with `/bin/link`,
+which fails when anything has that name, and then removes the copy's own
+name; if that removal fails, the install goes on and names the copy to
+remove with `sudo rm`, since both scripts refuse a rule with two names. The
+uninstaller checks the rule the same way, under the same lock,
+then renames it to a name with a dot beside it, which sudo does not read,
+and reads it there once more. It removes it only when it is still the same
+file with the same bytes; otherwise it links the file back under the rule's
+name. So when two accounts run these scripts at once, neither overwrites or
+removes a rule the other wrote after its read: the run that finds the rule
+changed stops, and asks you to rerun it.
 
 The ACL check reads each list with `/usr/bin/perl`, which loads no module
 and makes one `fgetattrlist` system call on a descriptor it opens itself
@@ -235,13 +242,22 @@ stops every install and uninstall at that check, before the rule changes.
 
 The lock keeps out only the runs that take it. Installers and uninstallers
 of earlier releases take no lock, or an older one, and neither does an
-administrator's own `sudo`. Against those, root's second read narrows the
-gap but does not close it: a writer that takes no lock can still change the
-rule between that read and the rename or removal, and no check of the file's
-identity or bytes can see that. A rule that changed between root's two
-reads, or that root cannot read in full, is kept, and the run asks you to
-rerun it, so a writer that keeps changing the rule keeps every run from
-changing it. A root call that is killed or does not answer in time leaves it
+administrator's own `sudo`. Against those, an upgrade's second read narrows
+the gap but does not close it: a writer that takes no lock can still change
+the rule between that read and the rename, and no check of the file's
+identity or bytes can see that. A fresh install's link never overwrites a
+rule made meanwhile. The uninstaller's last read comes after its rename, so
+a change made before the rename is put back; what stays open there is a
+write through a descriptor opened before the rename that lands after that
+read, which is removed with the rule. A changed rule is out of sudo's
+reading from the rename until it is linked back, and stays under the dotted
+name when something has taken the rule's name meanwhile (the message names
+the file). A root shell killed outright after the rename or the link leaves a
+dotted name sudo does not read: the rule itself, or a second name for it,
+which both scripts refuse (one link) until you remove it. A rule that
+changed between root's reads, or that root cannot read in full, is kept,
+and the run asks you to rerun it, so a writer that keeps changing the rule
+keeps every run from changing it. A root call that is killed or does not answer in time leaves it
 unknown whether the rule changed, and the script says so instead of claiming
 nothing changed. The root shell needs sudo to allow `/bin/bash`, as it does
 for an administrator by default; an account whose sudo policy allows only
@@ -471,11 +487,14 @@ full stops the uninstall as well. Under the recovery lock it reads the rule thro
 removes it only when it is exactly the rule the installer writes for your
 account; otherwise it keeps the file and says why. It removes the rule only if root, under the
 lock the installer takes for its write, finds the text it read, and then,
-just before the removal, finds the folders, the lock file and every ACL
-still as they must be and reads the same bytes from the same file again.
+just before it renames the rule out of sudo's reading, finds the folders,
+the lock file and every ACL still as they must be and reads the same bytes
+from the same file again, and then once more under the new name.
 If the rule changed meanwhile, root cannot read it in full, an ACL allows
 more than reading, or another run holds that lock for 10 s, the uninstaller
-keeps the rule and the app, and asks you to rerun it. If the
+keeps the rule and the app, and asks you to rerun it. If the rule is out of
+sudo's reading but removing it under its dotted name fails, the uninstaller
+names that file, which grants nothing, and goes on. If the
 root call that removes it fails in an unknown way or does not answer, the
 uninstaller keeps the app and the recovery journal too, since whether the
 rule is gone is not known; a `sudo` that ignores SIGTERM keeps the recovery

@@ -420,21 +420,34 @@ recovery; newly written journals use `frozenProcesses`.
   does not match what was read. Only then does `install.sh` write a copy
   beside the rule (`mktemp`, `root:wheel`, 0440) and check that copy with
   `visudo -cf`. Immediately before the rename, or before `uninstall.sh`
-  removes the rule, root checks the folders, the lock file's identity and
-  every access control list again, opens the rule anew, and reads it again
-  the same way: the rename or removal goes ahead only when that read
-  completes with the same bytes from the same file (device and inode). A
+  renames the rule aside, root checks the folders, the lock file's identity
+  and every access control list again, opens the rule anew, and reads it
+  again the same way: the rename goes ahead only when that read completes
+  with the same bytes from the same file (device and inode). Where no rule
+  was, `install.sh` checks that nothing has the name and then gives the copy
+  the rule's name with `/bin/link` (one `link(2)` call, which fails when
+  anything has the name) and removes the copy's own name; a removal that
+  fails is reported (exit 9) and the install goes on. `uninstall.sh` renames
+  the rule to a `mktemp` name beside it (a dot, so sudo skips it), reads it
+  there once more, and removes that name only when it is still the file
+  root pinned with the same bytes, owner, mode, link count and size (the
+  rename changes its ctime); otherwise it links the file back under the
+  rule's name with `/bin/link`, removes the dotted name, and stops (exit 4).
+  A dotted name it cannot remove after the rule is out of sudo's reading is
+  reported (exit 9) and the uninstall goes on. A
   checked failure removes the copy and leaves the rule. A rule that cannot
   be read in full or holds a NUL byte stops the run (exit 8). A file that
   changed since either read, or a lock still taken after 10 s, stops the
   run:
   `install.sh` leaves the rule, the app and the agent, and `uninstall.sh`
   keeps the rule and the app. Both ask for a rerun. The lock file may have
-  been created by then. A root shell killed by a signal, or an `mv` or `rm`
-  killed by one, leaves it unknown whether the rule changed; the scripts
-  report that, and `uninstall.sh` then keeps the app and the journal. A
-  root shell killed outright can leave its copy under a dotted name sudo
-  never reads. Before that call the scripts read the rule with `/bin/cat`
+  been created by then. A root shell killed by a signal, or an `mv`, `link`
+  or `rm` killed by one, leaves it unknown whether the rule changed; the
+  scripts report that, and `uninstall.sh` then keeps the app and the
+  journal. A root shell killed outright can leave its copy, or the rule
+  `uninstall.sh` renamed, under a dotted name sudo never reads; after a
+  link, that name is a second name for the rule, which both scripts refuse
+  (one link) until it is removed. Before that call the scripts read the rule with `/bin/cat`
   when the account can read it, and otherwise with `sudo -n /bin/test -e`
   and `sudo -n /bin/cat`, each with the 30 s limit, and `install.sh` checks
   the new rule with `sudo /usr/sbin/visudo -cf`. Both scripts ask for the
@@ -446,12 +459,19 @@ recovery; newly written journals use `frozenProcesses`.
   through sudo has a fixed path.
 - Not closed: a writer that takes no lock (an earlier release's scripts, an
   administrator's own `sudo`) can still change the rule between root's last
-  read and its `mv` or `rm`. No identity or byte check can see that change.
-  The root text is sent as one `bash -c` argument, which sudo's log and
-  `ps` show: 8,686 bytes for `install.sh` and 7,511 for `uninstall.sh`,
-  with each function's leading indentation removed, measured from the
-  functions and constants alone (7,362 and 6,187 before the ACL reader;
-  7,857 and 6,697 at 2e67600).
+  read and the `mv` of an upgrade. No identity or byte check can see that
+  change, and without a call that swaps two names (`renameatx_np`, which no
+  tool here makes) any other order leaves the account with no rule for a
+  moment. For `uninstall.sh`, bytes written through a descriptor opened
+  before its rename that land after its last read go with the rule; a
+  changed rule is out of sudo's reading from the rename until it is linked
+  back, and stays at the dotted name when something has taken the rule's
+  name meanwhile. The root text is sent as one `bash -c` argument, which
+  sudo's log and `ps` show: 9,119 bytes for `install.sh` and 8,851 for
+  `uninstall.sh` (for a five-letter account name), with each function's
+  leading indentation removed, measured from the functions and constants
+  alone (8,686 and 7,511 at 86af2b1; 7,362 and 6,187 before the ACL
+  reader; 7,857 and 6,697 at 2e67600).
 - Nothing else runs as root.
 
 ### 3. Lid observer

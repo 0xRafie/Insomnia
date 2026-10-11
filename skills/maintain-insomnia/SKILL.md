@@ -72,6 +72,10 @@ rule has a line for another account or changed while it ran, when an access
 control list on the rule or its folders allows more than reading, or when a
 process named Insomnia that it cannot identify is running. When one of its
 own steps did not finish within 30s, it says so and removes nothing; the
-user reruns it once that step has ended. Show the user its
+user reruns it once that step has ended. It may name a file it left in
+`/etc/sudoers.d` under a dotted name, which sudo does not read. For this
+account's rule it prints a `sudo rm` command to hand to the user. A changed
+rule it could not put back may be another account's, so the user checks it
+with `sudo cat` before deciding. Show the user its
 message and never edit `/etc/sudoers.d` yourself. A failed uninstall does not mean
 the power settings are back to normal, so check `pmset -g` afterward.

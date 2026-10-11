@@ -7931,8 +7931,9 @@ final class RecoveryScriptTests: XCTestCase {
     /// The rule is written in one sudo call that, under a lock only root can
     /// take, checks the rule is still what this run read, stages the new one
     /// beside it as root's with mode 0440, has visudo check that copy, and
-    /// renames it over the rule. A fresh install expects no rule; a rerun
-    /// expects the bytes it read.
+    /// renames it over the rule. A fresh install expects no rule, and links
+    /// the copy to the rule's name and then removes the copy's own name; a
+    /// rerun expects the bytes it read.
     func testInstallWritesTheRuleInOneLockedCompareAndRename() throws {
         try fx.prepareInstall()
         fx.setMode("launchctl", "loaded")
@@ -7949,6 +7950,8 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertLessThan(try XCTUnwrap(calls.firstIndex(of: staged)), try XCTUnwrap(calls.firstIndex(of: "visudo -cf \(stagedPath)")))
         XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), fx.sudoersRule)
         XCTAssertEqual(try fx.mode(fx.sudoers), 0o440)
+        XCTAssertEqual(try linkCount(fx.sudoers), 1, "the copy's own name is gone")
+        XCTAssertTrue(calls.contains("rm -f \(stagedPath)"), "the copy's own name, removed after the link: \(calls)")
         XCTAssertEqual(try fx.contents(of: fx.sudoers.deletingLastPathComponent()), fx.sudoersFolderAfterTransaction, "no staged copy left")
         XCTAssertEqual(try fx.mode(fx.sudoersLock), 0o600, "the lock is root's alone")
         let lockInode = try fx.inode(fx.sudoersLock)
@@ -8097,6 +8100,8 @@ final class RecoveryScriptTests: XCTestCase {
             XCTAssertEqual(lines.filter { $0.hasPrefix("PERL=") }, ["PERL=/usr/bin/perl"], name)
             XCTAssertEqual(lines.filter { $0.hasPrefix("LS=") }, [], name)
             XCTAssertEqual(lines.filter { $0.hasPrefix("DSMEMBERUTIL=") }, ["DSMEMBERUTIL=/usr/bin/dsmemberutil"], name)
+            XCTAssertEqual(lines.filter { $0.hasPrefix("MV=") }, ["MV=/bin/mv"], name)
+            XCTAssertEqual(lines.filter { $0.hasPrefix("LINK=") }, ["LINK=/bin/link"], name)
             for function in ["r_die", "r_stat", "r_file", "r_root", "r_acl_reader", "r_acl", "r_dirs", "r_guard",
                              "r_read", "r_pin", "r_recheck", "root_functions"] {
                 let start = try XCTUnwrap(lines.firstIndex { $0.hasPrefix("\(function)() {") }, "\(name): \(function)")
@@ -9927,8 +9932,8 @@ final class RecoveryScriptTests: XCTestCase {
     /// runs the real reader on such files.
     /// Root stops with exit 4, naming both identities, and keeps the file
     /// that is there now. The matched control is root's text from that run,
-    /// run again alone with no rename: it reads all six lists and
-    /// completes.
+    /// run again alone with no rename: it reads all six lists (uninstall.sh
+    /// a seventh, the rule's at the name it renames it to) and completes.
     func testRootReadsTheListOfTheFileItCheckedNotOnePutAtItsPathLater() throws {
         for install in [true, false] {
             let label = "install \(install)"
@@ -9958,7 +9963,7 @@ final class RecoveryScriptTests: XCTestCase {
             let control = try runRootText(f, install: install)
 
             XCTAssertEqual(control.status, 0, "\(label): " + control.output)
-            XCTAssertEqual(try String(contentsOf: count, encoding: .utf8), "6\n", label)
+            XCTAssertEqual(try String(contentsOf: count, encoding: .utf8), install ? "6\n" : "7\n", label)
             XCTAssertEqual(f.exists(f.sudoers), install, label)
         }
     }
@@ -10169,16 +10174,193 @@ final class RecoveryScriptTests: XCTestCase {
         }
     }
 
+    /// How many names the file at `url` has (its link count).
+    private func linkCount(_ url: URL) throws -> Int? {
+        (try FileManager.default.attributesOfItem(atPath: url.path)[.referenceCount] as? NSNumber)?.intValue
+    }
+
+    /// The names mktemp gave beside `f`'s rule (the rule's name, a dot and
+    /// six letters or digits) that are in its folder, as full paths.
+    private func asideNames(_ f: ScriptFixture) throws -> [String] {
+        let name = f.sudoers.lastPathComponent
+        return try f.contents(of: f.sudoers.deletingLastPathComponent())
+            .filter { $0.hasPrefix(name + ".") && $0.count == name.count + 7 }
+            .map { f.sudoers.path + $0.dropFirst(name.count) }
+    }
+
+    /// Between root's last read of the rule and its rename out of sudo's
+    /// reading, another writer that takes no lock changes it: in place (the
+    /// same file, other text, through the fake mv's mv.rewrite) or by a
+    /// rename (another file, mv.replace). Read again at the name it was
+    /// renamed to, it is not the file and bytes root read, so root links
+    /// it back under its own name and removes the other name: the rule
+    /// written meanwhile is back as it was, with one name, and the
+    /// uninstall keeps the app and the journal.
+    func testUninstallPutsBackARuleChangedBetweenItsLastReadAndItsRename() throws {
+        for how in ["mv.rewrite", "mv.replace"] {
+            let f = try ruleFixture(install: false)
+            defer { f.destroy() }
+            let theirs = ScriptFixture.sudoersRule(for: "bob")
+            let inode = try f.inode(f.sudoers)
+            try "".write(to: f.root.appendingPathComponent(how), atomically: true, encoding: .utf8)
+            try theirs.write(to: f.root.appendingPathComponent("rule.replacement"), atomically: true, encoding: .utf8)
+
+            let r = try runRuleScript(f, install: false)
+
+            XCTAssertEqual(r.status, 1, "\(how): " + r.stderr + r.stdout)
+            XCTAssertTrue(f.calls().contains(how == "mv.rewrite" ? "mv REWROTE-RULE" : "mv REPLACED-RULE"), "\(how): \(f.calls())")
+            XCTAssertTrue(r.stderr.contains(ruleRefusal(f, install: false, status: 4)), "\(how): " + r.stderr)
+            XCTAssertTrue(Self.asideNamed(r.stderr, rule: f.sudoers.path).contains("\(f.sudoers.path) changed after root read it, or could not be read again once renamed to \(f.sudoers.path).XXXXXX; it was put back as it was"), "\(how): " + r.stderr)
+            XCTAssertEqual(try String(contentsOf: f.sudoers, encoding: .utf8), theirs, "\(how): the rule written meanwhile is back")
+            if how == "mv.rewrite" {
+                XCTAssertEqual(try f.inode(f.sudoers), inode, how)
+            } else {
+                XCTAssertNotEqual(try f.inode(f.sudoers), inode, how)
+            }
+            XCTAssertEqual(try linkCount(f.sudoers), 1, how)
+            XCTAssertEqual(try f.contents(of: f.sudoers.deletingLastPathComponent()), f.sudoersFolderAfterTransaction, "\(how): nothing left beside it")
+            XCTAssertTrue(f.exists(f.app), how)
+            XCTAssertTrue(f.exists(f.state), how)
+        }
+    }
+
+    /// As above, a writer changes the rule in place between root's last
+    /// read and its rename, and then another puts a new file at the rule's
+    /// name before root links the changed rule back (the fake link's
+    /// link.replace). link(2) does not overwrite it: the new file stays at
+    /// the rule's name, the changed rule stays at the name it was renamed
+    /// to, where sudo does not read it, and the message names that file.
+    func testUninstallKeepsAChangedRuleAtItsSetAsideNameWhenItsNameIsTaken() throws {
+        let f = try ruleFixture(install: false)
+        defer { f.destroy() }
+        let theirs = ScriptFixture.sudoersRule(for: "bob"), newer = ScriptFixture.sudoersRule(for: "carol")
+        try "".write(to: f.root.appendingPathComponent("mv.rewrite"), atomically: true, encoding: .utf8)
+        try theirs.write(to: f.root.appendingPathComponent("rule.replacement"), atomically: true, encoding: .utf8)
+        try "".write(to: f.root.appendingPathComponent("link.replace"), atomically: true, encoding: .utf8)
+        try newer.write(to: f.root.appendingPathComponent("link.replacement"), atomically: true, encoding: .utf8)
+
+        let r = try runRuleScript(f, install: false)
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(f.calls().contains("mv REWROTE-RULE"), "\(f.calls())")
+        XCTAssertTrue(f.calls().contains("link REPLACED-RULE"), "\(f.calls())")
+        XCTAssertTrue(r.stderr.contains(ruleRefusal(f, install: false, status: 4)), r.stderr)
+        let aside = try asideNames(f)
+        XCTAssertEqual(aside.count, 1, "\(aside)")
+        let kept = try XCTUnwrap(aside.first)
+        XCTAssertTrue(r.stderr.contains("; putting it back failed (see the line above), so it is kept at \(kept), where sudo does not read it"), r.stderr)
+        XCTAssertEqual(try String(contentsOf: f.sudoers, encoding: .utf8), newer, "the file made at the rule's name stays")
+        XCTAssertEqual(try String(contentsOf: URL(fileURLWithPath: kept), encoding: .utf8), theirs, "the changed rule is kept")
+        XCTAssertTrue(f.exists(f.app))
+    }
+
+    /// Once root has renamed the rule out of sudo's reading, another writer
+    /// puts a rule at its name (here on root's read of the renamed rule's
+    /// access control list, the fake perl's seventh call). Root removes
+    /// only the renamed rule, still the one it read, and the new rule
+    /// stays.
+    func testUninstallLeavesARuleWrittenAtItsNameAfterItsRename() throws {
+        let f = try ruleFixture(install: false)
+        defer { f.destroy() }
+        let theirs = ScriptFixture.sudoersRule(for: "bob")
+        try "7".write(to: f.root.appendingPathComponent("perl.rewrite"), atomically: true, encoding: .utf8)
+        try theirs.write(to: f.root.appendingPathComponent("rule.replacement"), atomically: true, encoding: .utf8)
+
+        let r = try runRuleScript(f, install: false)
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertTrue(f.calls().contains("perl REWROTE-RULE"), "\(f.calls())")
+        XCTAssertEqual(try String(contentsOf: f.sudoers, encoding: .utf8), theirs)
+        XCTAssertEqual(try f.contents(of: f.sudoers.deletingLastPathComponent()), f.sudoersFolderAfterTransaction)
+        XCTAssertFalse(f.exists(f.app))
+    }
+
+    /// The rule is renamed out of sudo's reading, but removing it at that
+    /// name fails (the fake rm's rm.fail). It grants nothing there, so the
+    /// uninstall goes on, and says which file is left and how to remove
+    /// it.
+    func testUninstallGoesOnWhenRemovingTheRenamedRuleFails() throws {
+        let f = try ruleFixture(install: false, fakes: ["rm"])
+        defer { f.destroy() }
+        try "\(f.sudoers.path).*".write(to: f.root.appendingPathComponent("rm.fail"), atomically: true, encoding: .utf8)
+
+        let r = try runRuleScript(f, install: false)
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        let aside = try asideNames(f)
+        XCTAssertEqual(aside.count, 1, "\(aside)")
+        let left = try XCTUnwrap(aside.first)
+        XCTAssertTrue(f.calls().contains("rm FAILED \(left)"), "\(f.calls())")
+        XCTAssertTrue(r.stderr.contains("Removed \(f.sudoers.path) from sudo's reading, but not in full ("), r.stderr)
+        XCTAssertTrue(r.stderr.contains("\(f.sudoers.path) was renamed to \(left), which sudo does not read, but removing \(left) failed: remove it with 'sudo rm \(left)'"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("sudo does not read a name with a dot, so that copy grants nothing."), r.stderr)
+        XCTAssertFalse(f.exists(f.sudoers))
+        XCTAssertEqual(try String(contentsOf: URL(fileURLWithPath: left), encoding: .utf8), f.sudoersRule)
+        XCTAssertFalse(f.exists(f.app))
+    }
+
+    /// A fresh install (no rule there) puts the new rule in place with
+    /// link(2), which fails when anything has the name. Another writer that
+    /// takes no lock makes a rule there after root's last check, just
+    /// before the link (the fake link's link.replace): that rule stays, the
+    /// install stops with the app and the LaunchAgent untouched, and the
+    /// staged copy goes.
+    func testAFreshInstallKeepsARuleMadeJustBeforeItsLink() throws {
+        let f = try ruleFixture(install: true)
+        defer { f.destroy() }
+        try FileManager.default.removeItem(at: f.sudoers)
+        let theirs = ScriptFixture.sudoersRule(for: "bob")
+        try "".write(to: f.root.appendingPathComponent("link.replace"), atomically: true, encoding: .utf8)
+        try theirs.write(to: f.root.appendingPathComponent("link.replacement"), atomically: true, encoding: .utf8)
+
+        let r = try runRuleScript(f, install: true)
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertTrue(f.calls().contains("link REPLACED-RULE"), "\(f.calls())")
+        XCTAssertTrue(r.stderr.contains("\(f.sudoers.path) is there now"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("It was not replaced, so no rule written meanwhile was overwritten."), r.stderr)
+        XCTAssertEqual(try String(contentsOf: f.sudoers, encoding: .utf8), theirs)
+        XCTAssertEqual(try linkCount(f.sudoers), 1)
+        XCTAssertEqual(try f.contents(of: f.sudoers.deletingLastPathComponent()), f.sudoersFolderAfterTransaction, "the staged copy is removed")
+        XCTAssertFalse(f.calls().contains { $0.hasPrefix("osascript") || $0.hasPrefix("launchctl bootout") || $0.hasPrefix("launchctl bootstrap") }, "\(f.calls())")
+    }
+
+    /// A fresh install links the new rule into place and then removes the
+    /// copy's own name. When that removal fails (the fake rm's rm.fail),
+    /// the rule is in place with a second name, which sudo does not read:
+    /// the install goes on, and says how to remove it, since both scripts
+    /// refuse a rule with two names.
+    func testAFreshInstallGoesOnWhenRemovingTheLinkedCopysNameFails() throws {
+        let f = try ruleFixture(install: true)
+        defer { f.destroy() }
+        try FileManager.default.removeItem(at: f.sudoers)
+        try "\(f.sudoers.path).*".write(to: f.root.appendingPathComponent("rm.fail"), atomically: true, encoding: .utf8)
+
+        let r = try runRuleScript(f, install: true)
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        let copies = try asideNames(f)
+        XCTAssertEqual(copies.count, 1, "\(copies)")
+        let copy = try XCTUnwrap(copies.first)
+        XCTAssertTrue(f.calls().contains("rm FAILED \(copy)"), "\(f.calls())")
+        XCTAssertTrue(r.stderr.contains("\(f.sudoers.path) is in place, but removing \(copy), a second name for it, failed: remove it with 'sudo rm \(copy)'"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("The new rule is in place at \(f.sudoers.path), but the copy it was linked from is still beside it (see the line above): a second name for the same file."), r.stderr)
+        XCTAssertEqual(try String(contentsOf: f.sudoers, encoding: .utf8), f.sudoersRule)
+        XCTAssertEqual(try f.inode(f.sudoers), try f.inode(URL(fileURLWithPath: copy)))
+        XCTAssertEqual(try linkCount(f.sudoers), 2)
+    }
+
     /// Root's cat prints every byte of the rule and then fails. This rule
     /// has no newline at its end, so the bytes printed are as many as the
     /// file's size, and only cat's exit status shows the read failed; the
     /// run stops (8) whether that is the first read or the one made last
-    /// before the rename or removal. With no failure, both reads happen and
-    /// the run completes.
+    /// before the rename. uninstall.sh reads the rule a third time at the
+    /// name it renamed it to, and a failure there puts it back (4). With no
+    /// failure, every read happens and the run completes.
     func testRootStopsWhenItsReadOfTheRuleFails() throws {
         let rule = Data(ScriptFixture.sudoersRule(for: ScriptFixture.account).trimmingCharacters(in: .newlines).utf8)
         for install in [true, false] {
-            for failing in [0, 1, 2] {
+            for failing in install ? [0, 1, 2] : [0, 1, 2, 3] {
                 let label = "\(install ? "install" : "uninstall"), read \(failing)"
                 let f = try ruleFixture(install: install, fakes: ["cat"])
                 defer { f.destroy() }
@@ -10190,14 +10372,17 @@ final class RecoveryScriptTests: XCTestCase {
                 let reads = (try? String(contentsOf: f.root.appendingPathComponent("cat.stdin.count"), encoding: .utf8)) ?? "no read"
                 if failing == 0 {
                     XCTAssertEqual(r.status, 0, "\(label): " + r.stderr + r.stdout)
-                    XCTAssertEqual(reads, "2\n", label)
+                    XCTAssertEqual(reads, install ? "2\n" : "3\n", label)
                     XCTAssertEqual(f.exists(f.sudoers), install, label)
                     continue
                 }
                 XCTAssertEqual(r.status, 1, "\(label): " + r.stderr + r.stdout)
                 XCTAssertEqual(reads, "\(failing)\n", label)
-                XCTAssertTrue(r.stderr.contains("\(f.sudoers.path) could not be read (cat exited 1)"), "\(label): " + r.stderr)
-                XCTAssertTrue(r.stderr.contains(ruleRefusal(f, install: install, status: 8)), "\(label): " + r.stderr)
+                let aside = failing == 3
+                let stderr = Self.asideNamed(r.stderr, rule: f.sudoers.path)
+                XCTAssertTrue(stderr.contains("\(f.sudoers.path)\(aside ? ".XXXXXX" : "") could not be read (cat exited 1)"), "\(label): " + r.stderr)
+                XCTAssertTrue(r.stderr.contains(ruleRefusal(f, install: install, status: aside ? 4 : 8)), "\(label): " + r.stderr)
+                if aside { XCTAssertTrue(r.stderr.contains("it was put back as it was"), "\(label): " + r.stderr) }
                 XCTAssertEqual(try Data(contentsOf: f.sudoers), rule, label)
                 XCTAssertEqual(try f.contents(of: f.sudoers.deletingLastPathComponent()), f.sudoersFolderAfterTransaction, "\(label): no staged copy left")
                 XCTAssertTrue(f.exists(f.app), label)
@@ -10240,15 +10425,24 @@ final class RecoveryScriptTests: XCTestCase {
     /// The status root stops with when each of `calls` gets a wrong answer:
     /// 4 for the rule before it is read, 7 for the folders, the lock and the
     /// rule's folder. Of the stats of a descriptor, the first is the lock's
-    /// (7), then each read of the rule has one before cat (4) and one after
-    /// it (8).
+    /// (7), then each of the two reads of the rule has one before cat (4)
+    /// and one after it (8). uninstall.sh reads the rule a third time at
+    /// the name it renames it to (the rule's and a dot), and puts it back
+    /// when any check of that read fails: 4 for each of those stats.
     private func rootStatStatuses(_ calls: [(n: Int, what: String)], rule: String) -> [Int] {
         var descriptors = 0
         return calls.map { call in
-            guard call.what.isEmpty else { return call.what == rule ? 4 : 7 }
+            guard call.what.isEmpty else { return call.what == rule || call.what.hasPrefix(rule + ".") ? 4 : 7 }
             descriptors += 1
-            return descriptors == 1 ? 7 : (descriptors % 2 == 0 ? 4 : 8)
+            return descriptors == 1 ? 7 : descriptors > 5 ? 4 : (descriptors % 2 == 0 ? 4 : 8)
         }
+    }
+
+    /// `text` with each name mktemp gave beside the rule (the rule's name,
+    /// a dot and six letters or digits) written as "<rule>.XXXXXX", so the
+    /// names two runs gave compare equal.
+    private static func asideNamed(_ text: String, rule: String) -> String {
+        text.replacingOccurrences(of: NSRegularExpression.escapedPattern(for: rule) + #"\.[A-Za-z0-9]{6}"#, with: rule + ".XXXXXX", options: .regularExpression)
     }
 
     /// The number of a stat that `f`'s fake stat logged in the calls log
@@ -10302,7 +10496,9 @@ final class RecoveryScriptTests: XCTestCase {
     /// which stat failed, and before anything changes: the rule keeps its
     /// bytes and inode (or stays absent), nothing is staged beside it, and
     /// with no lock there before, a failure in the first walk up to / stops
-    /// root before it makes the lock. install.sh's text runs for a rule
+    /// root before it makes the lock. uninstall.sh's stats of the rule at
+    /// the name it renames it to come after the rename, and a failure there
+    /// puts the rule back under its own name, the same file. install.sh's text runs for a rule
     /// that is there and for none (with no lock either); uninstall.sh's
     /// for its removal. The other wrong answers (one field short, a second
     /// line, nothing, no newline at the end, other words) stop it the same
@@ -10343,7 +10539,7 @@ final class RecoveryScriptTests: XCTestCase {
             XCTAssertEqual(f.exists(f.sudoers), v.install, v.name)
             let calls = rootStatCalls(f)
             XCTAssertEqual(calls.map(\.n), Array(1...max(calls.count, 1)), "\(v.name): every stat is root's, in r_stat's form")
-            XCTAssertEqual(calls.filter { $0.what.isEmpty }.count, v.rule ? 5 : 1, "\(v.name): \(calls)")
+            XCTAssertEqual(calls.filter { $0.what.isEmpty }.count, v.install ? (v.rule ? 5 : 1) : 7, "\(v.name): \(calls)")
             let statuses = rootStatStatuses(calls, rule: f.sudoers.path)
             let isFolder = { (what: String) in what == "/" || f.sudoersLock.path.hasPrefix(what + "/") }
             // The first and last call of each run of folders, and every other call.
@@ -10366,7 +10562,8 @@ final class RecoveryScriptTests: XCTestCase {
                 let r = try runRootText(f, install: v.install, rule: v.rule)
 
                 XCTAssertEqual(Int(r.status), statuses[i], "\(label): " + r.output)
-                XCTAssertTrue(r.output.contains("stat \(call.what.isEmpty ? "of a descriptor" : call.what) exited 1, or its answer is not the one line asked for: "), "\(label): " + r.output)
+                let named = call.what.isEmpty ? "of a descriptor" : Self.asideNamed(call.what, rule: f.sudoers.path)
+                XCTAssertTrue(Self.asideNamed(r.output, rule: f.sudoers.path).contains("stat \(named) exited 1, or its answer is not the one line asked for: "), "\(label): " + r.output)
                 XCTAssertEqual(try String(contentsOf: f.root.appendingPathComponent("stat.count"), encoding: .utf8), "\(call.n)\n", "\(label): no stat after it")
                 if let inode {
                     XCTAssertEqual(try String(contentsOf: f.sudoers, encoding: .utf8), f.sudoersRule, label)
@@ -10717,22 +10914,26 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist")
     }
 
-    /// The rm that removes the rule removes it and then ends by a signal.
-    /// That is not a failed removal: the uninstall says whether the rule
-    /// was removed is not known, and keeps the app and the journal.
+    /// The mv that takes the rule out of sudo's reading renames it to a
+    /// name beside it and then ends by a signal. That is not a failed
+    /// removal: the uninstall says whether the rule was removed is not
+    /// known, and keeps the app and the journal. The rule is left at that
+    /// name, which sudo does not read.
     func testUninstallKeepsTheAppAndJournalWhenItsRuleRemovalIsKilled() throws {
         try fx.installMachinery()
         try fx.writeConfig(#"{"agentList":[]}"#)
         try fx.writeState(Self.cleanJournal)
-        // This copy's RM is the logging fake, which root's shell then runs.
-        try fx.writeUninstallCopy(extraConstants: ["RM": fx.bin.appendingPathComponent("rm").path])
-        try fx.sudoers.path.write(to: fx.root.appendingPathComponent("rm.killed"), atomically: true, encoding: .utf8)
+        try "\(fx.sudoers.path)|\(fx.sudoers.path).*\n".write(to: fx.root.appendingPathComponent("mv.killed"), atomically: true, encoding: .utf8)
 
         let r = try fx.run(fx.uninstall)
 
         XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
-        XCTAssertTrue(fx.calls().contains("rm KILLED \(fx.sudoers.path)"), "\(fx.calls())")
-        XCTAssertFalse(fx.exists(fx.sudoers), "the removal happened")
+        XCTAssertTrue(fx.calls().contains { $0.hasPrefix("mv KILLED \(fx.sudoers.path) \(fx.sudoers.path).") }, "\(fx.calls())")
+        XCTAssertFalse(fx.exists(fx.sudoers), "the rename happened")
+        let folder = fx.sudoers.deletingLastPathComponent()
+        let aside = try fx.contents(of: folder).filter { $0.hasPrefix("\(fx.sudoers.lastPathComponent).") }
+        XCTAssertEqual(aside.count, 1, "\(aside)")
+        if let name = aside.first { XCTAssertEqual(try String(contentsOf: folder.appendingPathComponent(name), encoding: .utf8), fx.sudoersRule) }
         XCTAssertTrue(r.stderr.contains("The sudo call that removes \(fx.sudoers.path) exited 143 (a signal), so whether the rule was removed is not known."), r.stderr)
         XCTAssertTrue(r.stderr.contains("The LaunchAgent is already removed; the app at \(fx.app.path) and the recovery journal were kept."), r.stderr)
         XCTAssertFalse(r.stderr.contains("Kept \(fx.sudoers.path)"), r.stderr)
@@ -13946,7 +14147,9 @@ private final class ScriptFixture {
     }
 
     /// uninstall.sh: every tool that changes or asks the system is a fake,
-    /// and the rule, its lock and the app are the fixture's. ROOT_UID is the
+    /// and the rule, its lock and the app are the fixture's. Its root
+    /// shell's MV and LINK are the fakes too; RM is the real rm unless a
+    /// test patches in the fake. ROOT_UID is the
     /// account running the tests, which owns every file the fake sudo's root
     /// shell checks. DSMEMBERUTIL is always the fake, so no test asks the
     /// real directory service whose entry an access control list names,
@@ -13968,6 +14171,8 @@ private final class ScriptFixture {
             "CP": bin.appendingPathComponent("cp").path,
             "DSMEMBERUTIL": bin.appendingPathComponent("dsmemberutil").path,
             "PERL": bin.appendingPathComponent("perl").path,
+            "MV": bin.appendingPathComponent("mv").path,
+            "LINK": bin.appendingPathComponent("link").path,
             "APP": app.path,
             "SUDOERS": sudoers.path,
             "SUDOERS_LOCK": sudoersLock.path,
@@ -14019,6 +14224,7 @@ private final class ScriptFixture {
             "CODESIGN": bin.appendingPathComponent("codesign").path,
             "SYSCTL": bin.appendingPathComponent("sysctl").path,
             "MV": bin.appendingPathComponent("mv").path,
+            "LINK": bin.appendingPathComponent("link").path,
             "RM": bin.appendingPathComponent("rm").path,
             "RMDIR": bin.appendingPathComponent("rmdir").path,
             "MKTEMP": bin.appendingPathComponent("mktemp").path,
@@ -14457,11 +14663,23 @@ private final class ScriptFixture {
         // SIGTERM, logging "mv KILLED <from> <to>": a rename done by an mv
         // that did not live to say so. A line of mv.hold in the same form
         // holds the move until releaseCommand and then makes it (see
-        // holdHere): a rename that takes longer than its script waits.
+        // holdHere): a rename that takes longer than its script waits. A
+        // move of the rule's path with mv.rewrite there first writes the
+        // text of rule.replacement into the rule in place (the same file,
+        // logged "mv REWROTE-RULE"); with mv.replace there it first puts
+        // that text at the rule's path by a rename (a new file, logged "mv
+        // REPLACED-RULE"): another writer that takes no lock, between
+        // root's last read of the rule and its rename.
         try writeFake("mv", """
         \(holdHere("mv"))
         args=(); for a in "$@"; do [[ "$a" == -* ]] || args+=("$a"); done
         from="${args[0]:-}"; to="${args[1]:-}"
+        if [[ "$from" == "\(sudoers.path)" && -f "\(r)/mv.rewrite" ]]; then
+          /bin/cat "\(r)/rule.replacement" > "\(sudoers.path)" && printf 'mv REWROTE-RULE\\n' >> "\(calls)"
+        fi
+        if [[ "$from" == "\(sudoers.path)" && -f "\(r)/mv.replace" ]]; then
+          /bin/cp "\(r)/rule.replacement" "\(r)/rule.new" && /bin/mv -f "\(r)/rule.new" "\(sudoers.path)" && printf 'mv REPLACED-RULE\\n' >> "\(calls)"
+        fi
         if [[ -f "\(r)/mv.fail" ]]; then
           while IFS='|' read -r f t; do
             if [[ -n "$f" && "$from" == $f && "$to" == $t ]]; then
@@ -14491,6 +14709,17 @@ private final class ScriptFixture {
         fi
         exec /bin/mv "$@"
         """)
+        // link: install.sh's and uninstall.sh's LINK. Runs /bin/link, but a
+        // link to the rule's path with link.replace there first puts the
+        // text of link.replacement at that path by a rename (a new file, the
+        // way another writer that takes no lock would), logged "link
+        // REPLACED-RULE", so the link finds the name taken.
+        try writeFake("link", """
+        if [[ "${2:-}" == "\(sudoers.path)" && -f "\(r)/link.replace" ]]; then
+          /bin/cp "\(r)/link.replacement" "\(r)/link.new" && /bin/mv -f "\(r)/link.new" "\(sudoers.path)" && printf 'link REPLACED-RULE\\n' >> "\(calls)"
+        fi
+        exec /bin/link "$@"
+        """)
         // rm, rmdir, mktemp, mkdir: install.sh's RM, RMDIR, MKTEMP and MKDIR.
         // Each call is logged and then made by the real tool, so a test can
         // tell a file removed or created through the fixed-path variable from
@@ -14498,7 +14727,9 @@ private final class ScriptFixture {
         // An rm of a path that matches the bash glob in rm.killed removes it
         // and then ends by SIGTERM, logging "rm KILLED <path>". One of a
         // path that matches the glob in rm.hold waits for releaseCommand
-        // first (see holdHere). uninstall.sh's RM is the real rm unless a
+        // first (see holdHere). One of a path that matches the glob in
+        // rm.fail removes nothing, logs "rm FAILED <path>" and exits 1.
+        // uninstall.sh's RM is the real rm unless a
         // test patches in this one. A mkdir of a path that matches the glob
         // in mkdir.hold waits the same way, and so does a mktemp whose
         // template matches the glob in mktemp.hold; backstop.sh's MKDIR and
@@ -14512,6 +14743,16 @@ private final class ScriptFixture {
                 if [[ -n "$pattern" && "$a" != -* && "$a" == $pattern ]]; then
                   hold_here "$a"
                   break
+                fi
+              done
+            fi
+            if [[ -f "\(r)/rm.fail" ]]; then
+              IFS= read -r pattern < "\(r)/rm.fail" || true
+              for a in "$@"; do
+                if [[ -n "$pattern" && "$a" != -* && "$a" == $pattern ]]; then
+                  printf 'rm FAILED %s\\n' "$a" >> "\(calls)"
+                  echo "rm: $a: Operation not permitted" >&2
+                  exit 1
                 fi
               done
             fi
