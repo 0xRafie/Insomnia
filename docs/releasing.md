@@ -71,9 +71,10 @@ one, so its `install.sh` needs `--app`, and its `uninstall.sh` runs only the
    `shasum -a 256 -c SHA256SUMS`, and install it with
    `./install.sh --allow-unverified-origin --app ./Insomnia.app` on a Mac you
    can afford to reinstall on. Then run the
-   [real-Mac checks](#real-mac-checks-before-a-release) and record the
-   results in `docs/release-validation.md`. Fix anything that fails and
-   start again from step 1.
+   [real-Mac checks](#real-mac-checks-before-a-release), all but the
+   release channel ones, and record the results in
+   `docs/release-validation.md`. Fix anything that fails and start again
+   from step 1.
 3. Tag the tested commit `v<version>`, the same digits, and push the tag:
 
    ```bash
@@ -89,7 +90,8 @@ one, so its `install.sh` needs `--app`, and its `uninstall.sh` runs only the
    never replaces published assets.
 5. Download the zip from the release and check it the way a user would (see
    below), then install it with the command in the release notes on a Mac
-   you can afford to reinstall on.
+   you can afford to reinstall on. This is the stable release channel check;
+   record its result with the others.
 
 A manual run (Actions, Release, Run workflow) with the nightly box left
 unticked builds and packages the chosen branch and uploads the zip and
@@ -198,10 +200,13 @@ results in `docs/release-validation.md` with the commit, the Mac, the macOS
 version and the date. A passing `swift test`, a source review or a green CI
 run is not a result.
 
-The simulated lid close/open check is the exception. A release build leaves
-out the `simulate-lid.sh` watcher, so run that check on a source build of the
-same commit installed with `INSOMNIA_LID_SIMULATION=1 ./scripts/install.sh`,
-and record that build setting with its result.
+Two kinds of check are exceptions. A release build leaves out the
+`simulate-lid.sh` watcher, so run the simulated lid close/open check on a
+source build of the same commit installed with
+`INSOMNIA_LID_SIMULATION=1 ./scripts/install.sh`, and record that build
+setting with its result. The release channel checks need a published
+release, so the stable one runs at step 5, after the tag push, and the
+nightly one after a nightly run publishes.
 
 Run them under supervision and never at the cost of active work. Use a
 stable, ventilated surface, not an enclosure. Do not overheat a Mac on
