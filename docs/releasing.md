@@ -189,6 +189,11 @@ release ships, and record the results in `docs/release-validation.md` with
 the commit, the Mac, the macOS version and the date. A passing `swift test`,
 a source review or a green CI run is not a result.
 
+The simulated lid close/open check is the exception. A release build leaves
+out the `simulate-lid.sh` watcher, so run that check on a source build of the
+same commit installed with `INSOMNIA_LID_SIMULATION=1 ./scripts/install.sh`,
+and record that build setting with its result.
+
 Run them under supervision and never at the cost of active work. Use a
 stable, ventilated surface, not an enclosure. Do not overheat a Mac on
 purpose to check thermal handling; try injected thermal events first.
