@@ -27,6 +27,16 @@ struct SleepGuardError: Error, LocalizedError, Sendable {
     }
 }
 
+/// `pmset -a disablesleep 1` exited 0, but `pmset -g` read SleepDisabled 0
+/// again `settle` seconds later.
+struct SleepDisableRevertedError: Error, LocalizedError, Sendable {
+    let settle: TimeInterval
+
+    var errorDescription: String? {
+        "macOS set SleepDisabled back to 0 within \(Int(settle)) s of `pmset -a disablesleep 1`, so closing the lid would still sleep this Mac"
+    }
+}
+
 /// `sudo -n pmset …`. Never prompts; if the sudoers rule is missing the call
 /// fails fast with a readable error instead of hanging on a password prompt.
 struct PmsetSleepGuard: SleepGuarding {
@@ -39,6 +49,11 @@ struct PmsetSleepGuard: SleepGuarding {
     /// reported as still running. The same 3 s as KILL_GRACE_SECONDS in
     /// scripts/backstop.sh.
     static let stopGrace: TimeInterval = 3
+    /// How long after `pmset -a disablesleep 1` the bit is read back. On
+    /// macOS 26.6.2 (25G83) pmset exits 0 and `pmset -g` reads SleepDisabled
+    /// 1 for about 2 s, then powerd reloads the Energy Saver preferences and
+    /// it reads 0 for good, so a closed lid sleeps the Mac mid-session.
+    static let settle: TimeInterval = 5
 
     /// The app uses the defaults; tests point `sudo` at a fake, shorten the
     /// limits, and start the deadline once the fake is ready.
@@ -46,6 +61,7 @@ struct PmsetSleepGuard: SleepGuarding {
     let pmsetPath: String
     let commandTimeout: TimeInterval
     let grace: TimeInterval
+    let settleDelay: TimeInterval
     let runner: CancellableCommand
 
     init(
@@ -53,17 +69,25 @@ struct PmsetSleepGuard: SleepGuarding {
         pmset: String = Self.pmset,
         timeout: TimeInterval = Self.timeout,
         stopGrace: TimeInterval = Self.stopGrace,
+        settle: TimeInterval = Self.settle,
         runner: CancellableCommand = CancellableCommand()
     ) {
         sudoPath = sudo
         pmsetPath = pmset
         commandTimeout = timeout
         grace = stopGrace
+        settleDelay = settle
         self.runner = runner
     }
 
+    /// A disable that no longer reads back after `settle` throws
+    /// `SleepDisableRevertedError`, which callers handle like a failed
+    /// pmset. Restoring sleep is not read back.
     func setSleepDisabled(_ disabled: Bool) async throws {
         try await sudoPmset(["-a", "disablesleep", disabled ? "1" : "0"])
+        guard disabled else { return }
+        try await Task.sleep(for: .seconds(settleDelay))
+        guard try await isSleepDisabled() else { throw SleepDisableRevertedError(settle: settleDelay) }
     }
 
     func setLowPowerMode(_ on: Bool) async throws {
