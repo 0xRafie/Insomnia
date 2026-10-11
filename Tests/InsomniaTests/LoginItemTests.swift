@@ -453,6 +453,7 @@ final class LoginItemTests: XCTestCase {
     /// The live install identity has the two parts macOS ties the item
     /// to: a hash (or "unsigned") and the bundle path. Read only.
     func testLiveInstallNamesHashPathAndExecutable() throws {
+        try SystemIntegration.require("the Security framework (this test process's code signature)")
         let install = LoginItem.liveInstall()
         let parts = install.split(separator: "@", maxSplits: 1)
         XCTAssertEqual(parts.count, 2, install)

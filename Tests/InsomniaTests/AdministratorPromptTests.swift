@@ -76,6 +76,7 @@ final class OsascriptAdministratorPromptTests: XCTestCase {
     /// osacompile only compiles the script; nothing runs and no dialog is
     /// shown.
     func testScriptCompiles() throws {
+        try SystemIntegration.require("osacompile on the administrator script")
         let osacompile = "/usr/bin/osacompile"
         try XCTSkipUnless(FileManager.default.isExecutableFile(atPath: osacompile), "no osacompile")
         let process = Process()

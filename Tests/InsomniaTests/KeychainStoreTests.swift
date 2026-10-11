@@ -644,6 +644,13 @@ final class KeychainModel: KeychainItemCalls, @unchecked Sendable {
 /// holds afterwards, never by a prompt.
 final class KeychainStoreReplaceTests: XCTestCase {
     private let service = "insomnia-hotspot-test"
+
+    /// A save builds the item's access list with the Security framework
+    /// (SecTrustedApplicationCreateFromPath on this test process and
+    /// SecAccessCreate), even though the keychain itself is the model.
+    override func setUpWithError() throws {
+        try SystemIntegration.require("the Security framework (an access list naming this test process)")
+    }
     private var replacement: String { KeychainStore.replacementService(for: service) }
 
     private func store(_ keychain: KeychainModel) -> KeychainStore {

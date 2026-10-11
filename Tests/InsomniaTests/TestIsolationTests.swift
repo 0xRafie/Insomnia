@@ -8,7 +8,8 @@ import InsomniaTestHome
 /// `SessionManager.live` resolve INSOMNIA_HOME at call time, so these tests
 /// check that the variable names an existing directory outside ~/Library,
 /// that every path the app resolves sits inside it, that a default-argument
-/// log line lands there, and that a TempHome hands the variable back instead
+/// log line lands there and not at the real log's path (which no test
+/// opens), and that a TempHome hands the variable back instead
 /// of unsetting it. They do not check which temp directory the loader used:
 /// it prefers Darwin's per-user temp dir and falls back to TMPDIR, and
 /// Foundation's temporaryDirectory need not match either. This class extends
@@ -87,14 +88,12 @@ final class TestIsolationTests: XCTestCase {
         Log.append(level: "info", probe)
 
         let written = try String(contentsOf: resolved.logFile, encoding: .utf8)
-        XCTAssertTrue(written.contains(probe), "probe line missing from \(resolved.logFile.path)")
+        XCTAssertEqual(written.components(separatedBy: probe).count - 1, 1, "probe line not written once to \(resolved.logFile.path)")
 
-        // Read-only look at the real log, if the machine has one.
-        let real = Paths.standard.logFile
-        if FileManager.default.fileExists(atPath: real.path) {
-            let contents = try String(contentsOf: real, encoding: .utf8)
-            XCTAssertFalse(contents.contains(probe), "probe line reached the real log at \(real.path)")
-        }
+        // Log.append writes to one file, `paths.logFile`, so the probe is
+        // in no other. The real log is never opened (round 39): its path
+        // is only compared.
+        XCTAssertNotEqual(resolved.logFile.standardized.path, Paths.standard.logFile.standardized.path)
     }
 
     func testTempHomeDestroyKeepsTheProcessWideHome() {

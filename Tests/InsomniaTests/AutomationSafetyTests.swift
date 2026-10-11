@@ -324,6 +324,7 @@ final class TmuxLiveRunnerTests: XCTestCase {
     private var socket: String!
 
     override func setUpWithError() throws {
+        try SystemIntegration.require("a real tmux server, which outlives the test process until kill-server")
         guard let found = Shell.locate(TmuxNudge.candidates) else {
             throw XCTSkip("tmux is not installed")
         }
@@ -615,6 +616,7 @@ final class TmuxTargetResolutionTests: XCTestCase {
     private var socket: String!
 
     override func setUpWithError() throws {
+        try SystemIntegration.require("a real tmux server, which outlives the test process until kill-server")
         guard let found = Shell.locate(TmuxNudge.candidates) else {
             throw XCTSkip("tmux is not installed")
         }
