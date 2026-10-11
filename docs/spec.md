@@ -357,13 +357,17 @@ recovery; newly written journals use `frozenProcesses`.
   child), since bash cannot take a descriptor from another process; the
   shells' file tests (`[[ -e ]]`, `[[ -f ]]`); `install.sh`'s source build
   (`build-app.sh`, which runs `swift build` for minutes); the password
-  prompt (`sudo -v`, and `sudo visudo -cf`, which may prompt too); the
-  backstop's `kill -CONT` of a process it froze and the installers'
-  `kill -0` of the owner of a staging folder left behind; and what
-  the scripts print to the terminal. A `mktemp` not seen to finish may
-  still make its folder after the run stopped, under a name no run knows,
-  which is then left in `TMPDIR`. Root's text, a `bash -c` run through a
-  bounded `sudo`, is within that call's limit.
+  prompt (`sudo -v`, and `sudo visudo -cf`, which may prompt too);
+  `install.sh`'s root call, which runs root's `bash -c` through `sudo`
+  without `-n`, so that it may prompt too: only its wait for the rule's
+  lock has a limit (10 s), and root's `stat` calls, ACL reads, `visudo`
+  and change of the rule inside it have none; the backstop's `kill -CONT`
+  of a process it froze and the installers' `kill -0` of the owner of a
+  staging folder left behind; and what the scripts print to the terminal.
+  A `mktemp` not seen to finish may still make its folder after the run
+  stopped, under a name no run knows, which is then left in `TMPDIR`.
+  `uninstall.sh` runs root's text through a bounded `sudo -n`, so it is
+  within that call's limit.
 - `uninstall.sh`'s own journal check reads each file once, by a bounded `cp`
   into a private directory, and runs every check on that copy, each with an
   explicit status that does not depend on `set -e`. A read that fails, is

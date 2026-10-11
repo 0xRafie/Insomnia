@@ -27,9 +27,12 @@ Reference pages in https://github.com/krishhgg/Insomnia:
 ## Check the state
 
 1. `tail -n 100 ~/Library/Logs/Insomnia/insomnia.log` shows what the app and
-   the recovery agent did last. A `recovery stopped: ... did not finish
-   within 30s` or `could not read the time now` line means that run undid
-   nothing; the agent tries again a minute later.
+   the recovery agent did last. A `could not read the time now` line, or a
+   `recovery stopped: ... did not finish within 30s` line that says
+   `nothing was read or undone this run`, means that run undid nothing. One
+   that says `nothing more is changed this run` stopped partway, so it may
+   have undone some entries first; check steps 2 and 3 for what is left.
+   Either way the agent tries again a minute later.
 2. `pmset -g | grep -i sleepdisabled` shows `1` while sleep is turned off.
 3. `cat ~/Library/Application\ Support/Insomnia/state.json` shows what is
    still waiting to be undone. These entries are pending:
@@ -71,11 +74,14 @@ undone. Fix that first, then run it again. It also stops when the sudoers
 rule has a line for another account or changed while it ran, when an access
 control list on the rule or its folders allows more than reading, or when a
 process named Insomnia that it cannot identify is running. When one of its
-own steps did not finish within 30s, it says so and removes nothing; the
-user reruns it once that step has ended. It may name a file it left in
-`/etc/sudoers.d` under a dotted name, which sudo does not read. For this
-account's rule it prints a `sudo rm` command to hand to the user. A changed
-rule it could not put back may be another account's, so the user checks it
-with `sudo cat` before deciding. Show the user its
-message and never edit `/etc/sudoers.d` yourself. A failed uninstall does not mean
-the power settings are back to normal, so check `pmset -g` afterward.
+own steps did not finish within 30s, it says so and removes nothing more.
+"Nothing was removed" means it stopped before removing anything; "Nothing
+more was removed" means it may already have removed some of the install,
+so check what is left. The user reruns it once that step has ended. It may
+name a file it left in `/etc/sudoers.d` under a dotted name, which sudo
+does not read. For this account's rule it prints a `sudo rm` command to
+hand to the user. A changed rule it could not put back may be another
+account's, so the user checks it with `sudo cat` before deciding. Show the
+user its message and never edit `/etc/sudoers.d` yourself. A failed
+uninstall does not mean the power settings are back to normal, so check
+`pmset -g` afterward.

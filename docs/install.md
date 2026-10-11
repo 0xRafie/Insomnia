@@ -339,7 +339,9 @@ A copy, folder or lock step that does not finish is never signalled: the
 install stops there, says what it had installed so far, leaves its private
 folders in place, and asks you to rerun it once that step has ended. The
 quit request has the same limit, and the wait for the app to exit follows
-it as before. The source build and the password prompt have no limit.
+it as before. The source build and the password prompt have no limit, and
+neither does root's change of the sudoers rule, a `sudo` that may prompt
+too: only its wait for the rule's lock is limited, to 10 s.
 Each call it makes to `sudo`, `pgrep`, `ps`, `plutil`, `launchctl` or
 `codesign` while it holds the lock has a 30 s limit, which a supervising
 process enforces even if the installer is killed meanwhile. The call keeps
