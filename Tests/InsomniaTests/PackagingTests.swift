@@ -133,8 +133,7 @@ final class PackagingTests: XCTestCase {
         try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
             .write(to: bundle.appendingPathComponent("Contents/Info.plist"))
         let script = Paths.backstopScript(inBundle: bundle)
-        try "#!/bin/bash\nprintf 'ran %s\\n' \"$*\" >> \"$HOME/backstop.ran\"\n".write(to: script, atomically: true, encoding: .utf8)
-        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        try TestScripts.write("#!/bin/bash\nprintf 'ran %s\\n' \"$*\" >> \"$HOME/backstop.ran\"\n", to: script)
         let sign = try run("/usr/bin/codesign", ["--force", "--sign", "-", bundle.path])
         XCTAssertEqual(sign.status, 0, sign.output)
         return bundle
@@ -325,8 +324,7 @@ final class PackagingTests: XCTestCase {
 
         func fake(_ name: String, _ body: String) throws -> URL {
             let url = bin.appendingPathComponent(name)
-            try ("#!/bin/bash\n" + body).write(to: url, atomically: true, encoding: .utf8)
-            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+            try TestScripts.write("#!/bin/bash\n" + body, to: url)
             return url
         }
         let swift = try fake("swift", """
@@ -461,8 +459,7 @@ final class PackagingTests: XCTestCase {
         try FileManager.default.createDirectory(at: shadow, withIntermediateDirectories: true)
         for name in ["rm", "mkdir", "cp", "chmod"] {
             let url = shadow.appendingPathComponent(name)
-            try "#!/bin/bash\nprintf 'PATH \(name) %s\\n' \"$*\" >> \"\(calls.path)\"\nexit 1\n".write(to: url, atomically: true, encoding: .utf8)
-            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+            try TestScripts.write("#!/bin/bash\nprintf 'PATH \(name) %s\\n' \"$*\" >> \"\(calls.path)\"\nexit 1\n", to: url)
         }
 
         let r = try run("/bin/bash", [script.path, "--output", out.path], environment: ["PATH": "\(shadow.path):/usr/bin:/bin", "HOME": scratch.path])
@@ -782,6 +779,8 @@ private struct IconScriptFixture {
         if [ -e "$flag" ]; then
           while IFS= read -r pattern; do
             for arg in "$@"; do
+              # The patterns are globs, so they stay unquoted.
+              # shellcheck disable=SC2254
               case "$arg" in $pattern) echo "mv: refusing $arg" >&2; exit 1 ;; esac
             done
           done < "$flag"
@@ -792,8 +791,7 @@ private struct IconScriptFixture {
 
     private func writeFake(_ name: String, _ body: String) throws {
         let url = bin.appendingPathComponent(name)
-        try ("#!/bin/bash\n" + body + "\n").write(to: url, atomically: true, encoding: .utf8)
-        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        try TestScripts.write("#!/bin/bash\n" + body + "\n", to: url)
     }
 
     func setWritable(_ dir: URL, _ writable: Bool) throws {
