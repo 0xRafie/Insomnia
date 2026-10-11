@@ -905,6 +905,87 @@ final class LaunchdBackstopTests: XCTestCase {
         }
     }
 
+    /// Round 41 (current item 1): every Insomnia folder of a user names its
+    /// candidates the same way, so a leftover is swept only when it is this
+    /// folder's: a regular file this user owns, not a link, FIFO or file
+    /// past `leftoverLimit` (one exactly at it is read), whose
+    /// ProgramArguments run this folder's bundle (or an older build's
+    /// backstop.sh in this folder), by path or through
+    /// a link to the whole folder, in a LaunchAgents folder that is within
+    /// this folder. A folder whose LaunchAgents folder links here sweeps
+    /// none of them, its own included; arm() sweeps this folder's and keeps
+    /// the rest.
+    func testOnlyThisFoldersOwnLeftoverCandidatesAreSwept() async throws {
+        let fm = FileManager.default
+        let label = "com.insomnia.backstop"
+        let mine = home.paths.launchAgents.path
+        let staging = mine + "/.\(label).staging"
+        try fm.createDirectory(atPath: staging, withIntermediateDirectories: true)
+        let wholeLink = home.root.appendingPathComponent("a link to this folder").path
+        try fm.createSymbolicLink(atPath: wholeLink, withDestinationPath: home.root.path)
+        let elsewhere = try otherFolder("folder elsewhere")
+        let aliasHome = try otherFolder("folder sharing LaunchAgents")
+        try fm.createSymbolicLink(atPath: aliasHome.launchAgents.path, withDestinationPath: mine)
+        func candidate(_ args: [String]) throws -> Data {
+            try PropertyListSerialization.data(fromPropertyList: ["Label": label, "ProgramArguments": args], format: .xml, options: 0)
+        }
+        func sealed(_ bundle: String) -> [String] { ["/bin/sh", "-c", "exec x", "sh", Self.requirement, bundle] }
+        let bundle = home.paths.appBundle.path
+        // This folder's candidate, padded inside its dict to `size` bytes.
+        func padded(_ size: Int) throws -> Data {
+            var data = try candidate(sealed(bundle))
+            let end = try XCTUnwrap(data.range(of: Data("</dict>".utf8)))
+            data.replaceSubrange(end.lowerBound..<end.lowerBound, with: Data(repeating: 0x20, count: size - data.count))
+            return data
+        }
+        let cases: [(name: String, dir: String, data: Data?, own: Bool)] = [
+            ("this folder's bundle", staging, try candidate(sealed(bundle)), true),
+            ("this folder's bundle, beside the plist", mine, try candidate(sealed(bundle)), true),
+            ("this folder's bundle through a link to all of it", staging, try candidate(sealed("\(wholeLink)/Insomnia.app")), true),
+            ("an older build's backstop.sh in this folder", staging, try candidate(["/bin/bash", home.paths.appSupport.appendingPathComponent("backstop.sh").path]), true),
+            ("another folder's bundle", staging, try candidate(sealed(elsewhere.appBundle.path)), false),
+            ("the folder sharing LaunchAgents's bundle", staging, try candidate(sealed(aliasHome.appBundle.path)), false),
+            ("another folder's backstop.sh", staging, try candidate(["/bin/bash", elsewhere.appSupport.appendingPathComponent("backstop.sh").path]), false),
+            ("a relative bundle", staging, try candidate(sealed("Insomnia.app")), false),
+            ("other ProgramArguments", staging, try candidate(["/bin/sh", "-c", bundle]), false),
+            ("not a property list", staging, Data("x".utf8), false),
+            ("this folder's, exactly at the limit", staging, try padded(LaunchdBackstop.leftoverLimit), true),
+            ("this folder's, one byte past the limit", staging, try padded(LaunchdBackstop.leftoverLimit + 1), false),
+            ("a FIFO", staging, nil, false),
+        ]
+        var paths: [(name: String, path: String, own: Bool)] = []
+        for (i, c) in cases.enumerated() {
+            let path = "\(c.dir)/\(label).candidate-\(i).plist"
+            if let data = c.data {
+                try data.write(to: URL(fileURLWithPath: path))
+            } else {
+                XCTAssertEqual(mkfifo(path, 0o600), 0)
+            }
+            paths.append((c.name, path, c.own))
+        }
+        let target = "\(staging)/\(label).candidate-0.plist"
+        let link = "\(staging)/\(label).candidate-link.plist"
+        try fm.createSymbolicLink(atPath: link, withDestinationPath: target)
+        paths.append(("a link to this folder's candidate", link, false))
+        let b = try makeBackstop()
+        for p in paths {
+            XCTAssertEqual(b.isOwnLeftover(p.path), p.own, p.name)
+        }
+        let aliasBackstop = try makeBackstop(paths: aliasHome)
+        for p in paths {
+            XCTAssertFalse(aliasBackstop.isOwnLeftover(p.path), "seen from the folder whose LaunchAgents links here: \(p.name)")
+        }
+        XCTAssertNotNil(LaunchdBackstop.readSmallRegularFile(target, limit: LaunchdBackstop.leftoverLimit, owner: getuid()))
+        XCTAssertNil(LaunchdBackstop.readSmallRegularFile(target, limit: LaunchdBackstop.leftoverLimit, owner: getuid() &+ 1), "another user's file is not read")
+
+        try await b.arm()
+
+        for p in paths {
+            var info = stat()
+            XCTAssertEqual(lstat(p.path, &info) == 0, !p.own, "after arm(): \(p.name)")
+        }
+    }
+
     /// The one top-level `path =` line, as uninstall.sh's loaded_agent
     /// reads it: none, two, a relative one or only a nested one is no path.
     func testTheLoadPathIsTheOneTopLevelAbsolutePath() {

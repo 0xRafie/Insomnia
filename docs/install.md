@@ -185,7 +185,13 @@ turn sleep back on and toggle Low Power Mode on battery, and nothing else; the
 command that keeps the Mac awake, `pmset -a disablesleep 1`, always goes
 through the standard macOS administrator password dialog. A reinstall over an
 older install replaces the file, so the old `disablesleep 1` line is removed.
-The installer never writes that line, on any path. It asks for your password
+The installer never writes that line, on any path. The file is one for every
+account on this Mac, and each account that installs Insomnia gets the same
+three lines in it. The installer reads it first and keeps the other accounts'
+lines for those three commands. It stops with nothing changed if the file
+holds a line it did not write, or cannot be read. Two accounts that install
+or uninstall at the same moment can still lose each other's lines, so run
+them one after the other. It asks for your password
 before it quits a running Insomnia, so cancelling the password prompt changes
 nothing and a running session keeps going. When a session is running it says
 the upgrade will end it before asking, and in a terminal it asks whether to
@@ -327,7 +333,9 @@ they are gone, any other Insomnia folder of yours needs
 `./scripts/install.sh` again before its next start. It removes the
 receipts folder too once no other account's receipt is in it, and leaves
 the folder and everything in it alone when someone other than root could
-change it. If recovery is incomplete or the app refuses to quit, it stops; resolve
+change it. It keeps the sudoers rule, with your own three lines in it, while
+that folder or the rule itself shows another account that installed
+Insomnia, or cannot rule one out, and says so. If recovery is incomplete or the app refuses to quit, it stops; resolve
 the reported problem and retry. With the app it removes what an interrupted
 install left beside it: `~/Applications/.Insomnia.app.previous`, and
 `.Insomnia.app.staging.*` directories of installs that are no longer running.

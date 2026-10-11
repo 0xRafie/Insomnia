@@ -85,6 +85,9 @@ struct LaunchdBackstop: BackstopScheduling {
 
     let plistURL: URL
     let bundle: URL
+    /// This folder's journal folder (`Paths.appSupport`), where builds before
+    /// the sealed bundle kept the backstop.sh their plists ran.
+    let journalFolder: URL
     let label: String
     let uid: uid_t
     /// The lock every load and unload of `label` takes (see
@@ -114,6 +117,7 @@ struct LaunchdBackstop: BackstopScheduling {
     ) {
         self.plistURL = paths.backstopPlist
         self.bundle = bundle ?? Self.runningOrInstalledBundle(paths: paths)
+        self.journalFolder = paths.appSupport
         self.agentLock = agentLock
         self.agentLockTimeout = agentLockTimeout
         self.pin = pin
@@ -328,8 +332,85 @@ struct LaunchdBackstop: BackstopScheduling {
         // report an error at every login.
         for dir in [stagingDirectory, plistURL.deletingLastPathComponent()] {
             for name in (try? fm.contentsOfDirectory(atPath: dir.path)) ?? [] where name.hasPrefix(candidatePrefix) {
-                try? fm.removeItem(at: dir.appendingPathComponent(name))
+                let path = dir.appendingPathComponent(name).path
+                if isOwnLeftover(path) {
+                    try? fm.removeItem(atPath: path)
+                } else {
+                    Log.info("kept backstop candidate \(path): it may be another Insomnia folder's")
+                }
             }
+        }
+    }
+
+    /// Whether the leftover candidate at `path` is this folder's to remove.
+    /// Every Insomnia folder of this user names its candidates the same way,
+    /// so a LaunchAgents folder that two folders share (one reaches it
+    /// through a link) holds either one's, and a name is not enough. It is
+    /// this folder's only when this folder's LaunchAgents folder is within
+    /// this folder (the folder above it, after any link, is the folder it is
+    /// named under, by device and inode: a link to the whole folder counts,
+    /// a LaunchAgents folder leading into another folder does not), and the
+    /// file is a regular file, not a link, that this process's user owns,
+    /// of at most `leftoverLimit` bytes, whose ProgramArguments run this folder's
+    /// bundle (or, for a build before the sealed bundle, this folder's
+    /// backstop.sh): the same path, or the same name in a folder that is
+    /// this one's by device and inode. Another account sharing the
+    /// LaunchAgents folder runs the same bundle but owns its own files.
+    /// uninstall.sh's agents_dir_home and own_plist read the folder and the
+    /// plist the same way. Two folders of one user that run one bundle
+    /// write the same bytes; those cannot be told apart, and count as this
+    /// folder's.
+    func isOwnLeftover(_ path: String) -> Bool {
+        let agents = plistURL.deletingLastPathComponent()
+        guard let up = FileIdentity(atPath: agents.deletingLastPathComponent().path),
+              FileIdentity(atPath: agents.path + "/..") == up,
+              let data = Self.readSmallRegularFile(path, limit: Self.leftoverLimit, owner: getuid()),
+              let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+              let args = plist["ProgramArguments"] as? [String]
+        else { return false }
+        let runs: String
+        let want: String
+        if args.count == 6, args[0] == "/bin/sh" {
+            runs = args[5]
+            want = bundle.path
+        } else if args.count == 2, args[0] == "/bin/bash" {
+            runs = args[1]
+            want = journalFolder.appendingPathComponent("backstop.sh").path
+        } else {
+            return false
+        }
+        if runs == want { return true }
+        let r = URL(fileURLWithPath: runs), w = URL(fileURLWithPath: want)
+        guard runs.hasPrefix("/"), r.lastPathComponent == w.lastPathComponent,
+              let mine = FileIdentity(atPath: w.deletingLastPathComponent().path)
+        else { return false }
+        return FileIdentity(atPath: r.deletingLastPathComponent().path) == mine
+    }
+
+    /// A candidate is about 1.5 KB; anything past this is not one.
+    static let leftoverLimit = 64 * 1024
+
+    /// The bytes of the regular file at `path`, opened without following a
+    /// link and without blocking (a FIFO with no writer would block a plain
+    /// open), when `owner` owns it and it holds at most `limit` bytes; nil
+    /// otherwise, or when it cannot be opened or read.
+    static func readSmallRegularFile(_ path: String, limit: Int, owner: uid_t) -> Data? {
+        let fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_uid == owner, info.st_size <= limit else { return nil }
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 16 * 1024)
+        while true {
+            let n = read(fd, &buffer, buffer.count)
+            if n < 0 {
+                if errno == EINTR { continue }
+                return nil
+            }
+            if n == 0 { return data }
+            data.append(buffer, count: n)
+            if data.count > limit { return nil }
         }
     }
 

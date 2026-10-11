@@ -9,10 +9,9 @@ import InsomniaTestHome
 /// check that the variable names an existing directory outside ~/Library,
 /// that every path the app resolves sits inside it, that a default-argument
 /// log line lands there and not at the real log's path (which no test
-/// opens), and that a TempHome hands the variable back instead
-/// of unsetting it. They do not check which temp directory the loader used:
-/// it prefers Darwin's per-user temp dir and falls back to TMPDIR, and
-/// Foundation's temporaryDirectory need not match either. This class extends
+/// opens), that a TempHome hands the variable back instead
+/// of unsetting it, and that the loader made its directory under TMPDIR
+/// when the run set an absolute one (TestScratch). This class extends
 /// XCTestCase directly on purpose: isolation must not depend on a base class
 /// or on which tests a `--filter` selects.
 final class TestIsolationTests: XCTestCase {
@@ -58,6 +57,19 @@ final class TestIsolationTests: XCTestCase {
         XCTAssertTrue(root.lastPathComponent.hasPrefix("insomnia-tests-process-"), root.path)
         XCTAssertTrue(isDirectory(root), "the loader's directory does not exist: \(root.path)")
         XCTAssertFalse(isInside(root, realLibrary), root.path)
+    }
+
+    /// A run that sets TMPDIR keeps the process home and every test's
+    /// scratch folder under it: the loader reads TMPDIR before Darwin's
+    /// per-user temp dir.
+    func testLoaderMadeItsHomeUnderAnAbsoluteTMPDIR() throws {
+        guard let tmp = ProcessInfo.processInfo.environment["TMPDIR"], tmp.hasPrefix("/") else {
+            throw XCTSkip("TMPDIR is not an absolute path in this run")
+        }
+        var base = tmp
+        while base.count > 1, base.hasSuffix("/") { base.removeLast() }
+        XCTAssertEqual(TestScratch.directory.path, base)
+        XCTAssertEqual(ProcessTestHome.root.deletingLastPathComponent().path, base)
     }
 
     func testEveryResolvedPathSitsInsideTheTestHome() throws {

@@ -212,11 +212,26 @@ struct SleepOffReceipts: Sendable {
     /// reads.
     static var live: SleepOffReceipts { SleepOffReceipts(folder: folder, owners: [0], user: getuid(), lists: .native) }
 
-    init(folder: String, owners: Set<uid_t>, user: uid_t, lists: AccessLists) {
+    init(folder: String, owners: Set<uid_t>, user: uid_t, lists: AccessLists, stats: StatCalls = .system) {
         self.folder = folder
         self.owners = owners
         self.user = user
         self.lists = lists
+        self.stats = stats
+    }
+
+    /// The lstat(2) and fstat(2) the receipt's checks make, each returning
+    /// 0 or the call's errno. The system's in the app (`system`); tests
+    /// give calls that fail, since nothing on a working disk makes the real
+    /// ones fail on cue.
+    struct StatCalls: Sendable {
+        var lstat: @Sendable (String, inout stat) -> Int32
+        var fstat: @Sendable (Int32, inout stat) -> Int32
+
+        static let system = StatCalls(
+            lstat: { Darwin.lstat($0, &$1) == 0 ? 0 : errno },
+            fstat: { Darwin.fstat($0, &$1) == 0 ? 0 : errno }
+        )
     }
 
     /// An absolute path with no `.`, `..`, empty or symbolic link
@@ -232,6 +247,7 @@ struct SleepOffReceipts: Sendable {
     /// here, so no real list is read (`AccessLists.fixed`); there is no
     /// default, so no receipt reads a real list unless it asks for one.
     let lists: AccessLists
+    let stats: StatCalls
 
     var file: String { folder + "/" + String(user) }
     /// `<uid>.released`, beside the receipt: the user's own file, 42 bytes,
@@ -271,14 +287,27 @@ struct SleepOffReceipts: Sendable {
     }
 
     /// Under the lock, something the checks need could not be read: an
-    /// access control list acl(3) could not give whole, or a path whose
-    /// lstat(2) failed other than by finding nothing there. Nothing shows
+    /// access control list acl(3) could not give whole, a path whose
+    /// lstat(2) failed other than by finding nothing there, or an fstat(2)
+    /// of the locked file that failed (`record`). Nothing shows
     /// whether the file can be trusted, or that it cannot, so it decides
     /// nothing (`verdict`). `identity` is "device:inode" of the locked
     /// file.
     struct Unknown: Error, LocalizedError {
         let detail: String
         let identity: String
+        var errorDescription: String? { detail }
+    }
+
+    /// Before the lock, the file at the receipt's path could not be
+    /// examined: lstat(2) failed other than by finding nothing there, or
+    /// fstat(2) of the opened file failed. That shows neither that the
+    /// receipt is missing or replaced nor that it is the file a start
+    /// claimed, and a command for that start may hold its lock, so it
+    /// decides nothing whatever the time (`verdict`). The release file's
+    /// fstat(2) failing throws it too (`readRelease`, `writeRelease`).
+    struct Unacquired: Error, LocalizedError {
+        let detail: String
         var errorDescription: String? { detail }
     }
 
@@ -356,11 +385,14 @@ struct SleepOffReceipts: Sendable {
     /// Opens the receipt read-only and locks it, trying every `pollEvery`
     /// for up to `timeout`, then checks it. Throws `Busy` when it stays
     /// locked, `LockFailed` when flock(2) fails another way, `Unopened`
-    /// when the file at the path cannot be opened, `Unknown` when, once
-    /// locked, a list or a path the checks need cannot be read, and
-    /// `Problem` when the receipt is missing or not a regular file before
-    /// the lock, or once locked, fails the checks or is not the file at its
-    /// path.
+    /// when the file at the path cannot be opened, `Unacquired` when the
+    /// file at the path cannot be examined before the lock (an lstat(2)
+    /// that fails other than by finding nothing there, or an fstat(2) of
+    /// the opened file that fails), `Unknown` when, once locked, a list or
+    /// a path the checks need cannot be read, and `Problem` when the
+    /// receipt is missing or not a regular file before the lock, is
+    /// another file once opened, or once locked, fails the checks or is not
+    /// the file at its path.
     ///
     /// Only what opening needs comes before the lock: a plain folder path
     /// and a regular file at it, by lstat, so a FIFO or a device put there
@@ -371,14 +403,25 @@ struct SleepOffReceipts: Sendable {
     func lock(timeout: TimeInterval, pollEvery: Duration = .milliseconds(50)) async throws -> Guard {
         try checkFolderPath()
         var info = stat()
-        guard lstat(file, &info) == 0 else { throw Problem(detail: "\(file): \(String(cString: strerror(errno)))") }
+        let err = stats.lstat(file, &info)
+        guard err == 0 else {
+            let detail = "\(file): \(String(cString: strerror(err)))"
+            // Nothing there. Any other failure shows nothing about the file.
+            if err == ENOENT || err == ENOTDIR { throw Problem(detail: detail) }
+            throw Unacquired(detail: "\(file) could not be examined before its lock (lstat: \(String(cString: strerror(err))))")
+        }
         guard info.st_mode & S_IFMT == S_IFREG else { throw Problem(detail: "\(file) is not a regular file") }
         // O_NONBLOCK: lstat found a regular file, but a FIFO put in its
         // place since must not hang the open.
         let fd = open(file, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         guard fd >= 0 else { throw Unopened(file: file, identity: FileIdentity(info).text, errno: errno) }
         var opened = stat()
-        guard fstat(fd, &opened) == 0, opened.st_dev == info.st_dev, opened.st_ino == info.st_ino else {
+        let openErr = stats.fstat(fd, &opened)
+        guard openErr == 0 else {
+            close(fd)
+            throw Unacquired(detail: "\(file) could not be examined once opened (fstat: \(String(cString: strerror(openErr))))")
+        }
+        guard opened.st_dev == info.st_dev, opened.st_ino == info.st_ino else {
             close(fd)
             throw Problem(detail: "\(file) changed while it was opened")
         }
@@ -406,7 +449,12 @@ struct SleepOffReceipts: Sendable {
         // checks.
         do {
             var now = stat()
-            guard lstat(file, &now) == 0, FileIdentity(now).text == held.identity else {
+            let err = stats.lstat(file, &now)
+            guard err == 0 else {
+                if err == ENOENT || err == ENOTDIR { throw Problem(detail: "\(file) was removed while it was locked") }
+                throw Unread(detail: "\(file) could not be examined once locked (lstat: \(String(cString: strerror(err))))")
+            }
+            guard FileIdentity(now).text == held.identity else {
                 throw Problem(detail: "\(file) was replaced while it was locked")
             }
             guard FileIdentity(try check()).text == held.identity else {
@@ -422,10 +470,16 @@ struct SleepOffReceipts: Sendable {
         return held
     }
 
-    /// The receipt's line, through the locked descriptor.
+    /// The receipt's line, through the locked descriptor. Throws `Unknown`
+    /// when fstat(2) of it fails, and `Problem` when it is not the file
+    /// install.sh made or holds no line.
     func record(under held: Guard) throws -> Record {
         var opened = stat()
-        guard fstat(held.fd, &opened) == 0, opened.st_nlink == 1, opened.st_size == off_t(Self.size) else {
+        let err = stats.fstat(held.fd, &opened)
+        guard err == 0 else {
+            throw Unknown(detail: "\(file) could not be examined once locked (fstat: \(String(cString: strerror(err))))", identity: held.identity)
+        }
+        guard opened.st_nlink == 1, opened.st_size == off_t(Self.size) else {
             throw Problem(detail: "\(file) is not the \(Self.size)-byte file install.sh made")
         }
         var bytes = [UInt8](repeating: 0, count: Self.size + 1)
@@ -452,8 +506,10 @@ struct SleepOffReceipts: Sendable {
     /// a receipt this process could not lock as the file the start
     /// claimed: a command may hold that file's lock, and after `expires` it
     /// is undone like an end. A receipt that is locked, a lock that fails,
-    /// and the claimed file still at the path but one that cannot be opened
-    /// to lock it decide nothing: a command may hold that lock. Every check
+    /// a file at the path that cannot be examined before the lock
+    /// (`Unacquired`), and the claimed file still at the path but one that
+    /// cannot be opened to lock it decide nothing: a command may hold that
+    /// lock. Every check
     /// of the file itself comes after the lock (`lock`), so a file that
     /// fails one decides only once no command holds it. The file the start
     /// claimed, locked, whose checks could not be read (`Unknown`), decides
@@ -470,7 +526,7 @@ struct SleepOffReceipts: Sendable {
         switch outcome {
         case let .success(g):
             held = g
-        case let .failure(error) where error is Busy || error is LockFailed || error is CancellationError:
+        case let .failure(error) where error is Busy || error is LockFailed || error is Unacquired || error is CancellationError:
             return .undecided(error.localizedDescription)
         case let .failure(error as Unopened) where error.identity == attempt.receipt:
             return .undecided("\(error.localizedDescription); a command for that start may hold its lock")
@@ -486,6 +542,8 @@ struct SleepOffReceipts: Sendable {
         let found: Record
         do {
             found = try record(under: held)
+        } catch let error as Unknown {
+            return .undecided("\(error.localizedDescription); nothing shows whether the receipt can be trusted, so it decides nothing")
         } catch {
             // Locked as the file the start claimed: no command for it is
             // running. One that starts before `expires` may still find its
@@ -545,7 +603,11 @@ struct SleepOffReceipts: Sendable {
         guard fd >= 0 else { throw Problem(detail: "\(releaseFile): \(String(cString: strerror(errno))). Run install.sh again") }
         defer { close(fd) }
         var info = stat()
-        guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_size == off_t(Self.releaseSize) else {
+        let err = stats.fstat(fd, &info)
+        guard err == 0 else {
+            throw Unacquired(detail: "\(releaseFile) could not be examined once opened (fstat: \(String(cString: strerror(err))))")
+        }
+        guard info.st_mode & S_IFMT == S_IFREG, info.st_size == off_t(Self.releaseSize) else {
             throw Problem(detail: "\(releaseFile) is not the \(Self.releaseSize)-byte file install.sh made. Run install.sh again")
         }
         var bytes = [UInt8](repeating: 0, count: Self.releaseSize + 1)
@@ -568,7 +630,11 @@ struct SleepOffReceipts: Sendable {
         guard fd >= 0 else { throw Problem(detail: "\(releaseFile) could not be opened for writing: \(String(cString: strerror(errno)))") }
         defer { close(fd) }
         var info = stat()
-        guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_size == off_t(Self.releaseSize) else {
+        let err = stats.fstat(fd, &info)
+        guard err == 0 else {
+            throw Unacquired(detail: "\(releaseFile) could not be examined once opened (fstat: \(String(cString: strerror(err))))")
+        }
+        guard info.st_mode & S_IFMT == S_IFREG, info.st_size == off_t(Self.releaseSize) else {
             throw Problem(detail: "\(releaseFile) is not the \(Self.releaseSize)-byte file install.sh made. Run install.sh again")
         }
         let bytes = Array(release.line.utf8)
@@ -630,8 +696,8 @@ struct SleepOffReceipts: Sendable {
     /// for a path that could not be read at all.
     private func inspect(_ path: String, directory: Bool, unread: inout Unread?) throws -> stat? {
         var info = stat()
-        guard lstat(path, &info) == 0 else {
-            let err = errno
+        let err = stats.lstat(path, &info)
+        guard err == 0 else {
             let detail = "\(path): \(String(cString: strerror(err)))"
             if err == ENOENT || err == ENOTDIR { throw Problem(detail: detail) }
             if unread == nil { unread = Unread(detail: detail) }

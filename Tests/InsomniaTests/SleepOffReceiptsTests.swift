@@ -397,6 +397,83 @@ final class SleepOffReceiptsTests: XCTestCase {
         XCTAssertEqual(mayHaveWritten(late), "\(file) could not be opened to be locked: Permission denied")
     }
 
+    /// Round 41 (current item 3). A stat call that fails, other than by
+    /// finding nothing at the path, shows neither that the receipt is
+    /// missing or replaced nor that it is the file the start claimed. Before
+    /// the lock (the lstat(2) of the receipt, the fstat(2) of the opened
+    /// file) a command for the start may hold its lock, and nothing is
+    /// known (`Unacquired`): undecided at any time, the dialog over too.
+    /// Under the lock (the lstat(2) of the receipt after it, the lstat(2)
+    /// of the receipt or a folder the checks make, the fstat(2) of the
+    /// locked file that reads its line) the file the start claimed cannot
+    /// be trusted or distrusted (`Unknown`): undecided at any time. Only
+    /// ENOENT, which says nothing is there, counts as missing, and decides
+    /// once the start has expired, before the lock or after it. Each
+    /// failure is injected once into the system's calls on a receipt that
+    /// otherwise shows this start never wrote (the control), and the lock
+    /// is free after each. Before round 41 an lstat(2) that failed before
+    /// the lock counted as missing, and an fstat(2) of the opened file that
+    /// failed as a replaced file: both let an expired start be undone.
+    func testAReceiptWhoseStatCallsFailDecidesNothing() async throws {
+        let file = receipts.file
+        TestReceipts.write(file, nonce: nonce, predecessor: predecessor, word: "refused")
+        let identity = try receipts.identity()
+        let control = await verdict(attempt(identity), now: expires)
+        XCTAssertEqual(control, .neverWrote, "the control")
+        let nothing = "; nothing shows whether the receipt can be trusted, so it decides nothing"
+        let cases: [(name: String, fail: FailingStats.Call, err: Int32, undecided: String?, removed: String?)] = [
+            ("lstat before the lock, EIO", .lstat(file, 1), EIO, "\(file) could not be examined before its lock (lstat: Input/output error)", nil),
+            ("lstat before the lock, EACCES", .lstat(file, 1), EACCES, "\(file) could not be examined before its lock (lstat: Permission denied)", nil),
+            ("fstat of the opened file", .fstat(1), EIO, "\(file) could not be examined once opened (fstat: Input/output error)", nil),
+            ("lstat after the lock", .lstat(file, 2), EIO, "\(file) could not be examined once locked (lstat: Input/output error)\(nothing)", nil),
+            ("lstat of the receipt in the checks", .lstat(file, 3), EIO, "\(file): Input/output error\(nothing)", nil),
+            ("lstat of its folder in the checks", .lstat(receipts.folder, 0), EIO, "\(receipts.folder): Input/output error\(nothing)", nil),
+            ("fstat that reads the line", .fstat(2), EIO, "\(file) could not be examined once locked (fstat: Input/output error)\(nothing)", nil),
+            ("lstat before the lock, ENOENT", .lstat(file, 1), ENOENT, nil, "\(file): No such file or directory"),
+            ("lstat after the lock, ENOENT", .lstat(file, 2), ENOENT, nil, "\(file) was removed while it was locked"),
+        ]
+        for c in cases {
+            for (now, dialogOver) in [(expires - 1, false), (expires, false), (expires + 3600, true)] {
+                let stats = FailingStats(c.fail, c.err)
+                let faulty = SleepOffReceipts(folder: receipts.folder, owners: receipts.owners, user: receipts.user, lists: receipts.lists, stats: stats.calls)
+                let outcome: Result<SleepOffReceipts.Guard, Error>
+                do { outcome = .success(try await faulty.lock(timeout: 0.2)) } catch { outcome = .failure(error) }
+                let v = faulty.verdict(for: attempt(identity), lock: outcome, now: now, dialogOver: dialogOver)
+                if case let .success(held) = outcome { held.release() }
+                let at = "\(c.name), \(now - expires) s from expires"
+                XCTAssertEqual(stats.failed, 1, "\(at): the one failure was made")
+                if let why = c.undecided {
+                    XCTAssertEqual(undecided(v), why, "\(at): \(v)")
+                } else if now >= expires {
+                    XCTAssertEqual(mayHaveWritten(v), c.removed, "\(at): \(v)")
+                } else {
+                    let why = try XCTUnwrap(undecided(v), "\(at): \(v)")
+                    XCTAssertTrue(why.hasPrefix("\(try XCTUnwrap(c.removed)); a command for that start could still write until "), "\(at): \(why)")
+                }
+                let fd = open(file, O_RDONLY | O_CLOEXEC)
+                XCTAssertEqual(flock(fd, LOCK_EX | LOCK_NB), 0, "\(at): the lock is free after")
+                close(fd)
+            }
+        }
+        // The release file, read and written under the lock by a start and
+        // its settlement: a failed fstat(2) of it is not taken for a file
+        // in another shape.
+        let calls: [(name: String, call: (SleepOffReceipts) throws -> Void)] = [
+            ("read", { _ = try $0.readRelease() }),
+            ("written", { try $0.writeRelease(.held(self.nonce)) }),
+        ]
+        for c in calls {
+            let faulty = SleepOffReceipts(folder: receipts.folder, owners: receipts.owners, user: receipts.user, lists: receipts.lists, stats: FailingStats(.fstat(1), EIO).calls)
+            XCTAssertThrowsError(try c.call(faulty), c.name) { error in
+                XCTAssertTrue(error is SleepOffReceipts.Unacquired, "\(c.name): \(error)")
+                XCTAssertEqual(error.localizedDescription, "\(receipts.releaseFile) could not be examined once opened (fstat: Input/output error)", c.name)
+            }
+        }
+        let again = await verdict(attempt(identity), now: expires)
+        XCTAssertEqual(again, .neverWrote, "the control again")
+        XCTAssertEqual(try receipts.readRelease(), .free(SleepOffReceipts.zero), "nothing was written")
+    }
+
     /// F3 (round 28). Only the one entry install.sh adds is the receipt's
     /// list: it allows, names the user, grants read alone and carries no
     /// flag. Each right and flag acl(3) defines, including those ls(1)
@@ -2261,6 +2338,41 @@ final class SleepOffSettlementTests: XCTestCase {
         XCTAssertFalse(m.isActive)
     }
 
+    /// Round 41 (current item 4): one read of session.json decides both
+    /// whether it is the start's own and which session the settlement
+    /// leaves. Before, a first read that failed was taken for no
+    /// session.json, so the start's file stayed, and a second read that
+    /// succeeded named it as the session to resume, though it never
+    /// began. Here the settlement's read fails once and every later read
+    /// succeeds: nothing is published, the record stays unsettled with its
+    /// claim, the start's session is not resumed, and the next transaction
+    /// settles the start with no session left.
+    func testAFailedSessionReadIsNotTakenForNoSessionWhenALaterReadSucceeds() async throws {
+        let attempt = try journalUnfinishedStart(ids: true)
+        pastExpiry()
+        let reads = SessionReads()
+        let m = h.makeManager(sessionReadCheck: { try reads.check() })
+        reads.failNext()
+
+        await m.reconcile()
+
+        XCTAssertEqual(reads.failed, 1)
+        XCTAssertGreaterThan(reads.count, 1, "the reads after the failed one succeeded")
+        XCTAssertFalse(m.isActive, "the start's own session is not resumed")
+        let journal = try XCTUnwrap(h.store.loadState())
+        XCTAssertEqual(journal.sleepOffAttempt, attempt, "nothing is published: the record stays unsettled")
+        XCTAssertEqual(TestReceipts.release(h.receipts), "\(attempt.nonce) held\n", "the claim stays")
+        XCTAssertEqual(restores, 0, "\(h.guardFake.calls)")
+        XCTAssertTrue(m.lastError?.contains("session.json could not be read to name the session this settlement leaves (") == true, m.lastError ?? "")
+
+        await m.reconcile()
+
+        try assertSettledAndNotResumed(m)
+        XCTAssertEqual(TestReceipts.release(h.receipts), "\(SleepOffReceipts.zero) free\n", "the claim is given back")
+        XCTAssertEqual(restores, 0, "\(h.guardFake.calls)")
+        XCTAssertEqual(reads.failed, 1)
+    }
+
     /// Round 36 (independent35 R35-7): sessions and records of this build
     /// carry ids (`Session.id`, `SleepOffAttempt.session`,
     /// `ResumedSession.id`). A session with the start's own times and
@@ -2657,5 +2769,97 @@ private final class JournalAtShow: @unchecked Sendable {
     var data: Data? {
         get { lock.withLock { _data } }
         set { lock.withLock { _data = newValue } }
+    }
+}
+
+/// Counts reads of session.json (`Store.sessionReadCheck`) and fails the
+/// next one after `failNext`, with EIO.
+private final class SessionReads: @unchecked Sendable {
+    private let lock = NSLock()
+    private var reads = 0
+    private var failures = 0
+    private var failing = false
+
+    func failNext() {
+        lock.lock()
+        defer { lock.unlock() }
+        failing = true
+    }
+
+    func check() throws {
+        lock.lock()
+        defer { lock.unlock() }
+        reads += 1
+        if failing {
+            failing = false
+            failures += 1
+            throw POSIXError(.EIO)
+        }
+    }
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return reads
+    }
+
+    var failed: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return failures
+    }
+}
+
+/// The receipt's stat calls (`SleepOffReceipts.StatCalls`): the system's,
+/// except one that fails with `err`. `.lstat(path, n)` fails the nth
+/// lstat(2) of `path` (every one when n is 0), `.fstat(n)` the nth
+/// fstat(2). Counts every call.
+private final class FailingStats: @unchecked Sendable {
+    enum Call { case lstat(String, Int), fstat(Int) }
+    private let lock = NSLock()
+    private var lstats: [String: Int] = [:]
+    private var fstats = 0
+    private var failures = 0
+    private let fail: Call
+    private let err: Int32
+
+    init(_ fail: Call, _ err: Int32) {
+        self.fail = fail
+        self.err = err
+    }
+
+    var calls: SleepOffReceipts.StatCalls {
+        SleepOffReceipts.StatCalls(
+            lstat: { path, info in
+                if self.fails(path) { return self.err }
+                return SleepOffReceipts.StatCalls.system.lstat(path, &info)
+            },
+            fstat: { fd, info in
+                if self.fails(nil) { return self.err }
+                return SleepOffReceipts.StatCalls.system.fstat(fd, &info)
+            })
+    }
+
+    var failed: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return failures
+    }
+
+    private func fails(_ path: String?) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let hit: Bool
+        if let path {
+            lstats[path, default: 0] += 1
+            guard case let .lstat(p, n) = fail, p == path else { return false }
+            hit = n == 0 || lstats[path] == n
+        } else {
+            fstats += 1
+            guard case let .fstat(n) = fail else { return false }
+            hit = fstats == n
+        }
+        if hit { failures += 1 }
+        return hit
     }
 }

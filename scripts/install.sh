@@ -1,9 +1,11 @@
 #!/bin/bash
 # Install Insomnia: put Insomnia.app (with backstop.sh sealed inside it) in
 # ~/Applications, install the LaunchAgent that verifies the bundle and runs
-# that script, write the three-line sudoers rule, and create the root-owned
-# receipt folder and this user's receipt in /private/var/db/com.kgarg.insomnia
-# (kept if already there and safe). Idempotent; asks for sudo once (for
+# that script, write this account's three lines of the sudoers rule (the
+# lines other accounts on this Mac have there stay), and create the
+# root-owned receipt folder and this user's receipt in
+# /private/var/db/com.kgarg.insomnia (kept if already there and safe).
+# Idempotent; asks for sudo once (for
 # /etc/sudoers.d/insomnia and the receipt), before a running Insomnia is asked
 # to quit and before anything of a previous install is touched. The rule, the
 # receipt, the bundle and the LaunchAgent are set up under the recovery lock; the bundle
@@ -121,9 +123,46 @@ SUDOERS=/etc/sudoers.d/insomnia
 # starts with '.' or '-', stops the install: chmod would split one with a
 # space or a colon, and sudoers would read other bytes as its syntax.
 account_name_ok() { local LC_ALL=C; [[ -n "$1" && "$1" != [.-]* && "$1" != *[!A-Za-z0-9_.-]* ]]; }
+# Prints the uid `id -u` gives for account name $1, only when id exits 0:
+# what it printed before a failure counts for nothing.
+uid_of() { # name
+  local out
+  out="$("$ID" -u -- "$1" 2>/dev/null)" || return 0
+  printf '%s' "$out"
+}
+# $SUDOERS is one file for every account on this Mac: each account's
+# install.sh writes that account's three lines in it, and keeps the lines
+# of the others. rule_lines reads the file's text ($1) line by line. The
+# lines of another account that are one of the three go into rule_others
+# (each once, in their order) and that account's name into rule_names. The
+# lines of this account ($USER_NAME), any account's line for turning sleep
+# off, which an older build wrote, a header install.sh writes and an empty
+# line are passed over. The number of the first other line, which
+# install.sh never wrote and sudo may read as a rule or a directive of its
+# own (#include is one), goes into rule_odd, and the reading stops there.
+RULE_HEADER="# Installed by Insomnia install.sh. Exactly three commands for each account, nothing else."
+rule_lines() { # text
+  local line name what n=0
+  rule_others=""; rule_names=""; rule_odd=""
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$((n + 1))
+    case "$line" in
+      ""|"$RULE_HEADER"|"# Installed by Insomnia install.sh. Exactly three commands, nothing else."|"# Installed by Insomnia install.sh. Exactly four commands, nothing else.") continue ;;
+    esac
+    if ! [[ "$line" =~ ^([^\ ]+)\ ALL=\(root\)\ NOPASSWD:\ /usr/bin/pmset\ (-a\ disablesleep\ [01]|-b\ lowpowermode\ [01])$ ]]; then
+      rule_odd="$n"; return 0
+    fi
+    name="${BASH_REMATCH[1]}"; what="${BASH_REMATCH[2]}"
+    if ! account_name_ok "$name"; then rule_odd="$n"; return 0; fi
+    [[ "$name" != "$USER_NAME" ]] || continue
+    case "$what" in "-a disablesleep 0"|"-b lowpowermode "[01]) ;; *) continue ;; esac
+    [[ $'\n'"$rule_others" == *$'\n'"$line"$'\n'* ]] || rule_others+="$line"$'\n'
+    [[ " $rule_names " == *" $name "* ]] || rule_names="${rule_names:+$rule_names }$name"
+  done <<< "$1"
+}
 UID_NUM="$("$ID" -u 2>/dev/null)" || UID_NUM=""
 USER_NAME="$("$ID" -un 2>/dev/null)" || USER_NAME=""
-if [[ -z "$UID_NUM" || "$UID_NUM" == *[!0-9]* ]] || ! account_name_ok "$USER_NAME" || [[ "$("$ID" -u -- "$USER_NAME" 2>/dev/null)" != "$UID_NUM" ]]; then
+if [[ -z "$UID_NUM" || "$UID_NUM" == *[!0-9]* ]] || ! account_name_ok "$USER_NAME" || [[ "$(uid_of "$USER_NAME")" != "$UID_NUM" ]]; then
   echo "Install stopped before changing anything: the account name of uid ${UID_NUM:-unknown} (${USER_NAME:-none}) is empty, holds a byte other than a letter, a digit, '_', '.' or '-', starts with '.' or '-', or is not this uid's, so neither the sudoers rule nor the receipt can name it." >&2
   exit 1
 fi
@@ -196,9 +235,8 @@ command_line() { local line; line="$(printf '%q ' "$@")"; printf '%s' "${line% }
 # holds no number from 0 to 255, gives 124.
 BOUNDED_OUTPUT=""
 BOUNDED_WHOLE=0
-# install.sh only prints a call's output and decides nothing from it, so it
-# never reads BOUNDED_WHOLE; bounded() stays the same as uninstall.sh's.
-# shellcheck disable=SC2034
+# install.sh decides from a call's output only where it also reads
+# BOUNDED_WHOLE (leftover_runs); bounded() stays the same as uninstall.sh's.
 bounded() { # command args...
   local base supervisor rc deadline file="" size opened=0 read_rc=0
   base="$("$MKTEMP" "$WORK/call.XXXXXX")"
@@ -684,14 +722,18 @@ fi
 # stop between the rule and the new bundle says so and gives the rerun
 # command (rule_ahead_note). sudo runs with -n on the credential step 2
 # refreshed: it never prompts while this run holds the lock.
+# The file is one for every account on this Mac. Another account's install
+# wrote that account's lines in it too, and that account's app, backstop.sh
+# and uninstall.sh restore sleep through them, perhaps for a start it has
+# not settled yet. So the file is read first, as root (only root can read
+# it), and written again with this account's three lines and every line of
+# another account that is one of the three, as it was (rule_lines). No
+# account keeps a `disablesleep 1` line. A line install.sh never wrote, or a
+# file that cannot be read whole, stops the install with nothing changed.
+# No lock spans accounts: another account's install.sh or uninstall.sh run
+# at the same moment can still write or remove the file between this read
+# and the write below.
 step "Writing $SUDOERS"
-TMP_SUDOERS="$("$MKTEMP")"
-"$CAT" > "$TMP_SUDOERS" <<SUDO
-# Installed by Insomnia install.sh. Exactly three commands, nothing else.
-$USER_NAME ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0
-$USER_NAME ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 1
-$USER_NAME ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 0
-SUDO
 # What a stop says about a sudo call made here that did not answer in time.
 sudo_stalled_note() { # rc what
   if (( $1 == 125 )); then
@@ -710,6 +752,49 @@ can take it again and undo a session left over.
 FAIL
   fi
 }
+read_rc=0
+bounded "$SUDO" -n "$CAT" "$SUDOERS" || read_rc=$?
+if (( read_rc == 124 || read_rc == 125 )); then
+  echo >&2
+  sudo_stalled_note "$read_rc" "Install stopped: 'sudo cat', which reads $SUDOERS,"
+  echo "$SUDOERS, the app at $APP and the LaunchAgent were not touched; the new build was discarded. Rerun this script." >&2
+  unchanged_note
+  exit 1
+fi
+rule_text=""
+if (( read_rc == 0 && BOUNDED_WHOLE )); then
+  rule_text="$BOUNDED_OUTPUT"
+elif ! (( read_rc == 1 && BOUNDED_WHOLE )) || [[ "$BOUNDED_OUTPUT" != "cat: $SUDOERS: No such file or directory" ]]; then
+  # A failed read prints its first line, which is sudo's or cat's message;
+  # the text of a read that ended 0 is the rule's, and is not printed.
+  if (( read_rc != 0 )) && [[ -n "$BOUNDED_OUTPUT" ]]; then printf '%s\n' "${BOUNDED_OUTPUT%%$'\n'*}" >&2; fi
+  echo "'sudo cat' exited $read_rc reading $SUDOERS, or what it printed could not be read whole, so the lines other accounts on this Mac have in it are unknown. $SUDOERS was not touched." >&2
+  unchanged_note
+  exit 1
+fi
+rule_lines "$rule_text"
+if [[ -n "$rule_odd" ]]; then
+  cat >&2 <<FAIL
+Install stopped: line $rule_odd of $SUDOERS is not one install.sh writes, so what
+it grants, and to whom, is not known here. The file is one for every account on
+this Mac, and install.sh rewrites it whole. Move that line to a file of its own
+in /etc/sudoers.d, or remove it ('sudo visudo -f $SUDOERS'), then rerun this
+script. $SUDOERS was not touched.
+FAIL
+  unchanged_note
+  exit 1
+fi
+TMP_SUDOERS="$("$MKTEMP")"
+"$CAT" > "$TMP_SUDOERS" <<SUDO
+$RULE_HEADER
+$USER_NAME ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0
+$USER_NAME ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 1
+$USER_NAME ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 0
+SUDO
+printf '%s' "$rule_others" >> "$TMP_SUDOERS"
+if [[ -n "$rule_names" ]]; then
+  echo "keeping the lines of the other accounts on this Mac that $SUDOERS holds: $rule_names"
+fi
 validate_rc=0
 bounded "$SUDO" -n "$VISUDO" -cf "$TMP_SUDOERS" || validate_rc=$?
 if (( validate_rc == 124 || validate_rc == 125 )); then
@@ -814,9 +899,9 @@ receipt_base_problem() {
 # Prints the receipt's access control entries as `ls -le` shows them: none
 # (it has no entry), ours (exactly the one this script adds), or other
 # (anything else, or a list that could not be read). Only `user:<name>
-# allow read`, as entry 0 and alone, with `id -u <name>` this user's uid,
-# is ours. ls(1) prints `inherited` after the name of an inherited entry,
-# every right after `allow` or `deny`, and a UUID in place of
+# allow read`, as entry 0 and alone, with `id -u <name>` this user's uid
+# (uid_of), is ours. ls(1) prints `inherited` after the name of an
+# inherited entry, every right after `allow` or `deny`, and a UUID in place of
 # `user:<name>` for an account the directory cannot name (file_cmds
 # ls/print.c), so each of those is other. It never prints synchronize,
 # prints the rights and flags only folders use only for a folder, and
@@ -835,7 +920,7 @@ receipt_entries() {
     return 0
   fi
   name="$(printf '%s\n' "$listing" | /usr/bin/awk 'NR == 1 { k = /^-/ }; NR == 2 && k && /^ 0: user:[^ :]+ allow read$/ { n = substr($2, 6) }; END { if (NR == 2) print n }')"
-  if [[ -n "$name" ]] && [[ "$("$ID" -u -- "$name" 2>/dev/null)" == "$UID_NUM" ]]; then
+  if [[ -n "$name" ]] && [[ "$(uid_of "$name")" == "$UID_NUM" ]]; then
     echo ours
   else
     echo other
@@ -1518,7 +1603,47 @@ CANDIDATE="$CANDIDATE_DIR/$LABEL.candidate-$$.plist"
 "$MKDIR" -p "$CANDIDATE_DIR"
 # Leftovers of earlier attempts, including an older build's candidates in
 # $LAUNCH_AGENTS itself (those make launchd's login load report an error).
-"$RM" -f "$CANDIDATE_DIR/$LABEL.candidate-"* "$LAUNCH_AGENTS/$LABEL.candidate-"*
+# Every Insomnia folder of this user names its candidates the same way, and
+# another folder whose LaunchAgents folder is a link to this one writes its
+# candidates here, so only a regular file this user owns whose
+# ProgramArguments run this install's bundle (or, for a build before the
+# sealed bundle, the writable backstop.sh of this folder) is removed. Another
+# account that shares this LaunchAgents folder runs the same bundle, but
+# owns its own candidates. Anything else stays and is named.
+leftover_runs() { # candidate -> what it runs, or nothing
+  local n first rc=0
+  bounded "$PLUTIL" -extract ProgramArguments raw -o - "$1" || rc=$?
+  (( rc == 0 && BOUNDED_WHOLE )) || return 0
+  n="$BOUNDED_OUTPUT"
+  rc=0; bounded "$PLUTIL" -extract ProgramArguments.0 raw -o - "$1" || rc=$?
+  (( rc == 0 && BOUNDED_WHOLE )) || return 0
+  first="$BOUNDED_OUTPUT"
+  if [[ "$n" == 6 && "$first" == /bin/sh ]]; then
+    rc=0; bounded "$PLUTIL" -extract ProgramArguments.5 raw -o - "$1" || rc=$?
+  elif [[ "$n" == 2 && "$first" == /bin/bash ]]; then
+    rc=0; bounded "$PLUTIL" -extract ProgramArguments.1 raw -o - "$1" || rc=$?
+  else
+    return 0
+  fi
+  if (( rc == 0 && BOUNDED_WHOLE )); then printf '%s' "$BOUNDED_OUTPUT"; fi
+}
+for leftover in "$CANDIDATE_DIR/$LABEL.candidate-"* "$LAUNCH_AGENTS/$LABEL.candidate-"*; do
+  [[ -e "$leftover" || -L "$leftover" ]] || continue
+  if [[ -L "$leftover" || ! -f "$leftover" ]]; then
+    echo "left $leftover: it is a link or not a regular file, so Insomnia did not write it"
+    continue
+  fi
+  if [[ ! -O "$leftover" ]]; then
+    echo "left $leftover: another user owns it, so it is that account's"
+    continue
+  fi
+  runs="$(leftover_runs "$leftover")"
+  if [[ "$runs" == "$APP" || "$runs" == "$APP_SUPPORT/backstop.sh" ]]; then
+    "$RM" -f "$leftover"
+  else
+    echo "left $leftover: it does not run $APP${runs:+ (it runs $runs)}, so it may be another Insomnia folder's"
+  fi
+done
 
 before="$(loaded_state)"
 

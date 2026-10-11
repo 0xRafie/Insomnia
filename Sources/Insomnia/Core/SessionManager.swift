@@ -603,10 +603,11 @@ final class SessionManager {
         keptRecheckDelay: Duration = .seconds(3),
         keptRecheckAttempts: Int = 20,
         keptRecheckSlowDelay: Duration = .seconds(60),
-        bootSession: String = SignalProcessControl.bootSession
+        bootSession: String = SignalProcessControl.bootSession,
+        sessionReadCheck: (@Sendable () throws -> Void)? = nil
     ) {
         self.paths = paths
-        self.store = Store(paths: paths)
+        self.store = Store(paths: paths, sessionReadCheck: sessionReadCheck)
         self.sleepGuard = sleepGuard
         self.processControl = processControl
         self.backstop = backstop
@@ -3650,33 +3651,54 @@ final class SessionManager {
         return .done
     }
 
-    /// With no session in memory, deletes session.json when it is the one
-    /// `attempt` wrote (its end is the start's deadline, and its id, when
-    /// both have one, the start's session id): that session
-    /// never began, and it must go before the settlement is published so
-    /// it is never resumed because a SleepDisabled 1 someone else set reads
-    /// as still off. Returns whether it deleted it.
-    private func removeSessionOfUnfinishedStart(_ attempt: SleepOffAttempt) throws -> Bool {
-        guard session == nil, let s = try? store.loadSession(), s.endsAt.timeIntervalSince1970.rounded(.down) == Double(attempt.deadline), s.sameID(as: attempt.session) != false else { return false }
-        try store.deleteSession()
-        Log.info("removed session.json of a start that never finished")
-        return true
+    /// Why a settlement could not decide what to do with session.json
+    /// (`sessionFileOfSettlement`).
+    private struct SessionFileProblem: Error {
+        let why: String
     }
 
-    /// The session a settlement of a start leaves to be resumed
-    /// (`SleepOffAttempt.resumes`): the one in memory, else session.json as
-    /// it is now, else none. A session.json whose bytes are not a session
-    /// names none, since nothing in it could be resumed. One that cannot
-    /// be read at all throws: the settlement is not published, its record
-    /// stays unsettled with its claim, and the next transaction reads it
-    /// again, after reconcile moved it aside.
-    private func sessionLeftToResume() throws -> ResumedSession {
-        if let session { return ResumedSession(session) }
+    /// Decides, from one read of session.json, whether it goes and which
+    /// session the settlement of `attempt` leaves to be resumed
+    /// (`SleepOffAttempt.resumes`). With a session in memory, that one is
+    /// named and the file is left alone. Otherwise a session.json that
+    /// `attempt` wrote (its end is the start's deadline, and its id, when
+    /// both have one, the start's session id) is of a session that never
+    /// began: it is deleted before the settlement is published, so it is
+    /// never resumed because a SleepDisabled 1 someone else set reads as
+    /// still off, and the settlement names none. Any other is named as it
+    /// is now; one whose bytes are not a session names none, since nothing
+    /// in it could be resumed. A read or a deletion that fails throws
+    /// (`SessionFileProblem`): the settlement is not published, its record
+    /// stays unsettled with its claim, and the next transaction reads
+    /// session.json again, after reconcile moved aside one it cannot read.
+    /// A read that fails is never taken for no session.json, and the file
+    /// is not read a second time, so a later read that succeeds cannot
+    /// name the start's own session as the one to resume.
+    private func sessionFileOfSettlement(_ attempt: SleepOffAttempt) throws -> (removed: Bool, resumes: ResumedSession) {
+        if let session { return (false, ResumedSession(session)) }
+        let onDisk: Session?
         do {
-            return try store.loadSession().map(ResumedSession.init) ?? .none
+            onDisk = try store.loadSession()
         } catch StoreError.unreadable(_, _) {
-            return .none
+            return (false, .none)
+        } catch {
+            throw SessionFileProblem(why: "session.json could not be read to name the session this settlement leaves (\(error.localizedDescription))")
         }
+        guard let s = onDisk, s.endsAt.timeIntervalSince1970.rounded(.down) == Double(attempt.deadline), s.sameID(as: attempt.session) != false else {
+            return (false, onDisk.map(ResumedSession.init) ?? .none)
+        }
+        do {
+            try store.deleteSession()
+        } catch {
+            throw SessionFileProblem(why: "session.json of that start could not be removed (\(error.localizedDescription))")
+        }
+        Log.info("removed session.json of a start that never finished")
+        return (true, .none)
+    }
+
+    /// The reason a `sessionFileOfSettlement` error gives.
+    private static func sessionFileWhy(_ error: Error) -> String {
+        (error as? SessionFileProblem)?.why ?? "session.json could not be read to name the session this settlement leaves (\(error.localizedDescription))"
     }
 
     /// Settles the start the journal still records (`sleepOffAttempt`)
@@ -3692,14 +3714,15 @@ final class SessionManager {
     /// everything, the record, the entry, session.json and the claim, holds
     /// the sleep undo (`keepAttempt`), and the next transaction reads the
     /// receipt again. Otherwise that start never finished, so its session
-    /// never began: its session.json goes first
-    /// (`removeSessionOfUnfinishedStart`). Then the journal records the
+    /// never began: one read of session.json decides whether it is that
+    /// start's, which goes first, and which session the settlement leaves
+    /// (`sessionFileOfSettlement`). Then the journal records the
     /// decision with the record marked settled: the sleep entry from before
     /// the start when no command for it turned sleep off, which keeps a
     /// restore an earlier session still owes, and the entry kept
     /// otherwise, so the restore runs like any other, and the session left
-    /// is named as the one to resume (`sessionLeftToResume`). Only then
-    /// does the claim go back and the record go. A removal, read or write
+    /// is named as the one to resume. Only then
+    /// does the claim go back and the record go. A read, removal or write
     /// that fails before the decision is published keeps the record
     /// unsettled with its claim, so the receipt's line still shows the
     /// same thing next time:
@@ -3748,22 +3771,16 @@ final class SessionManager {
         case let (_, .success(g)):
             held = g
         }
-        var removed = ""
-        do {
-            if try removeSessionOfUnfinishedStart(attempt) { removed = "; session.json of that start was removed" }
-        } catch {
-            let why = "session.json of that start could not be removed (\(error.localizedDescription))"
-            keepAttempt(attempt, verdict, because: why)
-            fail("could not settle an earlier start: \(why). Nothing was removed; its session is ended rather than resumed, starts are refused, and every run tries again")
-            return
-        }
+        let removed: String
         let resumes: ResumedSession
         do {
-            resumes = try sessionLeftToResume()
+            let file = try sessionFileOfSettlement(attempt)
+            removed = file.removed ? "; session.json of that start was removed" : ""
+            resumes = file.resumes
         } catch {
-            let why = "session.json could not be read to name the session this settlement leaves (\(error.localizedDescription))"
-            keepAttempt(attempt, verdict, because: why + removed)
-            fail("could not settle an earlier start: \(why)\(removed). The start stays recorded, starts are refused, and every run tries again")
+            let why = Self.sessionFileWhy(error)
+            keepAttempt(attempt, verdict, because: why)
+            fail("could not settle an earlier start: \(why). Nothing was removed; its session is ended rather than resumed, starts are refused, and every run tries again")
             return
         }
         let owes = verdict == .neverWrote ? attempt.owedBefore : true
@@ -3975,19 +3992,11 @@ final class SessionManager {
             switch outcome {
             case let .success(held):
                 defer { held.release() }
-                do {
-                    _ = try removeSessionOfUnfinishedStart(attempt)
-                } catch {
-                    let why = "session.json of that start could not be removed (\(error.localizedDescription))"
-                    keepAttempt(attempt, verdict, because: why)
-                    Log.error("the failed start stays recorded: \(why); the end below restores sleep and keeps the entry")
-                    break
-                }
                 let resumes: ResumedSession
                 do {
-                    resumes = try sessionLeftToResume()
+                    resumes = try sessionFileOfSettlement(attempt).resumes
                 } catch {
-                    let why = "session.json could not be read to name the session this settlement leaves (\(error.localizedDescription))"
+                    let why = Self.sessionFileWhy(error)
                     keepAttempt(attempt, verdict, because: why)
                     Log.error("the failed start stays recorded: \(why); the end below restores sleep and keeps the entry")
                     break

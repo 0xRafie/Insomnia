@@ -123,6 +123,9 @@ CMP=/usr/bin/cmp
 # it.
 ENV=/usr/bin/env
 PERL=/usr/bin/perl
+# id gives this account's name, which tells its lines in $SUDOERS from the
+# lines of other accounts (other_rules).
+ID=/usr/bin/id
 # The folder of the root-owned receipts install.sh made
 # (SleepOffReceipts.swift), and the one owner besides root it may have:
 # none, as uid 0 is root. Tests patch both lines in a private copy.
@@ -238,7 +241,8 @@ on_exit() {
 trap on_exit EXIT
 
 # Run one external call with a time limit. Its combined output is left in
-# BOUNDED_OUTPUT (trailing newline removed) and its exit status returned, or
+# BOUNDED_OUTPUT (trailing newline removed, and BOUNDED_NEWLINE 1 when there
+# was one) and its exit status returned, or
 # 124 when it did not finish within CALL_TIMEOUT_SECONDS and was stopped, or
 # 125 when it is sudo and still running. BOUNDED_WHOLE is 1 only when that
 # output was read whole; a caller that decides from the output treats 0 as
@@ -250,11 +254,13 @@ trap on_exit EXIT
 # an agent the app confirms after this run is gone.
 BOUNDED_OUTPUT=""
 BOUNDED_WHOLE=0
+BOUNDED_NEWLINE=0
 bounded() { # command args...
   local base supervisor rc deadline file="" size opened=0 read_rc=0
   base="$("$MKTEMP" "$WORK/call.XXXXXX")"
   BOUNDED_OUTPUT=""
   BOUNDED_WHOLE=0
+  BOUNDED_NEWLINE=0
   supervise "$base" "$@" </dev/null >/dev/null 2>&1 &
   supervisor=$!
   if [[ "$1" == "$SUDO" ]]; then
@@ -283,6 +289,7 @@ bounded() { # command args...
       BOUNDED_WHOLE=1
     fi
   fi
+  if [[ "$BOUNDED_OUTPUT" == *$'\n' ]]; then BOUNDED_NEWLINE=1; fi
   BOUNDED_OUTPUT="${BOUNDED_OUTPUT%$'\n'}"
   return "$rc"
 }
@@ -1215,10 +1222,26 @@ snap_read() { # keypath raw|json
 # known to put back, so nothing is changed; the exact command to undo each
 # one is printed instead, shell-quoted, since the list editor takes any
 # string. Checked: the shipped list plus config.json's agentList. Only a
-# read that says "does not exist" counts as clear; a read that fails any
-# other way is reported, not counted. Each read is bounded; one that does
-# not answer in time (cfprefsd stuck) ends the check, since the rest would
-# wait the same way, and uninstall goes on.
+# read that exits 1 and prints nothing but the message for a missing key
+# (read_says_missing) counts as clear; a read that fails any other way is
+# reported, not counted. Each read is bounded; one that does not answer in
+# time (cfprefsd stuck) ends the check, since the rest would wait the same
+# way, and uninstall goes on.
+# True when the last bounded call, `defaults read $1 NSAppSleepDisabled`,
+# exited 1 ($2) and its whole output is the message defaults prints for that
+# key missing, "The domain/default pair of ($1, NSAppSleepDisabled) does not
+# exist" and a newline, after at most one NSLog line (date, time,
+# defaults[pid:thread] and a space) printed in front of it. backstop.sh
+# makes the same check before it clears an App Nap entry.
+read_says_missing() { # bundle status
+  local data="$BOUNDED_OUTPUT" first
+  (( $2 == 1 && BOUNDED_WHOLE && BOUNDED_NEWLINE )) || return 1
+  first="${data%%$'\n'*}"
+  if [[ "$data" == *$'\n'* && "$first" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}\ defaults\[[0-9]+:[0-9a-f]+\]\ $ ]]; then
+    data="${data#*$'\n'}"
+  fi
+  [[ "$data" == "The domain/default pair of ($1, NSAppSleepDisabled) does not exist" ]]
+}
 list_unrecorded_app_nap() {
   local ids="" i=0 id value rc found=0 checked=0 unreadable=0 stuck="" skipped=0
   for id in "${DEFAULT_AGENTS[@]}"; do ids="$ids$id"$'\n'; done
@@ -1261,7 +1284,7 @@ list_unrecorded_app_nap() {
       continue
     fi
     if (( rc != 0 )); then
-      if [[ "$value" == *"does not exist"* ]]; then
+      if read_says_missing "$id" "$rc"; then
         checked=$((checked + 1))
       else
         unreadable=$((unreadable + 1))
@@ -1842,28 +1865,88 @@ read_access_lists() { # path...
 
 # Opens the receipt read-only on fd 7 and locks it as the root command does
 # (SleepOffReceipts.lock), exactly as backstop.sh's lock_receipt: only the
-# lstat type before the lock, every other check under it. Sets
+# stat type before the lock, every other check under it. Sets
 # receipt_locked, or receipt_lock_why and, for a receipt that stayed locked
-# or a lockf that failed, receipt_lock_busy=1, for a regular file that
-# could not be opened, receipt_unopened, and for a locked file a check
-# could not be made for, receipt_unknown. unlock_receipt closes fd 7.
+# or a lockf that failed, receipt_lock_busy=1, for a stat before the lock
+# or of the opened fd 7 that failed other than by finding nothing there,
+# receipt_unacquired=1, for a regular file that could not be opened,
+# receipt_unopened, and for a locked file a check could not be made for,
+# receipt_unknown. As there, the read-only open follows no O_NONBLOCK: a
+# FIFO put in the receipt's place can block it until a writer opens the
+# FIFO, before lockf's timeout starts. unlock_receipt closes fd 7.
 receipt_locked=""
+# One stat of path $2 with format $1, told apart as the app's lstat does:
+# stat_seen is "found" with stat_out its line, "gone" when stat found
+# nothing there (ENOENT, ENOTDIR), or "unread" with stat_err for any other
+# failure, which shows nothing about the path. The status and message come
+# from that one call: a failed stat prints only its message.
+stat_path() { # format path
+  local out
+  out="$("$STAT" -f "$1" "$2" 2>&1; echo ".$?")"
+  stat_rc="${out##*.}"; out="${out%.*}"; out="${out%$'\n'}"
+  stat_out=""; stat_err=""
+  if [[ "$stat_rc" == 0 ]]; then stat_seen=found; stat_out="$out"; return 0; fi
+  case "$out" in
+    "stat: $2: stat: No such file or directory"|"stat: $2: stat: Not a directory") stat_seen=gone ;;
+    *) stat_seen=unread; stat_err="${out:-no message} (stat exit ${stat_rc:-none})" ;;
+  esac
+}
+# Under the receipt's lock: true while path $1 still names the locked file
+# $2. Otherwise closes fd 7 and says why: the file was removed or another
+# put in its place, which the receipt then shows nothing through, or stat
+# failed or printed no identity, which leaves the locked file unknown
+# (receipt_unknown), as the app's Unread under the lock.
+receipt_still_locked() { # path identity
+  stat_path '%d:%i' "$1"
+  if [[ "$stat_seen" == found && "$stat_out" == "$2" ]]; then return 0; fi
+  exec 7<&-
+  if [[ "$stat_seen" == gone ]]; then
+    receipt_lock_why="$1 was removed while it was locked"
+  elif [[ "$stat_seen" == found && "$stat_out" =~ ^[0-9]+:[0-9]+$ ]]; then
+    receipt_lock_why="$1 was replaced while it was locked"
+  elif [[ "$stat_seen" == found ]]; then
+    receipt_unknown="$2"; receipt_lock_why="stat printed no identity for $1 once it was locked"
+  else
+    receipt_unknown="$2"; receipt_lock_why="$1 could not be examined once it was locked: $stat_err"
+  fi
+  return 1
+}
 lock_receipt() {
   local f="$RECEIPTS/$UID_NUM" why rc=0 found opened
-  receipt_locked=""; receipt_lock_why=""; receipt_lock_busy=0; receipt_read=0; receipt_unopened=""; receipt_unknown=""
-  found="$("$STAT" -f '%HT %d:%i' "$f" 2>/dev/null)" || found=""
-  if [[ "$found" != "Regular File "?* ]]; then
+  receipt_locked=""; receipt_lock_why=""; receipt_lock_busy=0; receipt_read=0; receipt_unopened=""; receipt_unknown=""; receipt_unacquired=0
+  stat_path '%HT %d:%i' "$f"
+  if [[ "$stat_seen" == gone ]]; then
     receipt_lock_why="$f is missing, is not the 82-byte file install.sh made, mode 600, or someone other than root can change it or a folder above it"
     return 0
   fi
-  found="${found##* }"
+  if [[ "$stat_seen" != found ]]; then
+    receipt_unacquired=1
+    receipt_lock_why="$f could not be examined before its lock: $stat_err"
+    return 0
+  fi
+  if ! [[ "$stat_out" =~ ^([A-Za-z][A-Za-z ]*)\ ([0-9]+:[0-9]+)$ ]]; then
+    receipt_unacquired=1
+    receipt_lock_why="stat printed no type and identity for $f before its lock"
+    return 0
+  fi
+  if [[ "${BASH_REMATCH[1]}" != "Regular File" ]]; then
+    receipt_lock_why="$f is missing, is not the 82-byte file install.sh made, mode 600, or someone other than root can change it or a folder above it"
+    return 0
+  fi
+  found="${BASH_REMATCH[2]}"
   if ! { exec 7<"$f"; } 2>/dev/null; then
     receipt_unopened="$found"
     receipt_lock_why="$f could not be opened to be locked"
     return 0
   fi
   opened="$("$STAT" -f '%d:%i' <&7 2>/dev/null)" || opened=""
-  if [[ -z "$opened" || "$opened" != "$found" ]]; then
+  if ! [[ "$opened" =~ ^[0-9]+:[0-9]+$ ]]; then
+    exec 7<&-
+    receipt_unacquired=1
+    receipt_lock_why="$f could not be examined once it was opened (stat of fd 7 printed no identity)"
+    return 0
+  fi
+  if [[ "$opened" != "$found" ]]; then
     exec 7<&-
     receipt_lock_why="$f changed while it was opened"
     return 0
@@ -1879,21 +1962,16 @@ lock_receipt() {
     fi
     return 0
   fi
-  if [[ "$opened" == "$("$STAT" -f '%d:%i' "$f" 2>/dev/null)" ]]; then
-    receipt_unsafe "$f" "$UID_NUM"
-    why="$unsafe_why"
-    if [[ -n "$why" ]]; then
-      exec 7<&-
-      receipt_lock_why="$why"
-      (( unsafe_unknown )) && receipt_unknown="$opened"
-      return 0
-    fi
-  fi
-  if [[ "$opened" != "$("$STAT" -f '%d:%i' "$f" 2>/dev/null)" ]]; then
+  receipt_still_locked "$f" "$opened" || return 0
+  receipt_unsafe "$f" "$UID_NUM"
+  why="$unsafe_why"
+  if [[ -n "$why" ]]; then
     exec 7<&-
-    receipt_lock_why="$f was replaced while it was locked"
+    receipt_lock_why="$why"
+    (( unsafe_unknown )) && receipt_unknown="$opened"
     return 0
   fi
+  receipt_still_locked "$f" "$opened" || return 0
   receipt_locked="$opened"
 }
 unlock_receipt() {
@@ -1987,6 +2065,10 @@ attempt_verdict() { # nonce predecessor identity expires now has-marker
   until="until $("$DATE" -u -r "$4" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "$4")"
   if (( receipt_lock_busy )); then
     verdict=undecided; verdict_why="$receipt_lock_why"
+    return 0
+  fi
+  if (( receipt_unacquired )); then
+    verdict=undecided; verdict_why="$receipt_lock_why; a command for that start may hold its lock"
     return 0
   fi
   if [[ -n "$receipt_unopened" && "$receipt_unopened" == "$3" ]]; then
@@ -2198,6 +2280,8 @@ settle_attempt() {
   attempt_verdict "$nonce" "$pred" "$receipt" "$expires" "$now" "$has_marker"
   if [[ "$verdict" == undecided && -n "$receipt_unknown" ]]; then
     settle_stop "it is not settled yet ($verdict_why). It can be settled once the receipt's checks can be made"
+  elif [[ "$verdict" == undecided ]] && (( receipt_unacquired )); then
+    settle_stop "it is not settled yet ($verdict_why). It can be settled once the receipt can be examined"
   elif [[ "$verdict" == undecided ]]; then
     settle_stop "it is not settled yet ($verdict_why). Wait for that to pass: a start's password dialog can be answered for about two minutes after it was shown, and a command it started holds the receipt until pmset exits"
   fi
@@ -2933,14 +3017,17 @@ MSG
   exit 1
 }
 # Another folder's agent is loaded: it stays loaded, and the rule, the
-# receipt and the bundle it runs stay with it (keep_shared).
+# receipt and the bundle it runs stay with it (keep_shared). The file it
+# was loaded from stays too (other_agent_files, see remove_plist).
 agent_kept=0
+other_agent_files=()
 keep_for_other_agent() {
   keep_shared=1
   if (( ! agent_kept )); then
     kept_why="${kept_why:+$kept_why, and }the recovery agent loaded as $LABEL is another Insomnia folder's ($agent_path)"
   fi
   agent_kept=1
+  other_agent_files+=("$agent_path")
   echo "kept for another Insomnia folder of this user: the recovery agent loaded as $LABEL comes from $agent_path, not from $LAUNCH_AGENTS; it stays loaded, and $SUDOERS, the receipt and $APP, which it runs, stay"
 }
 
@@ -3066,10 +3153,25 @@ restore_agent() {
     root_running=0
     echo "That command has ended." >&2
   fi
-  if [[ ! -f "$PLIST" ]]; then
-    echo "The LaunchAgent could not be loaded again: $PLIST is gone." >&2
-    return 0
-  fi
+  # Only from a plist that is this folder's (own_plist): one that another
+  # folder put at this path since, through a shared LaunchAgents folder,
+  # is that folder's to load.
+  own_plist "$PLIST"
+  case "$plist_seen" in
+    own) ;;
+    gone)
+      echo "The LaunchAgent could not be loaded again: $PLIST is gone." >&2
+      return 0 ;;
+    odd)
+      echo "The LaunchAgent was not loaded again: $PLIST is now a link or not a regular file, which Insomnia never writes." >&2
+      return 0 ;;
+    other)
+      echo "The LaunchAgent was not loaded again: $plist_whose, so $PLIST is now another Insomnia folder's." >&2
+      return 0 ;;
+    *)
+      echo "The LaunchAgent was not loaded again: $plist_why, so whether $PLIST is still this folder's is unknown. If it is, load it yourself: launchctl bootstrap gui/$UID_NUM $PLIST" >&2
+      return 0 ;;
+  esac
   bounded "$LAUNCHCTL" bootstrap "gui/$UID_NUM" "$PLIST" || rc=$?
   if (( rc == 0 )); then
     echo "The LaunchAgent was loaded again from $PLIST." >&2
@@ -3125,6 +3227,85 @@ other_accounts() {
   if (( odd > 0 )); then
     rule_why="${rule_why:+$rule_why, and }$RECEIPTS holds names install.sh does not make ($odd), so whether another account uses the rule is unknown"
   fi
+}
+# The account's name, checked as install.sh checks it: the one id gives for
+# this uid, and mapping back to it, with no byte sudoers would read as its
+# syntax.
+account_name_ok() { local LC_ALL=C; [[ -n "$1" && "$1" != [.-]* && "$1" != *[!A-Za-z0-9_.-]* ]]; }
+# Prints the uid `id -u` gives for account name $1, only when id exits 0:
+# what it printed before a failure counts for nothing.
+uid_of() { # name
+  local out
+  out="$("$ID" -u -- "$1" 2>/dev/null)" || return 0
+  printf '%s' "$out"
+}
+# $SUDOERS is one file for every account on this Mac: each account's
+# install.sh writes that account's three lines in it, and keeps the lines
+# of the others. rule_lines reads the file's text ($1) line by line. The
+# lines of another account that are one of the three go into rule_others
+# (each once, in their order) and that account's name into rule_names. The
+# lines of this account ($USER_NAME), any account's line for turning sleep
+# off, which an older build wrote, a header install.sh writes and an empty
+# line are passed over. The number of the first other line, which
+# install.sh never wrote and sudo may read as a rule or a directive of its
+# own (#include is one), goes into rule_odd, and the reading stops there.
+RULE_HEADER="# Installed by Insomnia install.sh. Exactly three commands for each account, nothing else."
+rule_lines() { # text
+  local line name what n=0
+  rule_others=""; rule_names=""; rule_odd=""
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$((n + 1))
+    case "$line" in
+      ""|"$RULE_HEADER"|"# Installed by Insomnia install.sh. Exactly three commands, nothing else."|"# Installed by Insomnia install.sh. Exactly four commands, nothing else.") continue ;;
+    esac
+    if ! [[ "$line" =~ ^([^\ ]+)\ ALL=\(root\)\ NOPASSWD:\ /usr/bin/pmset\ (-a\ disablesleep\ [01]|-b\ lowpowermode\ [01])$ ]]; then
+      rule_odd="$n"; return 0
+    fi
+    name="${BASH_REMATCH[1]}"; what="${BASH_REMATCH[2]}"
+    if ! account_name_ok "$name"; then rule_odd="$n"; return 0; fi
+    [[ "$name" != "$USER_NAME" ]] || continue
+    case "$what" in "-a disablesleep 0"|"-b lowpowermode "[01]) ;; *) continue ;; esac
+    [[ $'\n'"$rule_others" == *$'\n'"$line"$'\n'* ]] || rule_others+="$line"$'\n'
+    [[ " $rule_names " == *" $name "* ]] || rule_names="${rule_names:+$rule_names }$name"
+  done <<< "$1"
+}
+# The rule's own lines decide too: each account's install.sh keeps the
+# lines of the others in $SUDOERS (rule_lines), those of an account that
+# has no receipt here included (an older build made none). other_rules,
+# run when the receipts show no other account, reads the rule as root and
+# sets rule_why when it holds a line of another account or a line
+# install.sh never wrote, or when what it printed cannot be read whole, or
+# when this account's name, which tells its lines from the others', cannot
+# be checked; the rule then stays, as for another account's receipt. A
+# rule that is not there leaves rule_why empty. It returns 1, with
+# root_why, when the read as root failed or did not answer: the uninstall
+# stops there, as at a failed removal.
+USER_NAME=""
+other_rules() {
+  local rc=0 name
+  name="$("$ID" -un 2>/dev/null)" || name=""
+  if ! account_name_ok "$name" || [[ "$(uid_of "$name")" != "$UID_NUM" ]]; then
+    rule_why="the account name of uid $UID_NUM (${name:-none}) could not be checked, so whether $SUDOERS holds the lines of another account is unknown"
+    return 0
+  fi
+  USER_NAME="$name"
+  as_root "$CAT" "$SUDOERS" || rc=$?
+  if (( rc == 1 && BOUNDED_WHOLE )) && [[ "$BOUNDED_OUTPUT" == "cat: $SUDOERS: No such file or directory" ]]; then
+    root_why=""
+    return 0
+  fi
+  (( rc == 0 )) || return 1
+  if (( ! BOUNDED_WHOLE )); then
+    rule_why="what 'sudo -n $CAT $SUDOERS' printed could not be read whole, so whether the rule holds the lines of another account is unknown"
+    return 0
+  fi
+  rule_lines "$BOUNDED_OUTPUT"
+  if [[ -n "$rule_odd" ]]; then
+    rule_why="line $rule_odd of $SUDOERS is not one install.sh writes, so whether another account uses the rule is unknown"
+  elif [[ -n "$rule_names" ]]; then
+    rule_why="$SUDOERS holds the lines of another account on this Mac ($rule_names)"
+  fi
+  return 0
 }
 # Stops the uninstall after the rule went or was kept: what was kept, and
 # why.
@@ -3240,16 +3421,173 @@ esac
 # directory goes only once empty. Removed once the shared files are gone,
 # just before the bundle, or now when they stay: until then a stop loads
 # the agent again from the plist (restore_agent).
+# Every Insomnia folder of this user names its plist and candidates the
+# same way, so a LaunchAgents folder that two folders share (one of them,
+# or both, reach it through a link) holds files of either. A name, or a
+# path under $LAUNCH_AGENTS, is not enough to tell whose a file is, and
+# remove_plist removes only what is this folder's (own_plist).
 remove_plists() {
   local candidate
-  "$RM" -f "$PLIST"
   agent_out=0
+  agents_dir_home
+  case "$agents_home" in
+    none)
+      echo "no $LAUNCH_AGENTS"
+      return 0 ;;
+    other)
+      echo "kept the LaunchAgent files in $LAUNCH_AGENTS: it leads into another folder ($agents_where), so they are that folder's"
+      return 0 ;;
+    unknown)
+      echo "Kept the LaunchAgent files in $LAUNCH_AGENTS: $agents_why, so whether that folder is this Insomnia folder's is unknown. Rerun this script once it answers." >&2
+      remove_failures=$((remove_failures + 1))
+      return 0 ;;
+  esac
+  remove_plist "$PLIST"
   CANDIDATE_DIR="$LAUNCH_AGENTS/.$LABEL.staging"
   for candidate in "$CANDIDATE_DIR/$LABEL.candidate-"* "$LAUNCH_AGENTS/$LABEL.candidate-"*; do
-    if [[ -f "$candidate" && ! -L "$candidate" ]]; then "$RM" -f "$candidate"; fi
+    [[ -e "$candidate" || -L "$candidate" ]] || continue
+    remove_plist "$candidate"
   done
+  # rmdir removes only an empty folder; one that still holds another
+  # folder's candidate stays.
   if [[ -d "$CANDIDATE_DIR" && ! -L "$CANDIDATE_DIR" ]]; then "$RMDIR" "$CANDIDATE_DIR" 2>/dev/null || true; fi
-  echo "removed $PLIST"
+}
+# Whether $LAUNCH_AGENTS is within this folder: the folder above it, after
+# any link on the way, is the folder $LAUNCH_AGENTS names it under, by
+# device and inode (path_identity). A link to this whole folder (or /var
+# for /private/var) is still this folder. A LaunchAgents folder that is a
+# link into another folder is not: what is in it belongs to that folder,
+# whose agent launchd may load from it. Sets agents_home to own; none when
+# there is no such folder (nothing to remove); other, with agents_where
+# (the folder it leads into, as stat names it); or unknown, with
+# agents_why, when one of the two folders could not be identified.
+agents_dir_home() {
+  local rc=0 up
+  agents_home=unknown; agents_why=""; agents_where=""
+  [[ -e "$LAUNCH_AGENTS" || -L "$LAUNCH_AGENTS" ]] || { agents_home=none; return 0; }
+  path_identity "${LAUNCH_AGENTS%/*}" || rc=$?
+  if (( rc != 0 )); then agents_why="$own_why"; return 0; fi
+  up="$path_id"
+  rc=0; path_identity "$LAUNCH_AGENTS/.." || rc=$?
+  case "$rc" in
+    0)
+      if [[ "$path_id" == "$up" ]]; then agents_home=own; return 0; fi
+      agents_home=other
+      agents_where="the folder above it is $path_id by device and inode, not ${LAUNCH_AGENTS%/*}, which is $up" ;;
+    # A link to nothing: there is nothing in it to remove.
+    1) agents_home=none ;;
+    *) agents_why="$own_why" ;;
+  esac
+}
+# Whose the plist or candidate $1 is, from what it runs. It is read from a
+# private copy (copy_private: a regular file, not a link, read whole),
+# never in place. install.sh and the app write ProgramArguments
+# /bin/sh -c <program> sh <requirement> <bundle>; builds before the sealed
+# bundle wrote /bin/bash <their folder>/backstop.sh. It is this folder's
+# when that bundle is $APP, or that script $APP_SUPPORT/backstop.sh: the
+# same path, or the same name in a folder that is this one's by device and
+# inode (a link to this whole folder), and the file is this user's: the
+# plist of another account whose LaunchAgents folder is shared with this
+# one runs the same bundle, but that account owns it. Two folders of this
+# user that run one bundle write the same bytes; their plists cannot be
+# told apart, and one of them counts as this folder's. Sets plist_seen to
+# own (plist_id: the identity it was read with), other (plist_whose says
+# why: it runs another bundle or script, or another user owns it), gone
+# (no such file now), odd (a link or not a regular file, which Insomnia
+# never writes) or unknown (with plist_why). A change of owner
+# after the read changes the file's change time, so remove_plist's
+# identity check before the rm sees it.
+own_plist() { # path
+  local rc=0 n first runs want mine
+  plist_seen=unknown; plist_why=""; plist_id=""; plist_whose=""
+  [[ -e "$1" || -L "$1" ]] || { plist_seen=gone; return 0; }
+  copy_private "$1" agent.plist || rc=$?
+  case "$rc" in
+    0) ;;
+    4) plist_seen=odd; return 0 ;;
+    *) plist_why="it could not be read ($copy_why)"; return 0 ;;
+  esac
+  plist_id="$copy_id"
+  if [[ ! -O "$1" ]]; then
+    plist_seen=other; plist_whose="another user owns it"
+    return 0
+  fi
+  n="$(plutil_on -extract ProgramArguments raw -o - "$copy_path" 2>/dev/null)" || n=""
+  first="$(plutil_on -extract ProgramArguments.0 raw -o - "$copy_path" 2>/dev/null)" || first=""
+  if [[ "$n" == 6 && "$first" == /bin/sh ]]; then
+    want="$APP"
+    runs="$(plutil_on -extract ProgramArguments.5 raw -o - "$copy_path" 2>/dev/null)" || runs=""
+  elif [[ "$n" == 2 && "$first" == /bin/bash ]]; then
+    want="$APP_SUPPORT/backstop.sh"
+    runs="$(plutil_on -extract ProgramArguments.1 raw -o - "$copy_path" 2>/dev/null)" || runs=""
+  else
+    plist_why="its ProgramArguments are not the ones Insomnia writes"
+    return 0
+  fi
+  if [[ "$runs" != /* ]]; then
+    plist_why="what its ProgramArguments run is not an absolute path"
+    return 0
+  fi
+  plist_whose="it runs $runs, not this folder's ${want##*/}"
+  if [[ "$runs" == "$want" ]]; then plist_seen=own; return 0; fi
+  if [[ "${runs##*/}" != "${want##*/}" ]]; then plist_seen=other; return 0; fi
+  path_identity "${want%/*}" || { plist_why="it runs $runs, and ${want%/*} could not be identified ($own_why)"; return 0; }
+  mine="$path_id"
+  rc=0; path_identity "${runs%/*}" || rc=$?
+  case "$rc" in
+    0) if [[ "$path_id" == "$mine" ]]; then plist_seen=own; else plist_seen=other; fi ;;
+    # Its folder is gone or cannot be reached; this folder's can.
+    1) plist_seen=other ;;
+    *) plist_why="it runs $runs, whose folder could not be identified ($own_why)" ;;
+  esac
+}
+# Whether $1 is the file launchd loaded another folder's agent from
+# (other_agent_files): the same name in a folder that is the same by
+# device and inode, its staging folder for a candidate. A folder that
+# cannot be identified counts as the same.
+another_agents_file() { # path
+  local f rc
+  for f in ${other_agent_files[@]+"${other_agent_files[@]}"}; do
+    [[ "${f##*/}" == "${1##*/}" ]] || continue
+    [[ "$f" != "$1" ]] || return 0
+    rc=0; path_identity "${1%/*}" || rc=$?
+    (( rc != 1 )) || continue
+    (( rc == 0 )) || return 0
+    local here="$path_id"
+    rc=0; path_identity "${f%/*}" || rc=$?
+    (( rc != 1 )) || continue
+    if (( rc != 0 )) || [[ "$path_id" == "$here" ]]; then return 0; fi
+  done
+  return 1
+}
+# Removes the plist or candidate $1 when it is this folder's (own_plist),
+# is not the file another folder's loaded agent came from, and is still
+# the file it read just before the rm. A file that cannot be told stays
+# and counts as one that could not be removed.
+remove_plist() { # path
+  own_plist "$1"
+  if [[ "$plist_seen" == own ]] && another_agents_file "$1"; then
+    echo "kept $1: the recovery agent of another Insomnia folder, which stays loaded, was loaded from it"
+    return 0
+  fi
+  case "$plist_seen" in
+    gone) [[ "$1" != "$PLIST" ]] || echo "no $PLIST" ;;
+    own)
+      if [[ "$(file_id "$1")" != "$plist_id" ]]; then
+        echo "Kept $1: it changed after it was read, so whether it is still this folder's is unknown. Rerun this script." >&2
+        remove_failures=$((remove_failures + 1))
+      elif "$RM" -f "$1"; then
+        echo "removed $1"
+      else
+        echo "Could not remove $1; left in place." >&2
+        remove_failures=$((remove_failures + 1))
+      fi ;;
+    other) echo "kept $1: $plist_whose, so it is another Insomnia folder's" ;;
+    odd) echo "Left $1: it is a link or not a regular file, so Insomnia did not write it." ;;
+    *)
+      echo "Kept $1: $plist_why, so whether it is this folder's is unknown." >&2
+      remove_failures=$((remove_failures + 1)) ;;
+  esac
 }
 
 if (( keep_shared )); then
@@ -3268,6 +3606,16 @@ MSG
     exit 1
   fi
   other_accounts
+  if [[ -z "$rule_why" ]] && ! other_rules; then
+    "$CAT" >&2 <<MSG
+
+Uninstall stopped after booting out the LaunchAgent: $root_why.
+$SUDOERS, $APP, the receipt and the journal were kept. Rerun this script once
+nothing above is still running.
+MSG
+    restore_agent
+    exit 1
+  fi
   if [[ -n "$rule_why" ]]; then
     rule_step="keeping $SUDOERS for another account"
     echo "kept $SUDOERS: $rule_why, and that account's recovery agent may need the rule"

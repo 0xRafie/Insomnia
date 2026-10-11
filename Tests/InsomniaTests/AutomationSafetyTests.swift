@@ -396,7 +396,7 @@ final class TmuxLiveRunnerTests: XCTestCase {
     /// reach the pane in order, so once `X` is in the file, everything the
     /// nudge sent is too, however slow the pane.
     func testLivePaneGetsContinueWithoutEnterByDefault() async throws {
-        let received = FileManager.default.temporaryDirectory
+        let received = TestScratch.directory
             .appendingPathComponent("insomnia-nudge-\(UUID().uuidString).txt")
         defer { try? FileManager.default.removeItem(at: received) }
         // tmux runs the command through sh -c: quote the path for it.
@@ -774,8 +774,9 @@ final class DockerRuleEndpointTests: XCTestCase {
     private var dir: URL!
 
     override func setUpWithError() throws {
-        // Short path: sockaddr_un limits socket paths to ~104 bytes.
-        dir = URL(fileURLWithPath: "/tmp/ins-\(getpid())-\(UInt16.random(in: 0...UInt16.max))", isDirectory: true)
+        // Short name: sockaddr_un limits socket paths to ~104 bytes, so the
+        // scratch folder's path must stay under about 80.
+        dir = TestScratch.directory.appendingPathComponent("ins-\(getpid())-\(UInt16.random(in: 0...UInt16.max))", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     }
 

@@ -54,6 +54,23 @@ enum ProcessTestHome {
     }
 }
 
+/// The folder every test makes its scratch files in: the one the loader
+/// made the process home in (insomnia_test_scratch_base), TMPDIR when the
+/// run set it to an absolute path. Foundation's temporaryDirectory may
+/// name Darwin's per-user temp dir whatever TMPDIR says, so no test uses it.
+enum TestScratch {
+    static let directory: URL = {
+        guard let raw = insomnia_test_scratch_base() else {
+            fatalError("InsomniaTestHome did not run at load; no scratch folder")
+        }
+        return URL(fileURLWithPath: String(cString: raw), isDirectory: true)
+    }()
+
+    /// `directory`'s path with a trailing slash, as TestScratch.pathWithSlash
+    /// gives it.
+    static var pathWithSlash: String { directory.path + "/" }
+}
+
 /// Creates a temp INSOMNIA_HOME and points the process environment at it.
 /// `destroy()` hands the variable back to `ProcessTestHome` rather than
 /// unsetting it, so nothing falls through to the real ~/Library afterwards.
@@ -62,7 +79,7 @@ final class TempHome {
     let paths: Paths
 
     init() {
-        root = FileManager.default.temporaryDirectory
+        root = TestScratch.directory
             .appendingPathComponent("insomnia-tests-\(UUID().uuidString)", isDirectory: true)
         try! FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         setenv(Paths.environmentKey, root.path, 1)
@@ -250,6 +267,34 @@ enum TestReceipts {
         """
     }
 
+    /// Writes an id(1) at `tool` that stands in for the root command's
+    /// `id -u -- <name>` and asks no directory: the test user's name
+    /// prints the test user's uid and daemon prints 1, both with status 0;
+    /// any other name prints id's message and exits 1. While `tool` +
+    /// ".mode" holds `output-then-fail`, a known name prints its uid and
+    /// then exits 1, which no caller may take as an answer.
+    static func writeFakeId(at tool: String) throws {
+        func quoted(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+        let me = String(cString: getpwuid(getuid()).pointee.pw_name)
+        let text = """
+        #!/bin/bash
+        [[ "${1:-}" == -u && "${2:-}" == -- && $# -eq 3 ]] || { echo "id: this stand-in does not answer: $*" >&2; exit 64; }
+        case "$3" in
+          \(quoted(me))) uid=\(getuid()) ;;
+          daemon) uid=1 ;;
+          *) echo "id: $3: no such user" >&2; exit 1 ;;
+        esac
+        mode=""
+        if [[ -f \(quoted(tool + ".mode")) ]]; then mode="$(/bin/cat \(quoted(tool + ".mode")))"; fi
+        echo "$uid"
+        if [[ "$mode" == output-then-fail ]]; then exit 1; fi
+        exit 0
+
+        """
+        try text.write(toFile: tool, atomically: true, encoding: .utf8)
+        XCTAssertEqual(chmod(tool, 0o755), 0)
+    }
+
     /// Lists of access control entries every receipt check refuses, as
     /// stand-ins with no real entry after them: no entry, and every way the
     /// list or its one entry can differ from the one install.sh adds that
@@ -386,7 +431,7 @@ enum FakeTool {
     }
 
     /// The launcher's folder, removed when the process that made it exits.
-    private static let folder = FileManager.default.temporaryDirectory
+    private static let folder = TestScratch.directory
         .appendingPathComponent("insomnia-fake-launcher-\(getpid())-\(UUID().uuidString)", isDirectory: true)
     private static let owner = getpid()
 
@@ -1444,7 +1489,8 @@ struct Harness {
     /// a wrapper around it, or the real PmsetSleepGuard against a fake
     /// sudo and pmset. `receipts` replaces the harness's receipt folder.
     /// `bootSession` stands in for `kern.bootsessionuuid`, for a launch
-    /// after a restart.
+    /// after a restart. `sessionReadCheck` runs before each read of
+    /// session.json and fails it by throwing (`Store.sessionReadCheck`).
     func makeManager(
         lockTimeout: TimeInterval = 0.3,
         retryDelay: TimeInterval = 60,
@@ -1458,7 +1504,8 @@ struct Harness {
         keyboard: (any KeyboardBacklighting)? = nil,
         sleepGuard: (any SleepGuarding)? = nil,
         receipts: SleepOffReceipts? = nil,
-        bootSession: String = SignalProcessControl.bootSession
+        bootSession: String = SignalProcessControl.bootSession,
+        sessionReadCheck: (@Sendable () throws -> Void)? = nil
     ) -> SessionManager {
         let c = clock
         let lid = clamshell
@@ -1485,7 +1532,8 @@ struct Harness {
             keptRecheckDelay: keptRecheckDelay,
             keptRecheckAttempts: keptRecheckAttempts,
             keptRecheckSlowDelay: keptRecheckSlowDelay,
-            bootSession: bootSession
+            bootSession: bootSession,
+            sessionReadCheck: sessionReadCheck
         )
     }
 }
@@ -2304,21 +2352,30 @@ final class RootCommandProcess {
     /// from the folder's path plus `.acl`, and a folder's entries from the
     /// folder's path plus `.acl.folders` (TestReceipts.writeFolderEntries).
     /// A test makes the receipt's listing fail by creating the folder's
-    /// path plus `.acl.fails`.
+    /// path plus `.acl.fails`. The command's `id -u -- <name>` is an id
+    /// (TestReceipts.writeFakeId, at the folder's path plus `.id`) that
+    /// asks no directory: it knows the test user's name and daemon's.
     static func withTestReceipts(_ command: String, _ receipts: SleepOffReceipts, trustTestUser: Bool = true) -> String {
         XCTAssertEqual(command.components(separatedBy: SleepOffReceipts.folder).count - 1, 1, "the command names the receipt folder once")
         XCTAssertEqual(command.components(separatedBy: "-v o=0 ").count - 1, 1, "the command's awk check trusts one owner besides root, uid 0, given once")
         XCTAssertEqual(command.components(separatedBy: realPerl).count - 1, 1, "the command writes the receipt with /usr/bin/perl, named once")
         XCTAssertEqual(command.components(separatedBy: receiptListing).count - 1, 1, "the command lists the receipt's entries once")
         XCTAssertEqual(command.components(separatedBy: folderListing).count - 1, 1, "the command lists the folders' entries once")
+        XCTAssertEqual(command.components(separatedBy: idLookup).count - 1, 1, "the command asks id for the entry's uid once")
         XCTAssertFalse(receipts.folder.contains(" "), "the fixture replaces an unquoted word")
         XCTAssertNoThrow(try TestReceipts.writeEntries(TestReceipts.entries(receipts), to: receipts.folder + ".acl"))
         XCTAssertNoThrow(try TestReceipts.writeFakeLs(at: receipts.folder + ".ls", receipt: receipts.file, entries: receipts.folder + ".acl"))
+        XCTAssertNoThrow(try TestReceipts.writeFakeId(at: receipts.folder + ".id"))
         return command.replacingOccurrences(of: SleepOffReceipts.folder, with: receipts.folder)
             .replacingOccurrences(of: "-v o=0 ", with: trustTestUser ? "-v o=\(getuid()) " : "-v o=0 ")
             .replacingOccurrences(of: receiptListing, with: receipts.folder + ".ls -le $f")
             .replacingOccurrences(of: folderListing, with: receipts.folder + ".ls -lde $d")
+            .replacingOccurrences(of: idLookup, with: receipts.folder + ".id -u -- ")
     }
+
+    /// How the command asks for the uid of the account the receipt's entry
+    /// names.
+    static let idLookup = "/usr/bin/id -u -- "
 
     /// How the command lists the receipt's access control entries.
     static let receiptListing = "/bin/ls -le $f"

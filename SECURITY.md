@@ -15,16 +15,19 @@ The installer grants the user account passwordless access to three exact pmset
 commands listed in the README: turn sleep back on (`pmset -a disablesleep 0`)
 and switch battery Low Power Mode on or off (`pmset -b lowpowermode 1` and
 `0`). This grant is not exclusive to the Insomnia app: other processes running
-as that user can invoke them too. None of them can keep the Mac awake. Turning
-sleep off (`pmset -a disablesleep 1`) has no passwordless line; the app runs it
-through the standard macOS administrator dialog, with a fixed command string,
-each time the user starts a session, and never on relaunch or from the recovery
-agent. That command turns sleep off only while the start that asked still
-holds its random nonce in `pending-start`, and only before the start's
-`expires` (the session's end, or 130 s after that file was written if
-sooner), which it receives as an argument and compares with the clock as
-root. It holds a `lockf` lock on that file, and an flock(2) lock on the
-user's receipt (below), from before the checks until pmset exits.
+as that user can invoke them too. The rule is one file,
+`/etc/sudoers.d/insomnia`, with those three lines for each account on the Mac
+that installed Insomnia: an install reads it first and keeps the other
+accounts' lines for the same three commands. None of them can keep the Mac
+awake. Turning sleep off (`pmset -a disablesleep 1`) has no passwordless
+line; the app runs it through the standard macOS administrator dialog, with a
+fixed command string, each time the user starts a session, and never on
+relaunch or from the recovery agent. That command turns sleep off only while
+the start that asked still holds its random nonce in `pending-start`, and
+only before the start's `expires` (the session's end, or 130 s after that
+file was written if sooner), which it receives as an argument and compares
+with the clock as root. It holds a `lockf` lock on that file, and an flock(2)
+lock on the user's receipt (below), from before the checks until pmset exits.
 The start deletes the file when it finishes, and the app at launch, the recovery agent and uninstall delete it
 under the recovery lock before they undo anything; every one of them takes the
 file's own lock first, and deletes it only while its path still names the
@@ -549,9 +552,17 @@ trace.
   and exits 1. It cannot tell another folder's setting from the user's own
   or another tool's, so a user who keeps sleep off or Low Power Mode on
   must switch it back for the uninstall to finish. The rule is one file
-  for every account on the Mac, and another account's install or
-  uninstall holds its own standard lock, so an uninstall in one account
-  can still remove the rule another account's restore needs, as on main.
+  for every account on the Mac. install.sh reads it as root before it
+  writes it and keeps every other account's line that is exactly one of
+  the three, drops every `disablesleep 1` line, and stops with nothing
+  changed at a line it never wrote or a read it cannot trust (round 41;
+  before, a second account's install took away the first account's
+  restore). uninstall.sh keeps it while the receipt folder or the rule
+  itself shows another account, or cannot rule one out, and then this
+  account's own three lines stay in it too. Another account's install or
+  uninstall holds its own standard lock and no lock spans accounts, so
+  two accounts that install or uninstall at the same moment can still
+  drop the lines or the rule the other's restore needs.
 - Every Insomnia folder of the user loads its recovery agent under the one
   label `com.insomnia.backstop`, and launchd holds one job for it, from
   whichever folder loaded it last. uninstall.sh boots that job out only

@@ -412,6 +412,18 @@ recovery; newly written journals use `frozenProcesses`.
   awake, unjournaled, with Insomnia not running. Turning sleep off goes
   through the administrator password dialog instead
   (`AdministratorPrompt.swift`).
+- The file is one for every account on the Mac, and each account that
+  installed has those three lines in it. install.sh reads it as root first
+  (`sudo -n cat`, under the recovery lock), writes this account's three
+  lines and keeps every other account's line that is exactly one of the
+  three, once each and in its order (`rule_lines`, round 41). It drops
+  every `disablesleep 1` line, which an older build wrote for its account,
+  and this account's older lines. A line it never wrote (a directive such
+  as `#include`, any other grant, a name sudoers or chmod would misread),
+  a read that fails or does not answer, or one not read whole stops it
+  with nothing changed. Before round 41 it wrote only its own account's
+  lines, so a second account's install took away the restore of the
+  first, whose journal could still owe it.
 - Turning sleep back on and the Low Power Mode floor stay passwordless so the
   app, `backstop.sh` and `uninstall.sh` can recover unattended: ending a
   stuck or crashed session must never need a password.
@@ -482,9 +494,18 @@ recovery; newly written journals use `frozenProcesses`.
   still removes this account's receipt, release file and the rest, while
   the receipt folder holds another account's receipt or release file, a
   name install.sh does not make, or cannot be listed whole (perl's
-  readdir under the call limit; `other_accounts`, round 36). No lock spans
-  accounts, so the listing cannot keep another account's install.sh from
-  writing the rule or a receipt just after it. install.sh refuses, changing nothing, at a folder
+  readdir under the call limit; `other_accounts`, round 36). When the
+  folder shows no other account, it reads the rule as root and keeps it
+  the same way while the rule holds a line of another account (whose
+  install, by an older build, may have made no receipt), a line
+  install.sh never wrote or output it cannot read whole, or while this
+  account's name, which tells its lines from the others', cannot be
+  checked; a read that fails stops it there, as a failed removal does
+  (`other_rules`, round 41). A kept rule keeps this account's lines too.
+  No lock spans accounts, so neither the listing nor the read can keep
+  another account's install.sh from writing the rule or a receipt just
+  after it, and two accounts' installs or uninstalls run at the same
+  moment can still drop each other's lines. install.sh refuses, changing nothing, at a folder
   or file that is not as it makes it, apart from the repair of an earlier
   receipt (section 1). No passwordless line covers the receipt.
 - `install.sh` never writes `disablesleep 1`, on any path. When
@@ -496,8 +517,9 @@ recovery; newly written journals use `frozenProcesses`.
   the app is still running after 15 s, and asks for the password once more
   if sudo's cached credential expired during the quit. It assembles the
   new bundle with `backstop.sh` sealed inside, then takes the recovery
-  lock, checks that the app was not opened again meanwhile, and writes the
-  three-line rule with `sudo -n` (`visudo -cf`, then `install`). It then
+  lock, checks that the app was not opened again meanwhile, reads the rule
+  and writes this account's three lines, with the other accounts' kept,
+  with `sudo -n` (`cat`, `visudo -cf`, then `install`). It then
   checks that `sudo -k -n -l` lists the three commands without a password
   and stops if not. That catches a rule sudo does not read, but a listing
   is not proof that the restore runs: it passes once any of the user's

@@ -184,7 +184,7 @@ final class AccessListsCommandTests: XCTestCase {
         XCTAssertEqual(usage.stdout, "usage\n")
         XCTAssertTrue(usage.stderr.contains("usage: Insomnia --access-lists"), usage.stderr)
 
-        let missing = NSTemporaryDirectory() + "insomnia-missing-\(UUID().uuidString)"
+        let missing = TestScratch.pathWithSlash + "insomnia-missing-\(UUID().uuidString)"
         let paths = [NSHomeDirectory(), "/private/var/db", "/usr/bin", "/", missing]
         let r = try runBinary(["--access-lists", "30"] + paths)
         let words = paths.map { AccessListsCommand.word(AccessListsCommand.native($0), user: getuid()) }

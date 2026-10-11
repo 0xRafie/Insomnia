@@ -106,7 +106,7 @@ final class PackagingTests: XCTestCase {
     private var scratch: URL!
 
     override func setUpWithError() throws {
-        scratch = FileManager.default.temporaryDirectory
+        scratch = TestScratch.directory
             .appendingPathComponent("insomnia-packaging-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
     }
@@ -739,7 +739,7 @@ private struct IconScriptFixture {
     private let fm = FileManager.default
 
     init() throws {
-        root = FileManager.default.temporaryDirectory.appendingPathComponent("icon-script-\(UUID().uuidString)", isDirectory: true)
+        root = TestScratch.directory.appendingPathComponent("icon-script-\(UUID().uuidString)", isDirectory: true)
         for dir in ["scripts", "Resources", "docs/assets", "bin", "tmp"] {
             try fm.createDirectory(at: root.appendingPathComponent(dir, isDirectory: true), withIntermediateDirectories: true)
         }

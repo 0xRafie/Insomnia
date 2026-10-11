@@ -7,7 +7,7 @@ final class BackstopVersionTests: XCTestCase {
     private var dir: URL!
 
     override func setUpWithError() throws {
-        dir = FileManager.default.temporaryDirectory.appendingPathComponent("insomnia-backstop-version-\(UUID().uuidString)", isDirectory: true)
+        dir = TestScratch.directory.appendingPathComponent("insomnia-backstop-version-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     }
 

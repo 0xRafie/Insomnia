@@ -533,6 +533,48 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual((try fx.stateJSON()["appNapOverrides"] as? [Any])?.count, 0)
     }
 
+    /// Round 41 (current item 5): after a failed delete, only a read that
+    /// exits 1 and prints nothing but the missing-key message for that
+    /// domain, after at most the one NSLog line macOS puts in front of it,
+    /// clears the entry. Every other answer is kept for the next run: the
+    /// message with another line, after two NSLog lines, with exit 2, before
+    /// a timeout, with a NUL byte, for another domain, without its newline,
+    /// and a value followed by exit 1.
+    func testOnlyTheExactMissingKeyAnswerClearsAnAppNapEntry() throws {
+        let answers: [(domain: String, kind: String, why: String?)] = [
+            ("com.example.NSLog", "nslog", nil),
+            ("com.example.Extra", "extra", "defaults read exited 1, but its output is not only the message for a missing key"),
+            ("com.example.Twice", "nslog-twice", "defaults read exited 1, but its output is not only the message for a missing key"),
+            ("com.example.Exit2", "exit2", "defaults read exited 2"),
+            ("com.example.Slow", "slow", "defaults read exited 124"),
+            ("com.example.Nul", "nul", "defaults read exited 1, but its output could not be read whole (it holds a NUL byte, which a copy kept in memory cannot hold, exit 2)"),
+            ("com.example.Named", "other", "defaults read exited 1, but its output is not only the message for a missing key"),
+            ("com.example.Partial", "partial", "defaults read exited 1, but its output is not only the message for a missing key"),
+            ("com.example.Value", "value", "defaults read exited 1, but its output is not only the message for a missing key"),
+        ]
+        let entries = answers.map { #"{"bundleId":"\#($0.domain)","note":"\#($0.kind)"}"# }.joined(separator: ",")
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"appNapOverrides":["# + entries + "]}")
+        try fx.defaultsAnswers(answers.map { ($0.domain, $0.kind) })
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertEqual(fx.calls().filter { $0.hasPrefix("defaults ") }, answers.flatMap {
+            ["defaults delete \($0.domain) NSAppSleepDisabled", "defaults read \($0.domain) NSAppSleepDisabled"]
+        })
+        let kept = try XCTUnwrap(try fx.stateJSON()["appNapOverrides"] as? [[String: Any]])
+        XCTAssertEqual(kept.map { $0["bundleId"] as? String }, answers.filter { $0.why != nil }.map { $0.domain })
+        XCTAssertEqual(kept.map { $0["note"] as? String }, answers.filter { $0.why != nil }.map { $0.kind }, "kept verbatim")
+        let log = fx.log()
+        XCTAssertTrue(log.contains("defaults delete com.example.NSLog NSAppSleepDisabled: the key is already absent"), log)
+        for answer in answers {
+            guard let why = answer.why else { continue }
+            XCTAssertTrue(log.contains("defaults delete \(answer.domain) NSAppSleepDisabled failed and defaults read could not tell whether the key is still set (\(why)); keeping journal entry for retry"), "\(answer.kind): \(log)")
+            XCTAssertFalse(log.contains("defaults delete \(answer.domain) NSAppSleepDisabled: the key is already absent"), "\(answer.kind): \(log)")
+        }
+        XCTAssertFalse(log.contains("journal cleared"), log)
+    }
+
     /// An entry without a usable bundle id is never passed to `defaults`
     /// (a leading dash would be read as an option) and stays journaled.
     func testAppNapEntryWithoutUsableBundleIdIsKeptWithoutCommands() throws {
@@ -2152,6 +2194,104 @@ final class RecoveryScriptTests: XCTestCase {
         }
     }
 
+    /// Round 41 (current item 3): the stats lock_receipt makes, as the
+    /// app's lstat(2) and fstat(2) are read (SleepOffReceipts.lock). A stat
+    /// of the receipt before its lock that fails other than by finding
+    /// nothing there, or prints no type and identity, and a stat of the
+    /// opened fd 7 that prints no identity, show neither that the receipt
+    /// is missing or replaced nor that it is free: a command for the start
+    /// may hold its lock. A stat of the path under the lock that fails or
+    /// prints no identity leaves the locked file unknown. Each decides
+    /// nothing, though the start's dialog is over: no pmset runs, and the
+    /// start, its sleep entry and its claim stay. Only stat's own message
+    /// for nothing there counts as missing, before the lock or under it:
+    /// the start may have written, and sleep is restored. Before round 41
+    /// every failed stat before the lock counted as missing. Each case and
+    /// the control have a fixture of their own, and the runs go two at a
+    /// time (runTwoAtATime).
+    func testBackstopDecidesNothingWhenAStatOfTheReceiptFails() throws {
+        typealias Case = (name: String, mode: String, says: String, decides: Bool)
+        func cases(_ r: String) -> [Case] {
+            let unacquired = "; a command for that start may hold its lock"
+            let unknown = "; nothing shows whether the receipt can be trusted, so it decides nothing"
+            return [
+                ("a stat before the lock that fails", "before-eio", "\(r) could not be examined before its lock: stat: \(r): stat: Input/output error (stat exit 1)\(unacquired)", false),
+                ("a stat before the lock without an identity", "before-short", "stat printed no type and identity for \(r) before its lock\(unacquired)", false),
+                ("a stat of fd 7 that fails", "fd7", "\(r) could not be examined once it was opened (stat of fd 7 printed no identity)\(unacquired)", false),
+                ("a stat under the lock that fails", "after-eio", "\(r) could not be examined once it was locked: stat: \(r): stat: Input/output error (stat exit 1)\(unknown)", false),
+                ("a stat under the lock without an identity", "after-short", "stat printed no identity for \(r) once it was locked\(unknown)", false),
+                ("a stat before the lock that finds nothing", "before-gone", "\(r) is missing, is not the 82-byte file install.sh made, mode 600, or someone other than root can change it or a folder above it", true),
+                ("a stat under the lock that finds nothing", "after-gone", "\(r) was removed while it was locked", true),
+            ]
+        }
+        let count = cases("").count
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
+        var rows: [(row: ScriptRow, c: Case?, nonce: String)] = []
+        for i in 0...count {
+            let f = try ScriptFixture()
+            fixtures.append(f)
+            let previous = fx
+            fx = f
+            defer { fx = previous }
+            let nonce = try journalUnfinishedStart()
+            let c = i < count ? cases(f.receipt)[i] : nil
+            if let c {
+                let tool = f.bin.appendingPathComponent("stat-\(c.mode)").path
+                try FakeTool.write("""
+                #!/bin/bash
+                r='\(f.receipt)'
+                fail() { echo "stat: $r: stat: $1" >&2; exit 1; }
+                if [[ $# == 3 && "$1" == -f && "$2" == '%HT %d:%i' && "$3" == "$r" ]]; then
+                  case \(c.mode) in
+                    before-eio) fail "Input/output error" ;;
+                    before-short) echo "Regular File"; exit 0 ;;
+                    before-gone) fail "No such file or directory" ;;
+                  esac
+                fi
+                # fd 7: its standard input is the receipt.
+                if [[ \(c.mode) == fd7 && $# == 2 && "$1" == -f && "$2" == '%d:%i' && "$(/usr/bin/stat -f '%d:%i')" == "$(/usr/bin/stat -f '%d:%i' "$r")" ]]; then
+                  echo "stat: (stdin): Input/output error" >&2
+                  exit 1
+                fi
+                if [[ $# == 3 && "$1" == -f && "$2" == '%d:%i' && "$3" == "$r" ]]; then
+                  case \(c.mode) in
+                    after-eio) fail "Input/output error" ;;
+                    after-short) echo "x"; exit 0 ;;
+                    after-gone) fail "No such file or directory" ;;
+                  esac
+                fi
+                exec /usr/bin/stat "$@"
+
+                """, at: tool)
+                let text = try String(contentsOf: f.backstop, encoding: .utf8)
+                try ScriptFixture.patch(text, ["STAT": tool]).write(to: f.backstop, atomically: true, encoding: .utf8)
+            }
+            rows.append((ScriptRow(c?.name ?? "control", f, f.backstop), c, nonce))
+        }
+
+        runTwoAtATime(rows.map(\.row))
+
+        for (row, c, nonce) in rows {
+            let f = row.fixture
+            let r = try row.outcome()
+            let previous = fx
+            fx = f
+            defer { fx = previous }
+            guard let c else {
+                XCTAssertEqual(r.status, 0, "\(row.label): \(r.stderr)")
+                try assertSettled(sleepRestored: false)
+                continue
+            }
+            if c.decides {
+                try assertKept(r, nonce: nonce, restored: true, saying: ["an unfinished start could not be settled: the receipt could not be locked to give its claim back (\(c.says)). Nothing was removed"])
+            } else {
+                try assertKept(r, nonce: nonce, restored: false, saying: ["an unfinished start is not settled yet: \(c.says)"])
+            }
+            XCTAssertEqual(f.receiptText(), SleepOffReceipts.initialContent, row.label)
+        }
+    }
+
     /// Round 39 (P1 4236972947). A receipt whose checks could not be made
     /// (here a folder's list read in part) decides nothing, whatever it
     /// holds and whatever the time: the line the start found (its
@@ -2968,6 +3108,85 @@ final class RecoveryScriptTests: XCTestCase {
         ])
     }
 
+    /// Round 41 (current item 3), as in the backstop: a stat of the receipt
+    /// before its lock that fails other than by finding nothing there, or
+    /// prints no type and identity, and a stat of the opened fd 7 that
+    /// prints no identity, leave a command for the start possibly holding
+    /// its lock; a stat under the lock that fails or prints no identity
+    /// leaves the locked file unknown. Each stops the uninstall with the
+    /// start still journaled, its dialog over, nothing removed and no pmset.
+    /// Each case has a fixture of its own, and the runs go two at a time.
+    func testUninstallDecidesNothingWhenAStatOfTheReceiptFails() throws {
+        typealias Case = (name: String, mode: String, says: String)
+        func cases(_ r: String) -> [Case] {
+            let unacquired = "; a command for that start may hold its lock). It can be settled once the receipt can be examined."
+            let unknown = "; nothing shows whether the receipt can be trusted, so it decides nothing). It can be settled once the receipt's checks can be made."
+            return [
+                ("a stat before the lock that fails", "before-eio", "\(r) could not be examined before its lock: stat: \(r): stat: Input/output error (stat exit 1)\(unacquired)"),
+                ("a stat before the lock without an identity", "before-short", "stat printed no type and identity for \(r) before its lock\(unacquired)"),
+                ("a stat of fd 7 that fails", "fd7", "\(r) could not be examined once it was opened (stat of fd 7 printed no identity)\(unacquired)"),
+                ("a stat under the lock that fails", "after-eio", "\(r) could not be examined once it was locked: stat: \(r): stat: Input/output error (stat exit 1)\(unknown)"),
+                ("a stat under the lock without an identity", "after-short", "stat printed no identity for \(r) once it was locked\(unknown)"),
+            ]
+        }
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
+        var rows: [(row: ScriptRow, c: Case, nonce: String)] = []
+        for i in cases("").indices {
+            let f = try ScriptFixture()
+            fixtures.append(f)
+            let previous = fx
+            fx = f
+            defer { fx = previous }
+            try f.installMachinery()
+            let nonce = try journalUnfinishedStart()
+            let c = cases(f.receipt)[i]
+            let tool = f.bin.appendingPathComponent("stat-\(c.mode)").path
+            try FakeTool.write("""
+            #!/bin/bash
+            r='\(f.receipt)'
+            fail() { echo "stat: $r: stat: $1" >&2; exit 1; }
+            if [[ $# == 3 && "$1" == -f && "$2" == '%HT %d:%i' && "$3" == "$r" ]]; then
+              case \(c.mode) in
+                before-eio) fail "Input/output error" ;;
+                before-short) echo "Regular File"; exit 0 ;;
+              esac
+            fi
+            # fd 7: its standard input is the receipt.
+            if [[ \(c.mode) == fd7 && $# == 2 && "$1" == -f && "$2" == '%d:%i' && "$(/usr/bin/stat -f '%d:%i')" == "$(/usr/bin/stat -f '%d:%i' "$r")" ]]; then
+              echo "stat: (stdin): Input/output error" >&2
+              exit 1
+            fi
+            if [[ $# == 3 && "$1" == -f && "$2" == '%d:%i' && "$3" == "$r" ]]; then
+              case \(c.mode) in
+                after-eio) fail "Input/output error" ;;
+                after-short) echo "x"; exit 0 ;;
+              esac
+            fi
+            exec /usr/bin/stat "$@"
+
+            """, at: tool)
+            let text = try String(contentsOf: f.uninstall, encoding: .utf8)
+            try ScriptFixture.patch(text, ["STAT": tool]).write(to: f.uninstall, atomically: true, encoding: .utf8)
+            rows.append((ScriptRow(c.name, f, f.uninstall), c, nonce))
+        }
+
+        runTwoAtATime(rows.map(\.row))
+
+        for (row, c, nonce) in rows {
+            let f = row.fixture
+            let r = try row.outcome()
+            let previous = fx
+            fx = f
+            defer { fx = previous }
+            try assertUninstallStopped(r, nonce: nonce, saying: [
+                "The unfinished start is still journaled: it is not settled yet (\(c.says)",
+                "Nothing was removed and no pmset ran. Then rerun.",
+            ])
+            XCTAssertEqual(f.receiptText(), SleepOffReceipts.initialContent, row.label)
+        }
+    }
+
     /// The session of a start that never turned sleep off cannot be
     /// removed: the uninstall stops with nothing removed and no pmset.
     func testUninstallStopsWhenTheStartsSessionCannotBeRemoved() throws {
@@ -3251,6 +3470,101 @@ final class RecoveryScriptTests: XCTestCase {
             }
             XCTAssertEqual(FileManager.default.fileExists(atPath: f.receipts), !c.others.isEmpty, "\(c.name): an empty folder still goes")
             XCTAssertFalse(f.exists(f.installedBackstop), "\(c.name): this account's bundle still goes")
+        }
+    }
+
+    /// Round 41 (current item 2): the rule's own lines keep it too. Each
+    /// account's install.sh keeps the lines of the others in it, and an
+    /// account whose install made no receipt here (an older build made
+    /// none) shows only there. So when the receipt folder shows no other
+    /// account, uninstall.sh reads the rule as root, and keeps it while it
+    /// holds a line of another account (its four-line rule of an older
+    /// build too), a line install.sh never wrote, or what the read printed
+    /// cannot be read whole, and while this account's name, which tells
+    /// its lines from the others', cannot be checked. A read that fails
+    /// stops the uninstall there, as a failed removal does: the rule, the
+    /// bundle, the receipt and the journal stay, and the agent is loaded
+    /// again. The controls, a rule of this account's lines only and no
+    /// rule at all, remove it. Each case and control has a fixture of its
+    /// own, and the uninstalls run two at a time.
+    func testUninstallKeepsTheRuleWhileItMayHoldTheLinesOfAnotherAccount() throws {
+        let alice = ScriptFixture.ruleLines("alice")
+        let four = "# Installed by Insomnia install.sh. Exactly four commands, nothing else."
+        typealias Case = (name: String, rule: String?, setUp: ((ScriptFixture) throws -> Void)?, why: ((ScriptFixture) -> String)?, stops: Bool)
+        let cases: [Case] = [
+            ("another account's lines", ScriptFixture.ruleText(others: alice), nil,
+             { "\($0.sudoers.path) holds the lines of another account on this Mac (alice)" }, false),
+            ("another account's four-line rule of an older build", ([four, "alice ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep " + "1"] + alice).map { $0 + "\n" }.joined(), nil,
+             { "\($0.sudoers.path) holds the lines of another account on this Mac (alice)" }, false),
+            ("a line install.sh never wrote", ScriptFixture.ruleText(others: ["#include /private/etc/sudoers.d/more"]), nil,
+             { "line 5 of \($0.sudoers.path) is not one install.sh writes, so whether another account uses the rule is unknown" }, false),
+            ("a NUL byte", ScriptFixture.ruleText() + "\0\n", nil,
+             { "what 'sudo -n \($0.bin.path)/cat \($0.sudoers.path)' printed could not be read whole, so whether the rule holds the lines of another account is unknown" }, false),
+            ("this account's name is another uid's", ScriptFixture.ruleText(), { f in
+                let id = f.bin.appendingPathComponent("id-root")
+                try FakeTool.write("#!/bin/bash\nif [[ \"$*\" == -un ]]; then echo root; exit 0; fi\nif [[ \"$*\" == \"-u -- root\" ]]; then echo 0; exit 0; fi\nexec /usr/bin/id \"$@\"\n", at: id.path)
+                let text = try String(contentsOf: f.uninstall, encoding: .utf8)
+                try ScriptFixture.patch(text, ["ID": id.path]).write(to: f.uninstall, atomically: true, encoding: .utf8)
+            }, { "the account name of uid \($0.uid) (root) could not be checked, so whether \($0.sudoers.path) holds the lines of another account is unknown" }, false),
+            ("a read that fails", ScriptFixture.ruleText(others: alice), { f in
+                f.setMode("launchctl", "loaded")
+                try Data().write(to: f.root.appendingPathComponent("sudo-cat.fails"))
+            }, nil, true),
+            ("control: only this account's lines", ScriptFixture.ruleText(), nil, nil, false),
+            ("control: no rule", nil, nil, nil, false),
+        ]
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
+        var rows: [(row: ScriptRow, c: Case, rule: Data?)] = []
+        for c in cases {
+            let f = try ScriptFixture()
+            fixtures.append(f)
+            try f.installMachinery()
+            try f.writeState(cleanJournal)
+            try f.writeReceipt()
+            if let rule = c.rule { try Data(rule.utf8).write(to: f.sudoers) } else { try FileManager.default.removeItem(at: f.sudoers) }
+            try c.setUp?(f)
+            rows.append((ScriptRow(c.name, f, f.uninstall), c, c.rule.map { Data($0.utf8) }))
+        }
+
+        runTwoAtATime(rows.map(\.row))
+
+        for (row, c, rule) in rows {
+            let f = row.fixture
+            let r = try row.outcome()
+            let calls = f.calls()
+            let read = "sudo -n \(f.bin.path)/cat \(f.sudoers.path)"
+            if c.stops {
+                XCTAssertEqual(r.status, 1, "\(c.name): \(r.stderr + r.stdout)")
+                XCTAssertTrue(r.stderr.contains("Uninstall stopped after booting out the LaunchAgent: '\(read)' exited 1 (cat: \(f.sudoers.path): Input/output error).\n\(f.sudoers.path), \(f.app.path), the receipt and the journal were kept."), "\(c.name): \(r.stderr)")
+                XCTAssertEqual(try? Data(contentsOf: f.sudoers), rule, c.name)
+                XCTAssertFalse(calls.contains { Self.isRootRemoval($0) }, "\(c.name): \(calls)")
+                let out = try XCTUnwrap(calls.firstIndex(of: "launchctl bootout gui/\(f.uid) \(f.plist.path)"), "\(c.name): \(calls)")
+                let at = try XCTUnwrap(calls.firstIndex(of: read), "\(c.name): \(calls)")
+                let back = try XCTUnwrap(calls.firstIndex(of: "launchctl bootstrap gui/\(f.uid) \(f.plist.path)"), "\(c.name): loaded again: \(calls)")
+                XCTAssertTrue(out < at && at < back, "\(c.name): booted out, then read, then loaded again: \(calls)")
+                XCTAssertTrue(r.stderr.contains("The LaunchAgent was loaded again from \(f.plist.path)."), "\(c.name): \(r.stderr)")
+                XCTAssertTrue(FileManager.default.fileExists(atPath: f.receipt), c.name)
+                XCTAssertTrue(f.exists(f.state), c.name)
+                XCTAssertTrue(f.exists(f.installedBackstop), c.name)
+                continue
+            }
+            XCTAssertEqual(r.status, 0, "\(c.name): \(r.stderr + r.stdout)")
+            XCTAssertFalse(FileManager.default.fileExists(atPath: f.receipt), c.name)
+            XCTAssertFalse(f.exists(f.installedBackstop), "\(c.name): this account's bundle still goes")
+            guard let why = c.why?(f) else {
+                XCTAssertTrue(r.stdout.contains("\(f.sudoers.path) is gone"), "\(c.name): \(r.stdout)")
+                XCTAssertFalse(r.stderr.contains("was kept"), "\(c.name): \(r.stderr)")
+                XCTAssertTrue(calls.contains("sudo -n /bin/rm -f \(f.sudoers.path)"), "\(c.name): \(calls)")
+                XCTAssertTrue(calls.contains(read), "\(c.name): \(calls)")
+                XCTAssertFalse(f.exists(f.sudoers), c.name)
+                continue
+            }
+            XCTAssertTrue(r.stdout.contains("kept \(f.sudoers.path): \(why), and that account's recovery agent may need the rule"), "\(c.name): \(r.stdout)")
+            XCTAssertTrue(r.stderr.contains("\(f.sudoers.path) was kept: \(why). It is one file for every account on this Mac.\nOnce no account uses Insomnia any more, remove it yourself: sudo rm -f \(f.sudoers.path)"), "\(c.name): \(r.stderr)")
+            XCTAssertEqual(try? Data(contentsOf: f.sudoers), rule, c.name)
+            XCTAssertFalse(calls.contains("sudo -n /bin/rm -f \(f.sudoers.path)"), "\(c.name): \(calls)")
+            XCTAssertEqual(calls.contains(read), !c.name.hasPrefix("this account's name"), "\(c.name): read only once this account's name is checked: \(calls)")
         }
     }
 
@@ -4875,6 +5189,31 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(r.stdout.contains("defaults delete com.example.Partial"), r.stdout)
     }
 
+    /// Round 41 (current item 5): uninstall counts an agent app as checked
+    /// only when its read exits 1 and prints nothing but the missing-key
+    /// message for it (after at most one NSLog line). Any other answer is
+    /// reported as not read.
+    func testUninstallCountsOnlyTheExactMissingKeyAnswerAsChecked() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let unread = ["extra", "nslog-twice", "exit2", "other", "partial", "value"]
+        let answers = [("com.example.NSLog", "nslog"), ("com.example.Nul", "nul")] + unread.map { ("com.example.\($0)", $0) }
+        let list = answers.map { "\"\($0.0)\"" }.joined(separator: ",")
+        try fx.writeConfig(#"{"agentList":["# + list + "]}")
+        try fx.defaultsAnswers(answers)
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertTrue(r.stdout.contains("none of the \(Config.defaultAgentList.count + 1) agent apps checked has NSAppSleepDisabled set"), r.stdout)
+        XCTAssertTrue(r.stdout.contains("could not read the whole answer of defaults read for com.example.Nul;"), r.stdout)
+        for kind in unread {
+            XCTAssertTrue(r.stdout.contains("could not read NSAppSleepDisabled for com.example.\(kind); check it yourself with: defaults read com.example.\(kind) NSAppSleepDisabled"), "\(kind): \(r.stdout)")
+        }
+        XCTAssertFalse(r.stdout.contains("for com.example.NSLog"), r.stdout)
+        XCTAssertTrue(r.stdout.contains("\(unread.count + 1) could not be read"), r.stdout)
+    }
+
     /// A `defaults read` that never answers (cfprefsd stuck) is stopped
     /// after the call limit, reported with the command to check it by hand,
     /// and ends the check, since every later read would wait the same way.
@@ -5818,6 +6157,325 @@ final class RecoveryScriptTests: XCTestCase {
         }
     }
 
+    /// Round 41 (current item 1): which LaunchAgent files the uninstall
+    /// removes, as its remove_plists has it (with agents_dir_home,
+    /// own_plist, another_agents_file and remove_plist), run on their own
+    /// on real files with a stand-in for the bounded stat. Every Insomnia
+    /// folder of this user names its plist and candidates the same way, so
+    /// a name or a path under LaunchAgents is not enough. A file goes only
+    /// when its LaunchAgents folder is within this folder (a link to the
+    /// whole folder is; one that leads into another folder is not, and
+    /// nothing in it is touched), it is a regular file read whole, its
+    /// ProgramArguments run this folder's bundle (or an older build's
+    /// backstop.sh in this folder), by path or through a link to its
+    /// folder, it is not the file another folder's loaded agent came from
+    /// (its plist, or its candidate after a crash before the rename), and
+    /// it is still the file that was read just before the rm. Another
+    /// bundle or script, or one whose folder is gone, is another folder's
+    /// and stays. A link or FIFO is left. A file that could not be read,
+    /// that runs something else, past 8 MiB, changed after it was read, or
+    /// whose folders did not answer stays and counts as not removed. Exactly
+    /// 8 MiB is read. The check that this user owns the file needs another
+    /// account's file, which this test cannot make.
+    func testUninstallRemovesOnlyThisFoldersLaunchAgentFiles() throws {
+        let text = try String(contentsOf: fx.uninstall, encoding: .utf8)
+        func function(_ name: String) throws -> String {
+            let start = try XCTUnwrap(text.range(of: "\n\(name)() {"), name)
+            let end = try XCTUnwrap(text.range(of: "\n}\n", range: start.upperBound..<text.endIndex), name)
+            return String(text[start.lowerBound..<end.upperBound])
+        }
+        func assignment(_ name: String) throws -> String {
+            let start = try XCTUnwrap(text.range(of: "\n\(name)='"), name)
+            let end = try XCTUnwrap(text.range(of: "'\n", range: start.upperBound..<text.endIndex), name)
+            return String(text[start.lowerBound..<end.upperBound])
+        }
+        let fm = FileManager.default
+        let label = "com.insomnia.backstop"
+        let app = fx.app.path
+        func identity(_ path: String) -> String {
+            var info = stat()
+            XCTAssertEqual(stat(path, &info), 0, path)
+            return "\(info.st_dev):\(info.st_ino)"
+        }
+        func agent(_ args: [String]) throws -> Data {
+            try PropertyListSerialization.data(fromPropertyList: ["Label": label, "ProgramArguments": args, "RunAtLoad": true, "StartInterval": 60], format: .xml, options: 0)
+        }
+        func sealed(_ bundle: String) -> [String] { ["/bin/sh", "-c", "exec x", "sh", fx.requirement, bundle] }
+        func padded(_ size: Int) throws -> Data {
+            let data = try agent(sealed(app))
+            let end = try XCTUnwrap(data.range(of: Data("</dict>".utf8)))
+            var out = data
+            out.replaceSubrange(end.lowerBound..<end.lowerBound, with: Data(repeating: 0x20, count: size - data.count))
+            return out
+        }
+        func put(_ data: Data, _ path: String) throws {
+            try fm.createDirectory(atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+            try data.write(to: URL(fileURLWithPath: path))
+        }
+        let elsewhere = fx.root.appendingPathComponent("elsewhere").path
+        try fm.createDirectory(atPath: elsewhere + "/Insomnia.app", withIntermediateDirectories: true)
+        let appsLink = fx.root.appendingPathComponent("a link to Applications").path
+        try fm.createSymbolicLink(atPath: appsLink, withDestinationPath: fx.appsDir.path)
+        let base = fx.root.appendingPathComponent("remove", isDirectory: true).path
+
+        struct Case {
+            let name: String
+            let home: String
+            var agents: String?
+            var others: [String] = []
+            var stall: String?
+            var touch: String?
+            let lines: [String]
+            let failures: Int
+            var gone: [String] = []
+            var kept: [String] = []
+        }
+        var cases: [Case] = []
+        // A home, its LaunchAgents and staging folders, and another folder.
+        func dirs() throws -> (h: String, la: String, st: String, o: String) {
+            let h = "\(base)/\(cases.count)/home", o = "\(base)/\(cases.count)/other"
+            for dir in [h, o] { try fm.createDirectory(atPath: dir, withIntermediateDirectories: true) }
+            return (h, h + "/LaunchAgents", h + "/LaunchAgents/.\(label).staging", o)
+        }
+        func unknown(_ path: String, _ why: String) -> String { "Kept \(path): \(why), so whether it is this folder's is unknown." }
+        func another(_ path: String, _ runs: String, _ want: String) -> String { "kept \(path): it runs \(runs), not this folder's \(want), so it is another Insomnia folder's" }
+        let loadedFrom = "the recovery agent of another Insomnia folder, which stays loaded, was loaded from it"
+
+        do {
+            let d = try dirs()
+            let plist = d.la + "/\(label).plist", c1 = d.st + "/\(label).candidate-1.plist", c2 = d.la + "/\(label).candidate-2.plist"
+            try put(agent(sealed(app)), plist)
+            try put(agent(sealed(app)), c1)
+            try put(agent(["/bin/bash", d.h + "/backstop.sh"]), c2)
+            cases.append(Case(name: "this folder's plist and candidates", home: d.h, lines: ["removed \(plist)", "removed \(c1)", "removed \(c2)"], failures: 0, gone: [plist, c1, c2, d.st], kept: [d.la]))
+        }
+        do {
+            let d = try dirs()
+            let c1 = d.st + "/\(label).candidate-1.plist"
+            try put(agent(sealed(app)), c1)
+            cases.append(Case(name: "no plist, a candidate", home: d.h, lines: ["no \(d.la)/\(label).plist", "removed \(c1)"], failures: 0, gone: [c1, d.st]))
+        }
+        do {
+            let d = try dirs()
+            let plist = d.la + "/\(label).plist"
+            try put(agent(sealed(appsLink + "/Insomnia.app")), plist)
+            cases.append(Case(name: "the bundle through a link to its folder", home: d.h, lines: ["removed \(plist)"], failures: 0, gone: [plist]))
+        }
+        do {
+            let d = try dirs()
+            let whole = "\(base)/\(cases.count)/a link to home"
+            try fm.createSymbolicLink(atPath: whole, withDestinationPath: d.h)
+            let plist = d.la + "/\(label).plist"
+            try put(agent(sealed(app)), plist)
+            cases.append(Case(name: "this folder through a link to all of it", home: whole, agents: whole + "/LaunchAgents", lines: ["removed \(whole)/LaunchAgents/\(label).plist"], failures: 0, gone: [plist]))
+        }
+        do {
+            let d = try dirs()
+            let plist = d.la + "/\(label).plist", c1 = d.st + "/\(label).candidate-1.plist"
+            try put(agent(sealed(elsewhere + "/Insomnia.app")), plist)
+            try put(agent(["/bin/bash", d.o + "/backstop.sh"]), c1)
+            cases.append(Case(name: "another bundle, another folder's backstop.sh", home: d.h, lines: [another(plist, elsewhere + "/Insomnia.app", "Insomnia.app"), another(c1, d.o + "/backstop.sh", "backstop.sh")], failures: 0, kept: [plist, c1, d.st]))
+        }
+        do {
+            let d = try dirs()
+            let plist = d.la + "/\(label).plist"
+            let gone = fx.root.appendingPathComponent("gone").path + "/Insomnia.app"
+            try put(agent(sealed(gone)), plist)
+            cases.append(Case(name: "a bundle whose folder is gone", home: d.h, lines: [another(plist, gone, "Insomnia.app")], failures: 0, kept: [plist]))
+        }
+        do {
+            let d = try dirs()
+            let plist = d.la + "/\(label).plist", c1 = d.st + "/\(label).candidate-1.plist", c2 = d.st + "/\(label).candidate-2.plist"
+            try put(agent(["/bin/sh", "-c", "exit 0"]), plist)
+            try put(agent(sealed("Insomnia.app")), c1)
+            try put(Data("<plist/>".utf8), c2)
+            cases.append(Case(name: "ProgramArguments Insomnia does not write", home: d.h, lines: [
+                unknown(plist, "its ProgramArguments are not the ones Insomnia writes"),
+                unknown(c1, "what its ProgramArguments run is not an absolute path"),
+                unknown(c2, "its ProgramArguments are not the ones Insomnia writes"),
+            ], failures: 3, kept: [plist, c1, c2]))
+        }
+        do {
+            let d = try dirs()
+            let plist = d.la + "/\(label).plist"
+            try put(agent(sealed(app)), plist)
+            XCTAssertEqual(chmod(plist, 0), 0)
+            cases.append(Case(name: "a plist that cannot be read", home: d.h, lines: [unknown(plist, "it could not be read (Permission denied)")], failures: 1, kept: [plist]))
+        }
+        do {
+            let d = try dirs()
+            let plist = d.la + "/\(label).plist", fifo = d.st + "/\(label).candidate-fifo.plist"
+            let target = "\(base)/\(cases.count)/linked.plist"
+            try put(agent(sealed(app)), target)
+            try fm.createDirectory(atPath: d.st, withIntermediateDirectories: true)
+            try fm.createSymbolicLink(atPath: plist, withDestinationPath: target)
+            XCTAssertEqual(mkfifo(fifo, 0o600), 0)
+            let left = { (p: String) in "Left \(p): it is a link or not a regular file, so Insomnia did not write it." }
+            cases.append(Case(name: "a link and a FIFO", home: d.h, lines: [left(plist), left(fifo)], failures: 0, kept: [plist, fifo, target, d.st]))
+        }
+        do {
+            let d = try dirs()
+            let plist = d.o + "/LaunchAgents/\(label).plist", c1 = d.o + "/LaunchAgents/.\(label).staging/\(label).candidate-1.plist"
+            try put(agent(sealed(app)), plist)
+            try put(agent(sealed(app)), c1)
+            try fm.createSymbolicLink(atPath: d.la, withDestinationPath: d.o + "/LaunchAgents")
+            let where_ = "the folder above it is \(identity(d.o)) by device and inode, not \(d.h), which is \(identity(d.h))"
+            cases.append(Case(name: "a LaunchAgents folder that leads into another folder", home: d.h, lines: ["kept the LaunchAgent files in \(d.la): it leads into another folder (\(where_)), so they are that folder's"], failures: 0, kept: [plist, c1]))
+        }
+        do {
+            let d = try dirs()
+            cases.append(Case(name: "no LaunchAgents folder", home: d.h, lines: ["no \(d.la)"], failures: 0))
+        }
+        do {
+            let d = try dirs()
+            try fm.createSymbolicLink(atPath: d.la, withDestinationPath: d.h + "/missing")
+            cases.append(Case(name: "a LaunchAgents link to nothing", home: d.h, lines: ["no \(d.la)"], failures: 0, kept: [d.la]))
+        }
+        for stalled in ["home", "LaunchAgents/.."] {
+            let d = try dirs()
+            let plist = d.la + "/\(label).plist"
+            try put(agent(sealed(app)), plist)
+            let path = stalled == "home" ? d.h : d.la + "/.."
+            cases.append(Case(name: "stat of \(stalled) does not answer", home: d.h, stall: path, lines: ["Kept the LaunchAgent files in \(d.la): 'stat -L \(path)' did not answer within 5s, so whether that folder is this Insomnia folder's is unknown. Rerun this script once it answers."], failures: 1, kept: [plist]))
+        }
+        do {
+            let d = try dirs()
+            let plist = d.la + "/\(label).plist"
+            try put(agent(sealed(elsewhere + "/Insomnia.app")), plist)
+            let apps = fx.appsDir.path
+            cases.append(Case(name: "stat of the bundle's folder does not answer", home: d.h, stall: apps, lines: [unknown(plist, "it runs \(elsewhere)/Insomnia.app, and \(apps) could not be identified ('stat -L \(apps)' did not answer within 5s)")], failures: 1, kept: [plist]))
+        }
+        do {
+            let d = try dirs()
+            let plist = d.la + "/\(label).plist", c1 = d.st + "/\(label).candidate-1.plist"
+            try put(agent(sealed(app)), plist)
+            try put(agent(sealed(app)), c1)
+            try fm.createSymbolicLink(atPath: d.o + "/LaunchAgents", withDestinationPath: d.la)
+            cases.append(Case(name: "another folder's loaded agent came from this plist", home: d.h, others: [d.o + "/LaunchAgents/\(label).plist"], lines: ["kept \(plist): \(loadedFrom)", "removed \(c1)"], failures: 0, gone: [c1, d.st], kept: [plist]))
+        }
+        do {
+            let d = try dirs()
+            let plist = d.la + "/\(label).plist", c1 = d.st + "/\(label).candidate-C.plist"
+            try put(agent(sealed(app)), plist)
+            try put(agent(sealed(app)), c1)
+            try fm.createSymbolicLink(atPath: d.o + "/LaunchAgents", withDestinationPath: d.la)
+            cases.append(Case(name: "a crash before the rename left another folder's agent loaded from its candidate", home: d.h, others: [d.o + "/LaunchAgents/.\(label).staging/\(label).candidate-C.plist"], lines: ["removed \(plist)", "kept \(c1): \(loadedFrom)"], failures: 0, gone: [plist], kept: [c1, d.st]))
+        }
+        do {
+            let d = try dirs()
+            let plist = d.la + "/\(label).plist"
+            try put(agent(sealed(app)), plist)
+            cases.append(Case(name: "a plist changed after it was read", home: d.h, touch: plist, lines: ["Kept \(plist): it changed after it was read, so whether it is still this folder's is unknown. Rerun this script."], failures: 1, kept: [plist]))
+        }
+        do {
+            let d = try dirs()
+            let plist = d.la + "/\(label).plist", c1 = d.st + "/\(label).candidate-1.plist"
+            let limit = 8 * 1024 * 1024
+            try put(padded(limit), plist)
+            try put(padded(limit + 1), c1)
+            cases.append(Case(name: "exactly 8 MiB, and one byte more", home: d.h, lines: ["removed \(plist)", unknown(c1, "it could not be read (it is larger than 8 MiB)")], failures: 1, gone: [plist], kept: [c1]))
+        }
+
+        let reads = fx.root.appendingPathComponent("remove-reads").path
+        try fm.createDirectory(atPath: reads, withIntermediateDirectories: true)
+        var caseDirs: [String] = []
+        for (i, c) in cases.enumerated() {
+            let dir = "\(base)/\(i)/case"
+            try fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            try c.home.write(toFile: dir + "/home", atomically: true, encoding: .utf8)
+            try (c.agents ?? c.home + "/LaunchAgents").write(toFile: dir + "/agents", atomically: true, encoding: .utf8)
+            try c.others.map { $0 + "\n" }.joined().write(toFile: dir + "/others", atomically: true, encoding: .utf8)
+            if let stall = c.stall { try stall.write(toFile: dir + "/stall", atomically: true, encoding: .utf8) }
+            if let touch = c.touch { try touch.write(toFile: dir + "/touch", atomically: true, encoding: .utf8) }
+            caseDirs.append(dir)
+        }
+        // plutil, which reads the private copy: once, the first time it runs
+        // for a case with a touch file, it first adds a byte to the live file
+        // named there, as a write between the read and the rm would.
+        let plutil = fx.root.appendingPathComponent("plutil-touch").path
+        try """
+        #!/bin/bash
+        if [[ -f "$CASE/touch" ]]; then printf ' ' >> "$(< "$CASE/touch")"; /bin/rm -f "$CASE/touch"; fi
+        exec /usr/bin/plutil "$@"
+
+        """.write(toFile: plutil, atomically: true, encoding: .utf8)
+        XCTAssertEqual(chmod(plutil, 0o755), 0)
+        let harness = fx.root.appendingPathComponent("remove-plists.sh")
+        try """
+        set -euo pipefail
+        exec 2>&1
+        LABEL=\(label)
+        CALL_TIMEOUT_SECONDS=5
+        STAT=/usr/bin/stat
+        RM=/bin/rm
+        RMDIR=/bin/rmdir
+        ENV=/usr/bin/env
+        PERL=/usr/bin/perl
+        PLUTIL='\(plutil)'
+        READ_TIMEOUT_SECONDS=10
+        READS='\(reads)'
+        APP='\(app)'
+        # bounded() as the uninstall has it, for the one call these make
+        # through it, without the process: the real stat, or 124 for the
+        # path in the case's stall file.
+        bounded() {
+          local rc=0
+          BOUNDED_WHOLE=0
+          [[ $# == 5 && "$1 $2 $3 $4" == "$STAT -L -f %d:%i" ]] || { echo "unexpected call: $*"; exit 3; }
+          if [[ -f "$CASE/stall" && "${*: -1}" == "$(< "$CASE/stall")" ]]; then BOUNDED_OUTPUT=""; return 124; fi
+          BOUNDED_OUTPUT="$("$@" 2>&1)" || rc=$?
+          BOUNDED_WHOLE=1
+          return "$rc"
+        }
+        \(try assignment("COPY_PERL"))
+        \(try assignment("ID_PERL"))
+        \(try function("copy_private"))
+        \(try function("file_id"))
+        \(try function("plutil_on"))
+        \(try function("pmset_failed"))
+        \(try function("path_identity"))
+        \(try function("agents_dir_home"))
+        \(try function("own_plist"))
+        \(try function("another_agents_file"))
+        \(try function("remove_plist"))
+        \(try function("remove_plists"))
+        for CASE in "$@"; do
+          export CASE
+          APP_SUPPORT="$(< "$CASE/home")"
+          LAUNCH_AGENTS="$(< "$CASE/agents")"
+          PLIST="$LAUNCH_AGENTS/$LABEL.plist"
+          other_agent_files=()
+          while IFS= read -r f; do other_agent_files+=("$f"); done < "$CASE/others"
+          remove_failures=0
+          echo "== $CASE"
+          remove_plists
+          echo "failures $remove_failures"
+        done
+
+        """.write(to: harness, atomically: true, encoding: .utf8)
+
+        let r = try fx.run(harness, caseDirs)
+
+        XCTAssertEqual(r.status, 0, r.stdout + r.stderr)
+        XCTAssertEqual(r.stderr, "")
+        var groups: [[String]] = []
+        for line in r.stdout.split(separator: "\n", omittingEmptySubsequences: false).dropLast().map(String.init) {
+            if line.hasPrefix("== ") { groups.append([]) } else if !groups.isEmpty { groups[groups.count - 1].append(line) }
+        }
+        XCTAssertEqual(groups.count, cases.count, r.stdout)
+        for (c, lines) in zip(cases, groups) {
+            XCTAssertEqual(lines, c.lines + ["failures \(c.failures)"], c.name)
+            for path in c.gone {
+                var info = stat()
+                XCTAssertNotEqual(lstat(path, &info), 0, "\(c.name): \(path) is gone")
+            }
+            for path in c.kept {
+                var info = stat()
+                XCTAssertEqual(lstat(path, &info), 0, "\(c.name): \(path) stays")
+            }
+        }
+    }
+
     /// Round 34 (Greptile 4234715817): every Insomnia folder of this user
     /// loads its recovery agent under one label, and launchd holds one job
     /// for it. While `launchctl print` names another folder's file, at the
@@ -5915,6 +6573,101 @@ final class RecoveryScriptTests: XCTestCase {
                     : "the output of 'launchctl print gui/\(f.uid)/\(label)' could not be read whole"
                 try assertUninstallRemovedNothing(r, saying: "\(why), so whether the recovery agent loaded as \(label) is this folder's or another Insomnia folder's is unknown", journal: journal, receipt: SleepOffReceipts.initialContent, release: SleepOffReceipts.initialRelease, in: f)
                 XCTAssertEqual(f.printLockStates(), ["launchctl print held"], label0)
+            }
+        }
+    }
+
+    /// Round 41 (current item 1): the whole uninstall, with another
+    /// Insomnia folder's agent loaded (launchctl print names its file),
+    /// when the two folders share one LaunchAgents folder. Both plists run
+    /// the same bundle, so what they run cannot tell them apart. When this
+    /// folder's LaunchAgents folder is a link into the other folder, every
+    /// file in it is that folder's: its plist, its candidate and its staging
+    /// folder stay. Before round 41 the uninstall removed them through the
+    /// link, and the other folder's agent had no plist for the next login.
+    /// When the other folder's LaunchAgents folder is a link to this one,
+    /// the file its agent was loaded from stays: its plist, or, after a
+    /// crash between its load and the rename over the plist, its candidate.
+    /// This folder's other files go. Either way that agent, the rule and
+    /// the bundle stay, as for any other folder's agent, and this folder's
+    /// journal goes.
+    func testUninstallKeepsTheLaunchAgentFilesOfAFolderSharingItsLaunchAgentsFolder() throws {
+        let label = "com.insomnia.backstop"
+        let fm = FileManager.default
+        let names = ["this folder's leads there", "the other folder's leads here", "the other folder's leads here, loaded from its candidate"]
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
+        var rows: [(row: ScriptRow, loaded: String, kept: [(URL, Data)], gone: [URL])] = []
+        for name in names {
+            let f = try ScriptFixture()
+            fixtures.append(f)
+            try f.installMachinery()
+            try f.writeState(cleanJournal)
+            try f.writeReceipt()
+            f.setMode("pmset", "0")
+            let mine = f.plist.deletingLastPathComponent()
+            let other = f.root.appendingPathComponent("other home/LaunchAgents", isDirectory: true)
+            try fm.createDirectory(at: other.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let candidateName = "\(label).candidate-\(UUID().uuidString).plist"
+            var kept: [(URL, Data)] = []
+            var gone: [URL] = []
+            let loaded: String
+            if name == "this folder's leads there" {
+                try fm.removeItem(at: mine)
+                try fm.createDirectory(at: other.appendingPathComponent(".\(label).staging"), withIntermediateDirectories: true)
+                try fm.createSymbolicLink(at: mine, withDestinationURL: other)
+                let plist = other.appendingPathComponent("\(label).plist")
+                let candidate = other.appendingPathComponent(".\(label).staging/\(candidateName)")
+                for url in [plist, candidate] {
+                    try f.agentPlistData().write(to: url)
+                    kept.append((url, try Data(contentsOf: url)))
+                }
+                loaded = plist.path
+            } else {
+                try fm.createSymbolicLink(at: other, withDestinationURL: mine)
+                let candidate = mine.appendingPathComponent(".\(label).staging/\(candidateName)")
+                try fm.createDirectory(at: candidate.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try f.agentPlistData().write(to: candidate)
+                if name == "the other folder's leads here" {
+                    loaded = other.appendingPathComponent("\(label).plist").path
+                    kept.append((f.plist, try Data(contentsOf: f.plist)))
+                    gone = [candidate]
+                } else {
+                    loaded = other.appendingPathComponent(".\(label).staging/\(candidateName)").path
+                    kept.append((candidate, try Data(contentsOf: candidate)))
+                    gone = [f.plist]
+                }
+            }
+            try f.setPrintAnswers(["path \(loaded)"])
+            rows.append((ScriptRow(name, f, f.uninstall), loaded, kept, gone))
+        }
+
+        runTwoAtATime(rows.map(\.row))
+
+        for (row, loaded, kept, gone) in rows {
+            let name = row.label
+            let f = row.fixture
+            let r = try row.outcome()
+            let calls = f.calls()
+            let agents = f.plist.deletingLastPathComponent().path
+            XCTAssertEqual(r.status, 1, "\(name): \(r.stdout + r.stderr)")
+            XCTAssertTrue(r.stdout.contains("kept for another Insomnia folder of this user: the recovery agent loaded as \(label) comes from \(loaded), not from \(agents);"), "\(name): \(r.stdout)")
+            XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl bootout") || $0.hasPrefix("launchctl bootstrap") || $0.hasPrefix("sudo -n") }, "\(name): \(calls)")
+            for (url, data) in kept { XCTAssertEqual(try? Data(contentsOf: url), data, "\(name): \(url.path) stays as it was") }
+            for url in gone { XCTAssertFalse(f.exists(url), "\(name): \(url.path)") }
+            for url in [f.sudoers, f.app] { XCTAssertTrue(f.exists(url), "\(name): \(url.path)") }
+            XCTAssertFalse(f.exists(f.state), name)
+            let loadedFrom = "the recovery agent of another Insomnia folder, which stays loaded, was loaded from it"
+            switch name {
+            case "this folder's leads there":
+                XCTAssertTrue(r.stdout.contains("kept the LaunchAgent files in \(agents): it leads into another folder (the folder above it is "), "\(name): \(r.stdout)")
+                XCTAssertFalse(r.stdout.contains("removed \(agents)"), "\(name): \(r.stdout)")
+            case "the other folder's leads here":
+                XCTAssertTrue(r.stdout.contains("kept \(f.plist.path): \(loadedFrom)\n"), "\(name): \(r.stdout)")
+                XCTAssertTrue(r.stdout.contains("removed \(gone[0].path)\n"), "\(name): \(r.stdout)")
+            default:
+                XCTAssertTrue(r.stdout.contains("removed \(f.plist.path)\n"), "\(name): \(r.stdout)")
+                XCTAssertTrue(r.stdout.contains("kept \(kept[0].0.path): \(loadedFrom)\n"), "\(name): \(r.stdout)")
             }
         }
     }
@@ -6440,7 +7193,7 @@ final class RecoveryScriptTests: XCTestCase {
         // With no foreign file left, the staging directory itself goes.
         try FileManager.default.removeItem(at: launchAgents.appendingPathComponent(".com.insomnia.backstop.staging/notes.txt"))
         try fx.installMachinery()
-        try "<plist/>".write(to: launchAgents.appendingPathComponent(".com.insomnia.backstop.staging/com.insomnia.backstop.candidate-77.plist"), atomically: true, encoding: .utf8)
+        try fx.agentPlistData().write(to: launchAgents.appendingPathComponent(".com.insomnia.backstop.staging/com.insomnia.backstop.candidate-77.plist"))
         let again = try fx.run(fx.uninstall)
         XCTAssertEqual(again.status, 0, again.stderr + again.stdout)
         XCTAssertEqual(try fx.contents(of: launchAgents), ["com.other.agent.plist"])
@@ -6497,11 +7250,13 @@ final class RecoveryScriptTests: XCTestCase {
         let launchAgents = fx.plist.deletingLastPathComponent()
         let staging = launchAgents.appendingPathComponent(".com.insomnia.backstop.staging", isDirectory: true)
         try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
-        for url in [staging.appendingPathComponent("com.insomnia.backstop.candidate-4242.plist"),
-                    staging.appendingPathComponent("com.insomnia.backstop.candidate-0F2C9A54-1B7E-4D7A-9C11-5E3B2A7D9F00.plist"),
-                    launchAgents.appendingPathComponent("com.insomnia.backstop.candidate-0F2C9A54-1B7E-4D7A-9C11-5E3B2A7D9F01"),
-                    staging.appendingPathComponent("notes.txt"),
-                    launchAgents.appendingPathComponent("com.other.agent.plist")] {
+        // The candidates run this fixture's bundle, or for an older build's
+        // the writable backstop.sh in this folder (uninstall.sh's own_plist).
+        let older = try PropertyListSerialization.data(fromPropertyList: ["Label": "com.insomnia.backstop", "ProgramArguments": ["/bin/bash", fx.legacyBackstop.path]], format: .xml, options: 0)
+        try fx.agentPlistData().write(to: staging.appendingPathComponent("com.insomnia.backstop.candidate-4242.plist"))
+        try fx.agentPlistData().write(to: staging.appendingPathComponent("com.insomnia.backstop.candidate-0F2C9A54-1B7E-4D7A-9C11-5E3B2A7D9F00.plist"))
+        try older.write(to: launchAgents.appendingPathComponent("com.insomnia.backstop.candidate-0F2C9A54-1B7E-4D7A-9C11-5E3B2A7D9F01"))
+        for url in [staging.appendingPathComponent("notes.txt"), launchAgents.appendingPathComponent("com.other.agent.plist")] {
             try "<plist/>".write(to: url, atomically: true, encoding: .utf8)
         }
         return (removable, ([live, link] + unlike).sorted(), elsewhere)
@@ -7448,7 +8203,7 @@ final class RecoveryScriptTests: XCTestCase {
     /// printed in both scripts, where they returned 0 as a file with no
     /// records.
     func testTheRecordReaderReturnsTwoForWhatItCannotRead() throws {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("record-text-\(UUID().uuidString)", isDirectory: true)
+        let dir = TestScratch.directory.appendingPathComponent("record-text-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { removeIfPresent(dir) }
         let locked = dir.appendingPathComponent("locked.json")
@@ -8840,6 +9595,73 @@ final class RecoveryScriptTests: XCTestCase {
                      "receipt_unsafe", "lists_from_answer", "unlock_receipt", "plutil_on", "same_as_read",
                      "job_running", "wait_for_job", "signal_job", "pipe_job", "take_answer"] {
             XCTAssertEqual(try function(name, in: backstop), try function(name, in: uninstall), name)
+        }
+    }
+
+    /// Round 41 (current item 2): install.sh and uninstall.sh tell the
+    /// rule's lines apart with the same text: the account name check, the
+    /// uid lookup, the header and rule_lines.
+    func testInstallAndUninstallReadTheRuleAlike() throws {
+        let install = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent("install.sh"), encoding: .utf8)
+        let uninstall = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent("uninstall.sh"), encoding: .utf8)
+        func function(_ name: String, in text: String) throws -> String {
+            let start = try XCTUnwrap(text.range(of: "\n\(name)() {"), name)
+            let end = try XCTUnwrap(text.range(of: "\n}\n", range: start.upperBound..<text.endIndex), name)
+            return String(text[start.lowerBound..<end.upperBound])
+        }
+        func line(_ prefix: String, in text: String) -> [String] {
+            text.components(separatedBy: "\n").filter { $0.hasPrefix(prefix) }
+        }
+        for name in ["uid_of", "rule_lines"] {
+            XCTAssertEqual(try function(name, in: install), try function(name, in: uninstall), name)
+        }
+        for prefix in ["account_name_ok() {", "RULE_HEADER="] {
+            XCTAssertEqual(line(prefix, in: install).count, 1, prefix)
+            XCTAssertEqual(line(prefix, in: install), line(prefix, in: uninstall), prefix)
+        }
+        XCTAssertEqual(line("RULE_HEADER=", in: install), [##"RULE_HEADER="# Installed by Insomnia install.sh. Exactly three commands for each account, nothing else.""##])
+    }
+
+    /// Round 41 (current item 2): rule_lines, run by the real /bin/bash on
+    /// its own text, as both scripts read the rule. Another account's line
+    /// that is one of the three is kept as it is, once, in its order, and
+    /// its name listed once; this account's lines, any `disablesleep 1`
+    /// line, the headers install.sh wrote and empty lines are passed over;
+    /// the first line install.sh never wrote is named by its number.
+    func testRuleLinesKeepOnlyOtherAccountsGrantsAndNameTheFirstUnknownLine() throws {
+        let install = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent("install.sh"), encoding: .utf8)
+        func function(_ name: String) throws -> String {
+            let start = try XCTUnwrap(install.range(of: "\n\(name)() {"), name)
+            let end = try XCTUnwrap(install.range(of: "\n}\n", range: start.upperBound..<install.endIndex), name)
+            return String(install[start.lowerBound..<end.upperBound])
+        }
+        let header = try XCTUnwrap(install.components(separatedBy: "\n").first { $0.hasPrefix("RULE_HEADER=") })
+        let nameCheck = try XCTUnwrap(install.components(separatedBy: "\n").first { $0.hasPrefix("account_name_ok() {") })
+        let reader = try function("rule_lines")
+        let script = "set -eu\n" + nameCheck + "\n" + header + "\n" + reader + #"""
+        USER_NAME=me
+        rule_lines "$1"
+        printf 'others=[%s] names=[%s] odd=[%s]\n' "$rule_others" "$rule_names" "$rule_odd"
+        """#
+        let me = ScriptFixture.ruleLines("me"), a = ScriptFixture.ruleLines("a_1.b-c"), b = ScriptFixture.ruleLines("B2")
+        let off = { (name: String) in "\(name) ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep " + "1" }
+        let reads: [(name: String, text: [String], prints: String)] = [
+            ("nothing", [], "others=[] names=[] odd=[]\n"),
+            ("this account only, every header", ["# Installed by Insomnia install.sh. Exactly three commands for each account, nothing else.", "# Installed by Insomnia install.sh. Exactly three commands, nothing else.", "# Installed by Insomnia install.sh. Exactly four commands, nothing else.", off("me")] + me, "others=[] names=[] odd=[]\n"),
+            ("two others, repeated and mixed", [a[2], off("a_1.b-c"), b[0], a[2], "", me[1], b[1], a[0]], "others=[\(a[2])\n\(b[0])\n\(b[1])\n\(a[0])\n] names=[a_1.b-c B2] odd=[]\n"),
+            ("a line it never wrote, after a kept one", [a[0], "Defaults !authenticate", b[0]], "others=[\(a[0])\n] names=[a_1.b-c] odd=[2]\n"),
+            ("a tab for the space", [a[0].replacingOccurrences(of: " ALL", with: "\tALL")], "others=[] names=[] odd=[1]\n"),
+            ("another run-as user", [a[0].replacingOccurrences(of: "(root)", with: "(ALL)")], "others=[] names=[] odd=[1]\n"),
+            ("another pmset setting", ["a ALL=(root) NOPASSWD: /usr/bin/pmset -a sleep 0"], "others=[] names=[] odd=[1]\n"),
+            ("a leading space", [" " + a[0]], "others=[] names=[] odd=[1]\n"),
+            ("a name with a byte sudoers reads", ScriptFixture.ruleLines("a%b"), "others=[] names=[] odd=[1]\n"),
+            ("a name that starts with '.'", ScriptFixture.ruleLines(".a"), "others=[] names=[] odd=[1]\n"),
+            ("a comment", ["# a note"], "others=[] names=[] odd=[1]\n"),
+        ]
+        for c in reads {
+            let r = try fx.runTool("/bin/bash", ["-c", script, "bash", c.text.joined(separator: "\n")])
+            XCTAssertEqual(r.status, 0, "\(c.name): \(r.output)")
+            XCTAssertEqual(r.output, c.prints, c.name)
         }
     }
 
@@ -11404,8 +12226,8 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
         XCTAssertTrue(r.stderr.contains("SHA256SUMS"), "points at the download checks: \(r.stderr)")
         XCTAssertEqual(try String(contentsOf: fx.appBinary, encoding: .utf8), FakeTool.launcherText, "old bundle kept")
-        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule", "sudoers rule kept")
-        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist", "trusted plist kept")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), fx.ruleText(), "sudoers rule kept")
+        XCTAssertEqual(try Data(contentsOf: fx.plist), try fx.agentPlistData(), "trusted plist kept")
     }
 
     func testInstallFromPrebuiltAppRefusesAnotherIdentifierAVersionlessBundleAndAMissingBackstop() throws {
@@ -12302,7 +13124,7 @@ final class RecoveryScriptTests: XCTestCase {
     func testInstallLeavesAVisudoThatIgnoresSigtermHoldingTheLockAndTheRuleUntouched() throws {
         try writePreviousPair()
         try FileManager.default.createDirectory(at: fx.sudoers.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try "rule".write(to: fx.sudoers, atomically: true, encoding: .utf8)
+        try fx.ruleText().write(to: fx.sudoers, atomically: true, encoding: .utf8)
         fx.setMode("sudo", "visudo-hangs-under-lock")
 
         let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
@@ -12320,7 +13142,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(calls.contains { $0.contains("/usr/bin/install") || $0.contains(" -l ") || $0.hasPrefix("launchctl") }, "\(calls)")
         XCTAssertFalse(fx.hungProcessGone("sudo", within: 2), "sudo is never sent SIGKILL")
         XCTAssertFalse(try fx.lockIsFree(), "the sudo started under the lock still runs, so the lock stays held")
-        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), fx.ruleText())
         XCTAssertEqual(try fx.installedBinaryFirstLine(), "previous")
         XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "trusted")
 
@@ -12669,7 +13491,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stderr.contains("recovery lock"), r.stderr)
         XCTAssertEqual(try String(contentsOf: fx.appBinary, encoding: .utf8), FakeTool.launcherText)
         XCTAssertEqual(try String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper")
-        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule", "the rule is written only under the lock")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), fx.ruleText(), "the rule is written only under the lock")
         XCTAssertFalse(calls.contains { $0.contains("/usr/sbin/visudo") }, "\(calls)")
         XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
         XCTAssertFalse(r.stderr.contains("already holds the new three-line rule"), r.stderr)
@@ -12695,7 +13517,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(calls.contains { $0.contains("/usr/sbin/visudo") }, "\(calls)")
         XCTAssertEqual(try String(contentsOf: fx.appBinary, encoding: .utf8), FakeTool.launcherText)
         XCTAssertEqual(try String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper")
-        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), fx.ruleText())
         XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
     }
 
@@ -12856,8 +13678,8 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
         XCTAssertEqual(try String(contentsOf: fx.appBinary, encoding: .utf8), FakeTool.launcherText, "old bundle replaced")
         XCTAssertEqual(try String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper", "installed backstop.sh replaced")
-        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist", "trusted plist touched")
-        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule", "sudoers rule replaced")
+        XCTAssertEqual(try Data(contentsOf: fx.plist), try fx.agentPlistData(), "trusted plist touched")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), fx.ruleText(), "sudoers rule replaced")
         XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
         XCTAssertTrue(r.stderr.contains("not asked to quit"), r.stderr)
         XCTAssertFalse(r.stderr.contains("Insomnia was quit"), r.stderr)
@@ -12886,9 +13708,9 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(calls.contains { $0.hasPrefix("osascript") }, "the app was asked to quit: \(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
         XCTAssertEqual(try Data(contentsOf: fx.session), session, "session.json changed")
-        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), fx.ruleText())
         XCTAssertEqual(try String(contentsOf: fx.appBinary, encoding: .utf8), FakeTool.launcherText)
-        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist")
+        XCTAssertEqual(try Data(contentsOf: fx.plist), try fx.agentPlistData())
         XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
         XCTAssertTrue(r.stderr.contains("a running session keeps going"), r.stderr)
     }
@@ -12911,7 +13733,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(calls.contains { $0.hasPrefix("sudo") }, "\(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("osascript") }, "\(calls)")
         XCTAssertTrue(FileManager.default.fileExists(atPath: fx.session.path))
-        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), fx.ruleText())
     }
 
     /// Yes in a terminal goes ahead: password, quit, rule, bundle.
@@ -13005,8 +13827,8 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
         XCTAssertEqual(try String(contentsOf: fx.appBinary, encoding: .utf8), FakeTool.launcherText, "old bundle replaced")
         XCTAssertEqual(try String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper", "installed backstop.sh replaced")
-        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist", "trusted plist touched")
-        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule", "sudoers rule replaced")
+        XCTAssertEqual(try Data(contentsOf: fx.plist), try fx.agentPlistData(), "trusted plist touched")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), fx.ruleText(), "sudoers rule replaced")
         XCTAssertTrue(r.stderr.contains("Insomnia was quit"), r.stderr)
         XCTAssertTrue(r.stderr.contains("nothing else was changed"), r.stderr)
         XCTAssertFalse(r.stderr.contains("already holds the new three-line rule"), r.stderr)
@@ -13036,7 +13858,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(calls.contains { $0.hasPrefix("sudo -n \(fx.fakePmset)") }, "no recovery ran: \(calls)")
         XCTAssertEqual(try String(contentsOf: fx.appBinary, encoding: .utf8), FakeTool.launcherText)
         XCTAssertEqual(try String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper")
-        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist")
+        XCTAssertEqual(try Data(contentsOf: fx.plist), try fx.agentPlistData())
         XCTAssertTrue(try sudoersRules() == Self.passwordlessLines, "the new rule is what was installed")
         XCTAssertTrue(r.stderr.contains("does not list its commands without a password"), r.stderr)
         XCTAssertTrue(try fx.lockIsFree())
@@ -13064,8 +13886,8 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
         XCTAssertEqual(try String(contentsOf: fx.appBinary, encoding: .utf8), FakeTool.launcherText, "old bundle replaced")
         XCTAssertEqual(try String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper", "installed backstop.sh replaced")
-        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist", "trusted plist touched")
-        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule", "sudoers rule replaced")
+        XCTAssertEqual(try Data(contentsOf: fx.plist), try fx.agentPlistData(), "trusted plist touched")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), fx.ruleText(), "sudoers rule replaced")
         XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
     }
 
@@ -13089,7 +13911,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(calls.contains { $0.hasPrefix("osascript") }, "nothing to quit: \(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
         XCTAssertEqual(try String(contentsOf: fx.appBinary, encoding: .utf8), FakeTool.launcherText, "old bundle replaced")
-        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist", "trusted plist touched")
+        XCTAssertEqual(try Data(contentsOf: fx.plist), try fx.agentPlistData(), "trusted plist touched")
         XCTAssertTrue(try String(contentsOf: fx.sudoers, encoding: .utf8).contains("NOPASSWD: /usr/bin/pmset"), "the new rule is what was installed")
         XCTAssertTrue(r.stderr.contains("does not list its commands without a password"), r.stderr)
         assertRerunNote(r.stderr)
@@ -13113,10 +13935,10 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(calls.filter { $0.hasPrefix("sudo") }, ["sudo -v"], "nothing written for an install that cannot finish: \(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("pkill") }, "a refused quit stands: \(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
-        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule", "the sudoers file was touched")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), fx.ruleText(), "the sudoers file was touched")
         XCTAssertEqual(try String(contentsOf: fx.appBinary, encoding: .utf8), FakeTool.launcherText)
         XCTAssertEqual(try String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper")
-        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist")
+        XCTAssertEqual(try Data(contentsOf: fx.plist), try fx.agentPlistData())
         XCTAssertTrue(r.stderr.contains("still running"), r.stderr)
         XCTAssertTrue(r.stderr.contains("Nothing was changed"), r.stderr)
     }
@@ -13202,22 +14024,25 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(calls.contains { $0.hasPrefix("sudo -n -l") }, "\(calls)")
         XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
         XCTAssertEqual(try String(contentsOf: fx.appBinary, encoding: .utf8), FakeTool.launcherText)
-        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist")
+        XCTAssertEqual(try Data(contentsOf: fx.plist), try fx.agentPlistData())
         XCTAssertTrue(r.stderr.contains("does not list its commands without a password"), r.stderr)
         assertRerunNote(r.stderr)
     }
 
     /// A reinstall over the four-line rule of an older build replaces the
-    /// file: the `disablesleep 1` line does not survive.
+    /// file: the `disablesleep 1` line does not survive. Round 41: the
+    /// older build named this account in it (its $USER), and its lines are
+    /// this account's, so none of them is kept as another account's.
     func testReinstallOverFourLineRuleLeavesThreeLines() throws {
         try fx.prepareInstall()
         try fx.installMachinery()
+        let me = String(cString: getpwuid(getuid()).pointee.pw_name)
         try """
         # Installed by Insomnia install.sh. Exactly four commands, nothing else.
-        tester ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1
-        tester ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0
-        tester ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 1
-        tester ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 0
+        \(me) ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1
+        \(me) ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0
+        \(me) ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 1
+        \(me) ALL=(root) NOPASSWD: /usr/bin/pmset -b lowpowermode 0
 
         """.write(to: fx.sudoers, atomically: true, encoding: .utf8)
         fx.setMode("launchctl", "loaded")
@@ -13226,12 +14051,147 @@ final class RecoveryScriptTests: XCTestCase {
 
         XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
         XCTAssertEqual(try sudoersRules(), Self.passwordlessLines)
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), fx.ruleText())
+        XCTAssertFalse(r.stdout.contains("keeping the lines of the other accounts"), r.stdout)
         XCTAssertFalse(try String(contentsOf: fx.sudoers, encoding: .utf8).contains("disablesleep 1"))
         let installs = fx.calls().filter { $0.hasPrefix("sudo -n /usr/bin/install") }
         XCTAssertEqual(installs.filter { $0.hasSuffix(" " + fx.sudoers.path) }.count, 1, "written once: \(fx.calls())")
         XCTAssertEqual(installs.count, 3, "the sudoers file, the receipt and its release file: \(installs)")
         XCTAssertTrue(installs.dropFirst().first?.hasSuffix(" " + fx.receipt) == true, "\(installs)")
         XCTAssertTrue(installs.last?.hasSuffix(" " + fx.released) == true, "\(installs)")
+    }
+
+    /// Round 41 (current item 2): the rule is one file for every account
+    /// on this Mac, and another account's app, backstop.sh and uninstall.sh
+    /// restore sleep through that account's lines, perhaps for a start it
+    /// has not settled. Before round 41 an install wrote only its own
+    /// account's lines, so a second account's install took the first
+    /// account's restore away. Now install.sh reads the rule as root first
+    /// and writes this account's three lines, then every other account's
+    /// line that is one of the three, each once and in its order. No
+    /// account keeps a `disablesleep 1` line (an older build wrote one),
+    /// and this account's older lines are not kept as another's. With no
+    /// rule there, only this account's lines are written. Each case has a
+    /// fixture of its own, and the installs run two at a time.
+    func testInstallKeepsTheLinesOfOtherAccountsInTheRule() throws {
+        let me = String(cString: getpwuid(getuid()).pointee.pw_name)
+        let alice = ScriptFixture.ruleLines("alice"), bob = ScriptFixture.ruleLines("bob.o-2")
+        let four = "# Installed by Insomnia install.sh. Exactly four commands, nothing else."
+        let three = "# Installed by Insomnia install.sh. Exactly three commands, nothing else."
+        func off(_ name: String) -> String { "\(name) ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep " + "1" }
+        let cases: [(name: String, rule: [String]?, kept: [String], names: String?)] = [
+            ("another account's four-line rule of an older build", [four, off("alice")] + alice, alice, "alice"),
+            ("this account's and two others', with duplicates and empty lines",
+             [three, alice[0], "", off("bob.o-2")] + ScriptFixture.ruleLines(me) + [off(me), bob[2], alice[0], bob[0], alice[1], alice[2], bob[1], ""],
+             [alice[0], bob[2], bob[0], alice[1], alice[2], bob[1]], "alice bob.o-2"),
+            ("another account's lines under this build's header, no newline at the end", [ScriptFixture.ruleText(others: alice).components(separatedBy: "\n").dropLast().joined(separator: "\n")], alice, "alice"),
+            ("no rule", nil, [], nil),
+        ]
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
+        var rows: [(row: ScriptRow, kept: [String], names: String?)] = []
+        for c in cases {
+            let f = try ScriptFixture()
+            fixtures.append(f)
+            try f.prepareInstall()
+            try f.installMachinery()
+            if let rule = c.rule {
+                try rule.joined(separator: "\n").appending(c.name.contains("no newline") ? "" : "\n").write(to: f.sudoers, atomically: true, encoding: .utf8)
+            } else {
+                try FileManager.default.removeItem(at: f.sudoers)
+            }
+            f.setMode("launchctl", "loaded")
+            rows.append((ScriptRow(c.name, f, f.installRedirected), c.kept, c.names))
+        }
+
+        runTwoAtATime(rows.map(\.row))
+
+        for (row, kept, names) in rows {
+            let f = row.fixture
+            let r = try row.outcome()
+            XCTAssertEqual(r.status, 0, "\(row.label): \(r.stderr + r.stdout)")
+            XCTAssertEqual(try String(contentsOf: f.sudoers, encoding: .utf8), f.ruleText(others: kept), row.label)
+            if let names {
+                XCTAssertTrue(r.stdout.contains("keeping the lines of the other accounts on this Mac that \(f.sudoers.path) holds: \(names)\n"), "\(row.label): \(r.stdout)")
+            } else {
+                XCTAssertFalse(r.stdout.contains("keeping the lines of the other accounts"), "\(row.label): \(r.stdout)")
+            }
+            let calls = f.calls()
+            let read = try XCTUnwrap(calls.firstIndex(of: "sudo -n \(f.bin.path)/cat \(f.sudoers.path)"), "\(row.label): \(calls)")
+            let validate = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("sudo -n /usr/sbin/visudo") }, "\(row.label): \(calls)")
+            XCTAssertLessThan(read, validate, "\(row.label): read before the new rule is made: \(calls)")
+            XCTAssertEqual(calls.filter { $0.hasSuffix("/cat \(f.sudoers.path)") }.count, 1, "\(row.label): read once: \(calls)")
+            XCTAssertEqual(calls.filter { $0.hasPrefix("sudo -n /usr/bin/install") && $0.hasSuffix(" " + f.sudoers.path) }.count, 1, "\(row.label): written once: \(calls)")
+        }
+    }
+
+    /// Round 41 (current item 2): a rule line install.sh never wrote (a
+    /// directive, another grant, a line of its own grants with a byte
+    /// more, or with a name sudoers or chmod would misread) stops the
+    /// install before the new rule is made, with nothing changed: install.sh
+    /// rewrites the file whole, and would otherwise drop or keep a grant it
+    /// does not know. So does a read as root that fails, that does not
+    /// answer in time (it stops on SIGTERM), or whose output is not read
+    /// whole (a NUL byte in the file). Each case has a fixture of its own,
+    /// and the installs run two at a time.
+    func testInstallStopsWithNothingChangedWhenTheRuleCannotBeReadOrHoldsALineItNeverWrote() throws {
+        let alice = ScriptFixture.ruleLines("alice")
+        let header = "# Installed by Insomnia install.sh. Exactly three commands for each account, nothing else."
+        typealias Case = (name: String, rule: String, flag: String?, says: (ScriptFixture) -> [String])
+        func odd(_ n: Int) -> (ScriptFixture) -> [String] {
+            { ["Install stopped: line \(n) of \($0.sudoers.path) is not one install.sh writes, so what\nit grants, and to whom, is not known here.", "\($0.sudoers.path) was not touched."] }
+        }
+        func unread(_ rc: Int, _ first: String?) -> (ScriptFixture) -> [String] {
+            { f in (first.map { ["\($0.replacingOccurrences(of: "<rule>", with: f.sudoers.path))\n"] } ?? [])
+                + ["'sudo cat' exited \(rc) reading \(f.sudoers.path), or what it printed could not be read whole, so the lines other accounts on this Mac have in it are unknown. \(f.sudoers.path) was not touched."] }
+        }
+        let cases: [Case] = [
+            ("an #include", ([header] + alice + ["#include /private/etc/sudoers.d/more"]).map { $0 + "\n" }.joined(), nil, odd(5)),
+            ("a Defaults line", ([header, "Defaults:alice !authenticate"] + alice).map { $0 + "\n" }.joined(), nil, odd(2)),
+            ("a wider grant", ([header, "alice ALL=(ALL) NOPASSWD: ALL"]).map { $0 + "\n" }.joined(), nil, odd(2)),
+            ("a grant with a space more", ([header, alice[0] + " "]).map { $0 + "\n" }.joined(), nil, odd(2)),
+            ("a grant with a carriage return", ([header, alice[1] + "\r"]).map { $0 + "\n" }.joined(), nil, odd(2)),
+            ("a name that starts with '-'", ([header] + ScriptFixture.ruleLines("-alice")).map { $0 + "\n" }.joined(), nil, odd(2)),
+            ("a name with a comma", ([header] + ScriptFixture.ruleLines("alice,bob")).map { $0 + "\n" }.joined(), nil, odd(2)),
+            ("a read that fails", ScriptFixture.ruleText(others: alice), "sudo-cat.fails", unread(1, "cat: <rule>: Input/output error")),
+            ("a NUL byte", ScriptFixture.ruleText(others: alice) + "\0\n", nil, unread(0, nil)),
+            ("a read that does not answer", ScriptFixture.ruleText(others: alice), "sudo-cat.stalls",
+             { ["Install stopped: 'sudo cat', which reads \($0.sudoers.path), did not answer within 5s. It stopped on SIGTERM and this\nrun exits", "\($0.sudoers.path), the app at \($0.app.path) and the LaunchAgent were not touched; the new build was discarded. Rerun this script."] }),
+        ]
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
+        var rows: [(row: ScriptRow, c: Case, rule: Data)] = []
+        for c in cases {
+            let f = try ScriptFixture()
+            fixtures.append(f)
+            try f.prepareInstall()
+            try f.installMachinery()
+            try Data(c.rule.utf8).write(to: f.sudoers)
+            if let flag = c.flag { try Data().write(to: f.root.appendingPathComponent(flag)) }
+            rows.append((ScriptRow(c.name, f, f.installRedirected), c, try Data(contentsOf: f.sudoers)))
+        }
+
+        runTwoAtATime(rows.map(\.row))
+
+        for (row, c, rule) in rows {
+            let f = row.fixture
+            let r = try row.outcome()
+            XCTAssertEqual(r.status, 1, "\(c.name): \(r.stderr + r.stdout)")
+            for phrase in c.says(f) { XCTAssertTrue(r.stderr.contains(phrase), "\(c.name): \(phrase): \(r.stderr)") }
+            XCTAssertTrue(r.stderr.contains("Nothing was changed."), "\(c.name): \(r.stderr)")
+            XCTAssertFalse(r.stderr.contains("already holds the new three-line rule"), "\(c.name): \(r.stderr)")
+            XCTAssertFalse(r.stderr.contains("alice ALL"), "\(c.name): the rule's text is not printed: \(r.stderr)")
+            XCTAssertEqual(try Data(contentsOf: f.sudoers), rule, c.name)
+            let calls = f.calls()
+            XCTAssertTrue(calls.contains("sudo -n \(f.bin.path)/cat \(f.sudoers.path)"), "\(c.name): \(calls)")
+            XCTAssertFalse(calls.contains { $0.contains("/usr/sbin/visudo") || $0.contains("/usr/bin/install") || $0.contains(" -l ") || $0.hasPrefix("launchctl") }, "\(c.name): \(calls)")
+            XCTAssertEqual(try String(contentsOf: f.appBinary, encoding: .utf8), FakeTool.launcherText, c.name)
+            XCTAssertEqual(try Data(contentsOf: f.plist), try f.agentPlistData(), c.name)
+            if c.flag == "sudo-cat.stalls" {
+                XCTAssertTrue(calls.contains("sudo SIGTERM"), "\(c.name): \(calls)")
+                XCTAssertTrue(try f.lockIsFree(), "\(c.name): the read stopped, and the lock went with this run")
+            }
+        }
     }
 
     /// No path of the installer may grant passwordless `disablesleep 1`:
@@ -13361,7 +14321,7 @@ private final class ScriptFixture {
     private let fm = FileManager.default
 
     init() throws {
-        root = fm.temporaryDirectory.appendingPathComponent("insomnia-script-tests-\(UUID().uuidString)", isDirectory: true)
+        root = TestScratch.directory.appendingPathComponent("insomnia-script-tests-\(UUID().uuidString)", isDirectory: true)
         home = root.appendingPathComponent("home", isDirectory: true)
         bin = root.appendingPathComponent("bin", isDirectory: true)
         repoScripts = root.appendingPathComponent("repo/scripts", isDirectory: true)
@@ -13973,6 +14933,29 @@ private final class ScriptFixture {
           p=""; if [[ -f "\(r)/sudo-rm.no-credential" ]]; then IFS= read -r p < "\(r)/sudo-rm.no-credential" || true; fi
           if [[ -n "$p" && "$p" == "${!#}" ]]; then echo "sudo: a password is required" >&2; exit 1; fi
         fi
+        # `-n <cat> <path>` (install.sh and uninstall.sh read the rule as
+        # root): fails like sudo -n without a credential in mode auth-fail,
+        # as visudo does, and otherwise runs the fixture's cat on the path,
+        # only a path inside the fixture. With sudo-root.mode "search" it
+        # can see through a folder the user cannot search, as root can,
+        # as rm and test do below. While sudo-cat.fails exists it
+        # fails as cat does on a disk that cannot be read; while
+        # sudo-cat.stalls exists it never answers and stops on SIGTERM
+        # (hang_on_term stop).
+        if [[ "${1:-}" == -n && "${2:-}" == "\(bin.path)/cat" ]]; then
+          if [[ "$mode" == auth-fail ]]; then echo "sudo: a password is required" >&2; exit 1; fi
+          if [[ -e "\(r)/sudo-cat.stalls" ]]; then hang_on_term stop; fi
+          if [[ -e "\(r)/sudo-cat.fails" ]]; then echo "cat: ${!#}: Input/output error" >&2; exit 1; fi
+          case "${!#}" in "\(r)"/*)
+            shift
+            \(readFile(into: "root_mode", "\(r)/sudo-root.mode", or: ""))
+            if [[ "$root_mode" == search ]]; then
+              d="$(dirname "${!#}")"; /bin/chmod u+x "$d"; "$@"; rc=$?; /bin/chmod u-x "$d"; exit $rc
+            fi
+            exec "$@" ;;
+          esac
+          printf 'sudo REFUSED %s\\n' "$*" >> "\(calls)"; exit 1
+        fi
         case "${1:-}" in
           -v) case "$mode" in
                 auth-fail) echo "sudo: 3 incorrect password attempts" >&2; exit 1 ;;
@@ -14436,7 +15419,9 @@ private final class ScriptFixture {
         // "unreachable" (or "unreachable:<domain>") fails every command,
         // read included, the way a cfprefsd that does not answer would:
         // non-zero without the "does not exist" message. Mode "hang" (or
-        // "hang:<domain>") never answers; see hangHere.
+        // "hang:<domain>") never answers; see hangHere. defaults.answers
+        // (`domain|kind`, see defaultsAnswers) makes a read of that domain
+        // answer another way, whatever the table holds.
         try writeFake("defaults", """
         printf 'defaults %s\\n' "$*" >> "\(calls)"
         \(readFile(into: "mode", "\(r)/defaults.mode", or: "ok"))
@@ -14463,6 +15448,24 @@ private final class ScriptFixture {
         fi
         # nul:<domain>: a read answers 0, then a NUL byte and a 1.
         if [[ "$cmd" == read && "$mode" == "nul:$domain" ]]; then printf '0\\n\\0 1\\n'; exit 0; fi
+        if [[ "$cmd" == read && -f "\(r)/defaults.answers" ]]; then
+          kind=""
+          while IFS='|' read -r d k; do [[ "$d" == "$domain" ]] && kind="$k"; done < "\(r)/defaults.answers"
+          missing="The domain/default pair of ($domain, $key) does not exist"
+          case "$kind" in
+            "") ;;
+            nslog) printf '2026-10-10 12:00:00.000 defaults[4321:1a2b3c] \\n%s\\n' "$missing" >&2; exit 1 ;;
+            extra) printf '%s\\nmore\\n' "$missing" >&2; exit 1 ;;
+            nslog-twice) printf '2026-10-10 12:00:00.000 defaults[4321:1a2b3c] \\n2026-10-10 12:00:00.001 defaults[4321:1a2b3c] \\n%s\\n' "$missing" >&2; exit 1 ;;
+            exit2) printf '%s\\n' "$missing" >&2; exit 2 ;;
+            slow) printf '%s\\n' "$missing" >&2; exec /bin/sleep 60 ;;
+            nul) printf '%s\\0\\n' "$missing" >&2; exit 1 ;;
+            other) printf 'The domain/default pair of (com.example.Other, %s) does not exist\\n' "$key" >&2; exit 1 ;;
+            partial) printf '%s' "$missing" >&2; exit 1 ;;
+            value) echo 1; exit 1 ;;
+            *) echo "fake defaults: unknown answer '$kind'" >&2; exit 2 ;;
+          esac
+        fi
         case "$cmd" in
           read)
             v="$(lookup)" || { echo "The domain/default pair of ($domain, $key) does not exist" >&2; exit 1; }
@@ -14723,9 +15726,15 @@ private final class ScriptFixture {
     /// The agent plist an install writes for the bundle at $APP, pinning
     /// the fake codesign's requirement.
     func writeAgentPlist() throws {
-        let dict = LaunchdBackstop.plistDictionary(label: "com.insomnia.backstop", target: BackstopTarget(bundle: app, requirement: requirement))
-        let data = try PropertyListSerialization.data(fromPropertyList: dict, format: .xml, options: 0)
-        try data.write(to: plist)
+        try agentPlistData().write(to: plist)
+    }
+
+    /// The plist the app writes for this fixture: its ProgramArguments run
+    /// `bundle`, by default this fixture's $APP, so uninstall.sh's
+    /// own_plist reads it as this folder's.
+    func agentPlistData(runs bundle: URL? = nil) throws -> Data {
+        let dict = LaunchdBackstop.plistDictionary(label: "com.insomnia.backstop", target: BackstopTarget(bundle: bundle ?? app, requirement: requirement))
+        return try PropertyListSerialization.data(fromPropertyList: dict, format: .xml, options: 0)
     }
 
     /// Makes the fake mv refuse every move whose source and destination
@@ -14958,6 +15967,20 @@ private final class ScriptFixture {
         try text.write(to: root.appendingPathComponent("defaults.table"), atomically: true, encoding: .utf8)
     }
 
+    /// How the fake `defaults` answers a read of a domain, whatever its
+    /// table holds. Each kind but nslog is not an answer that proves the key
+    /// absent. nslog: the missing-key message after the NSLog line macOS
+    /// prints in front of it, exit 1. nslog-twice: the same after two NSLog
+    /// lines. extra: the message and one more line, exit 1. exit2: the
+    /// message, exit 2. slow: the message, then no exit until SIGTERM. nul:
+    /// the message with a NUL byte after it, exit 1. other: the message for
+    /// another domain, exit 1. partial: the message without its newline,
+    /// exit 1. value: "1", then exit 1.
+    func defaultsAnswers(_ rows: [(domain: String, kind: String)]) throws {
+        let text = rows.map { "\($0.domain)|\($0.kind)" }.joined(separator: "\n") + "\n"
+        try text.write(to: root.appendingPathComponent("defaults.answers"), atomically: true, encoding: .utf8)
+    }
+
     /// The fake's table after a run: domain to value; absent means no key.
     func defaultsValues() -> [String: String] {
         guard let text = try? String(contentsOf: root.appendingPathComponent("defaults.table"), encoding: .utf8) else { return [:] }
@@ -15002,6 +16025,23 @@ private final class ScriptFixture {
         return obj
     }
 
+    /// The rule install.sh writes for this account (the one `id -un` gives
+    /// for this uid), followed by `others`, the lines of other accounts it
+    /// keeps. Round 41 (current item 2): install.sh and uninstall.sh read
+    /// the rule, so a fixture's rule is one install.sh could have written.
+    static func ruleText(others: [String] = []) -> String {
+        let me = String(cString: getpwuid(getuid()).pointee.pw_name)
+        return (["# Installed by Insomnia install.sh. Exactly three commands for each account, nothing else."]
+            + ruleLines(me) + others).map { $0 + "\n" }.joined()
+    }
+
+    /// The three lines install.sh writes for account `name`.
+    static func ruleLines(_ name: String) -> [String] {
+        ["-a disablesleep 0", "-b lowpowermode 1", "-b lowpowermode 0"].map { "\(name) ALL=(root) NOPASSWD: /usr/bin/pmset \($0)" }
+    }
+
+    func ruleText(others: [String] = []) -> String { Self.ruleText(others: others) }
+
     /// Everything uninstall.sh would remove on success, with the fake app
     /// binary as the bundle's (appBinary).
     func installMachinery() throws {
@@ -15009,9 +16049,9 @@ private final class ScriptFixture {
         try FakeTool.write(String(contentsOf: bin.appendingPathComponent(".fake-src/Insomnia"), encoding: .utf8), at: appBinary.path)
         try Self.infoPlist(resumeFrozenVersion: "1").write(to: appInfo, atomically: true, encoding: .utf8)
         try fm.createDirectory(at: sudoers.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try "rule".write(to: sudoers, atomically: true, encoding: .utf8)
+        try ruleText().write(to: sudoers, atomically: true, encoding: .utf8)
         try fm.createDirectory(at: plist.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try "plist".write(to: plist, atomically: true, encoding: .utf8)
+        try writeAgentPlist()
         try fm.createDirectory(at: logFile.deletingLastPathComponent(), withIntermediateDirectories: true)
         try "log\n".write(to: logFile, atomically: true, encoding: .utf8)
         try "{}".write(to: config, atomically: true, encoding: .utf8)

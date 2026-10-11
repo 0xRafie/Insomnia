@@ -221,7 +221,8 @@ Flag a change that breaks one of these; do not flag the behavior itself.
   prompt. Quitting the app always ends the session; there is no keep-awake
   after quit (spec section 1).
 - `install.sh`, `SleepGuard.swift`, `AdministratorPrompt.swift`. The
-  sudoers rule has three NOPASSWD lines and none for `disablesleep 1`:
+  sudoers rule has three NOPASSWD lines for each account that installed,
+  kept across the other accounts' installs, and none for `disablesleep 1`:
   turning sleep off asks for the administrator password at every Start, so
   nothing running as the user can keep the Mac awake unattended. Reconcile
   at launch reads `pmset -g` and never prompts or turns sleep off again; a

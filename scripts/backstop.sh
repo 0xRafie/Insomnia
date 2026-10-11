@@ -154,9 +154,10 @@
 #                              defaults delete <bundleId> NSAppSleepDisabled
 #                              when the key was absent. A delete that fails
 #                              counts as done only when defaults read then
-#                              says the key does not exist; a read that
-#                              fails any other way proves nothing and the
-#                              entry stays.
+#                              exits 1 with only the message for that
+#                              domain's key missing as its whole output; a
+#                              read that exits or prints anything else
+#                              proves nothing and the entry stays.
 #     A flag is cleared only after its undo succeeded. Unknown keys survive.
 #     Exit 0 only when the journal is clean afterwards; otherwise exit 1 so
 #     the failure is visible and the next periodic run retries.
@@ -247,7 +248,6 @@ MKTEMP=/usr/bin/mktemp
 CAT=/bin/cat
 HEAD=/usr/bin/head
 TR=/usr/bin/tr
-GREP=/usr/bin/grep
 # perl makes the private copies of the files this run reads (copy_private),
 # through env -i, so nothing in the environment (PERL5OPT, PERL5LIB) reaches
 # it.
@@ -1536,11 +1536,13 @@ session_shape_problems() { # file
 #     line, or, once expires has passed, anything else: a receipt that is
 #     missing, replaced, unsafe or damaged.
 #   - "undecided": the receipt stays locked or cannot be locked, or the
-#     file the start journaled cannot be opened, so its lock cannot be
-#     seen; or that file is locked but a check of it could not be made
-#     (receipt_unsafe's unsafe_unknown), so it is neither trusted nor
-#     shown to be unsafe, whatever the time; or expires has not passed and
-#     the receipt shows nothing yet: the dialog may still be answered.
+#     file at its path cannot be examined before the lock
+#     (receipt_unacquired), or the file the start journaled cannot be
+#     opened, so its lock cannot be seen; or that file is locked but a
+#     check of it could not be made (receipt_unsafe's unsafe_unknown, or a
+#     stat of the path that failed), so it is neither trusted nor shown to
+#     be unsafe, whatever the time; or expires has not passed and the
+#     receipt shows nothing yet: the dialog may still be answered.
 # Decided, the start never finished, so its session never began:
 # session.json goes when its end is the attempt's deadline, so that session
 # is never resumed (a SleepDisabled 1 someone else set would read as still
@@ -1775,43 +1777,107 @@ read_access_lists() { # path...
 
 # Opens the receipt read-only on fd 7 and locks it as the root command does
 # (SleepOffReceipts.lock). Before the lock only what the open needs: the
-# path, by lstat, names a regular file. Then the open, fd 7's identity
-# against that lstat's, and `lockf <fd>`, whose lock lasts until fd 7
+# path, by one stat, names a regular file. Then the open, fd 7's identity
+# against that stat's, and `lockf <fd>`, whose lock lasts until fd 7
 # closes. Every other check of the receipt and the folders above it
 # (receipt_unsafe) runs only once fd 7 is locked, so nothing those checks
 # find passes over a command that holds the lock; then the path must still
 # name the locked file. Sets receipt_locked to that file's device:inode;
 # otherwise receipt_lock_why, and receipt_lock_busy=1 when lockf found it
 # locked for the whole RECEIPT_LOCK_TIMEOUT_SECONDS or failed, which
-# decides nothing whenever it happens. A regular file that cannot be opened
-# sets receipt_unopened to its device:inode: when that is the file the
-# start journaled, its lock cannot be seen, and attempt_verdict decides
-# nothing either. So does a locked file a check could not be made for
-# (receipt_unsafe's unsafe_unknown): receipt_unknown is then its
-# device:inode, and fd 7 is closed as for a file that fails. Unlike the
-# app, the shell opens with neither O_NOFOLLOW nor O_NONBLOCK: a link put
-# in the receipt's place after the lstat fails
-# the identity check, but a FIFO put there stalls the open until something
-# writes to it. Only someone who can write the receipt's folder can put
-# either there, and the checks under the lock refuse such a folder. fd 7
-# stays open only while locked; unlock_receipt closes it.
+# decides nothing whenever it happens. A stat before the lock that fails
+# other than by finding nothing there, or that prints no type and
+# identity, and a stat of the opened fd 7 that prints no identity, set
+# receipt_unacquired=1 (the app's Unacquired): they show neither that the
+# receipt is missing or replaced nor that it is free, so they decide
+# nothing either. A regular file that cannot be opened sets
+# receipt_unopened to its device:inode: when that is the file the start
+# journaled, its lock cannot be seen, and attempt_verdict decides nothing.
+# So does a locked file a check could not be made for (receipt_unsafe's
+# unsafe_unknown, or a stat of the path under the lock that failed or
+# printed no identity): receipt_unknown is then its device:inode, and fd 7
+# is closed as for a file that fails. Unlike the app, the shell opens with
+# neither O_NOFOLLOW nor O_NONBLOCK. A link put in the receipt's place
+# after the stat fails the identity check. A FIFO put there can block the
+# read-only open until a writer opens that FIFO (it does not block when a
+# writer already has it open), and that wait comes before lockf's
+# RECEIPT_LOCK_TIMEOUT_SECONDS starts, so nothing here bounds it. Only
+# someone who can write the receipt's folder can put either there: root,
+# in a folder the checks under the lock accept. fd 7 stays open only while
+# locked; unlock_receipt closes it.
 receipt_locked=""
+# One stat of path $2 with format $1, told apart as the app's lstat does:
+# stat_seen is "found" with stat_out its line, "gone" when stat found
+# nothing there (ENOENT, ENOTDIR), or "unread" with stat_err for any other
+# failure, which shows nothing about the path. The status and message come
+# from that one call: a failed stat prints only its message.
+stat_path() { # format path
+  local out
+  out="$("$STAT" -f "$1" "$2" 2>&1; echo ".$?")"
+  stat_rc="${out##*.}"; out="${out%.*}"; out="${out%$'\n'}"
+  stat_out=""; stat_err=""
+  if [[ "$stat_rc" == 0 ]]; then stat_seen=found; stat_out="$out"; return 0; fi
+  case "$out" in
+    "stat: $2: stat: No such file or directory"|"stat: $2: stat: Not a directory") stat_seen=gone ;;
+    *) stat_seen=unread; stat_err="${out:-no message} (stat exit ${stat_rc:-none})" ;;
+  esac
+}
+# Under the receipt's lock: true while path $1 still names the locked file
+# $2. Otherwise closes fd 7 and says why: the file was removed or another
+# put in its place, which the receipt then shows nothing through, or stat
+# failed or printed no identity, which leaves the locked file unknown
+# (receipt_unknown), as the app's Unread under the lock.
+receipt_still_locked() { # path identity
+  stat_path '%d:%i' "$1"
+  if [[ "$stat_seen" == found && "$stat_out" == "$2" ]]; then return 0; fi
+  exec 7<&-
+  if [[ "$stat_seen" == gone ]]; then
+    receipt_lock_why="$1 was removed while it was locked"
+  elif [[ "$stat_seen" == found && "$stat_out" =~ ^[0-9]+:[0-9]+$ ]]; then
+    receipt_lock_why="$1 was replaced while it was locked"
+  elif [[ "$stat_seen" == found ]]; then
+    receipt_unknown="$2"; receipt_lock_why="stat printed no identity for $1 once it was locked"
+  else
+    receipt_unknown="$2"; receipt_lock_why="$1 could not be examined once it was locked: $stat_err"
+  fi
+  return 1
+}
 lock_receipt() {
   local f="$RECEIPTS/$UID" why rc=0 found opened
-  receipt_locked=""; receipt_lock_why=""; receipt_lock_busy=0; receipt_read=0; receipt_unopened=""; receipt_unknown=""
-  found="$("$STAT" -f '%HT %d:%i' "$f" 2>/dev/null)" || found=""
-  if [[ "$found" != "Regular File "?* ]]; then
+  receipt_locked=""; receipt_lock_why=""; receipt_lock_busy=0; receipt_read=0; receipt_unopened=""; receipt_unknown=""; receipt_unacquired=0
+  stat_path '%HT %d:%i' "$f"
+  if [[ "$stat_seen" == gone ]]; then
     receipt_lock_why="$f is missing, is not the 82-byte file install.sh made, mode 600, or someone other than root can change it or a folder above it"
     return 0
   fi
-  found="${found##* }"
+  if [[ "$stat_seen" != found ]]; then
+    receipt_unacquired=1
+    receipt_lock_why="$f could not be examined before its lock: $stat_err"
+    return 0
+  fi
+  if ! [[ "$stat_out" =~ ^([A-Za-z][A-Za-z ]*)\ ([0-9]+:[0-9]+)$ ]]; then
+    receipt_unacquired=1
+    receipt_lock_why="stat printed no type and identity for $f before its lock"
+    return 0
+  fi
+  if [[ "${BASH_REMATCH[1]}" != "Regular File" ]]; then
+    receipt_lock_why="$f is missing, is not the 82-byte file install.sh made, mode 600, or someone other than root can change it or a folder above it"
+    return 0
+  fi
+  found="${BASH_REMATCH[2]}"
   if ! { exec 7<"$f"; } 2>/dev/null; then
     receipt_unopened="$found"
     receipt_lock_why="$f could not be opened to be locked"
     return 0
   fi
   opened="$("$STAT" -f '%d:%i' <&7 2>/dev/null)" || opened=""
-  if [[ -z "$opened" || "$opened" != "$found" ]]; then
+  if ! [[ "$opened" =~ ^[0-9]+:[0-9]+$ ]]; then
+    exec 7<&-
+    receipt_unacquired=1
+    receipt_lock_why="$f could not be examined once it was opened (stat of fd 7 printed no identity)"
+    return 0
+  fi
+  if [[ "$opened" != "$found" ]]; then
     exec 7<&-
     receipt_lock_why="$f changed while it was opened"
     return 0
@@ -1827,21 +1893,16 @@ lock_receipt() {
     fi
     return 0
   fi
-  if [[ "$opened" == "$("$STAT" -f '%d:%i' "$f" 2>/dev/null)" ]]; then
-    receipt_unsafe "$f" "$UID"
-    why="$unsafe_why"
-    if [[ -n "$why" ]]; then
-      exec 7<&-
-      receipt_lock_why="$why"
-      (( unsafe_unknown )) && receipt_unknown="$opened"
-      return 0
-    fi
-  fi
-  if [[ "$opened" != "$("$STAT" -f '%d:%i' "$f" 2>/dev/null)" ]]; then
+  receipt_still_locked "$f" "$opened" || return 0
+  receipt_unsafe "$f" "$UID"
+  why="$unsafe_why"
+  if [[ -n "$why" ]]; then
     exec 7<&-
-    receipt_lock_why="$f was replaced while it was locked"
+    receipt_lock_why="$why"
+    (( unsafe_unknown )) && receipt_unknown="$opened"
     return 0
   fi
+  receipt_still_locked "$f" "$opened" || return 0
   receipt_locked="$opened"
 }
 unlock_receipt() {
@@ -1946,6 +2007,10 @@ attempt_verdict() { # nonce predecessor identity expires now has-marker
   until="until $("$DATE" -u -r "$4" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "$4")"
   if (( receipt_lock_busy )); then
     verdict=undecided; verdict_why="$receipt_lock_why"
+    return 0
+  fi
+  if (( receipt_unacquired )); then
+    verdict=undecided; verdict_why="$receipt_lock_why; a command for that start may hold its lock"
     return 0
   fi
   if [[ -n "$receipt_unopened" && "$receipt_unopened" == "$3" ]]; then
@@ -2805,6 +2870,34 @@ fi
 # included) unless its restore succeeded.
 kept_app_nap=""
 kept_app_nap_count=0
+# True when file $2, the whole output (standard output and error) of a
+# `defaults read $1 NSAppSleepDisabled` that exited 1, is the message
+# defaults prints for that key missing and nothing else: "The
+# domain/default pair of ($1, NSAppSleepDisabled) does not exist" and a
+# newline, after at most one NSLog line (date, time, defaults[pid:thread]
+# and a space) that defaults prints in front of it. The file is read whole
+# by COPY_PERL, which fails on a file it cannot read whole or one with a NUL
+# byte. Otherwise sets missing_why.
+missing_why=""
+read_says_missing() { # bundle file
+  local out rc=0 data first
+  missing_why=""
+  out="$("$ENV" -i "$PERL" -e "$COPY_PERL" "$READ_TIMEOUT_SECONDS" "$2" - 2>/dev/null)" || rc=$?
+  if (( rc != 0 )) || [[ "$out" != *$'\n'*. ]]; then
+    missing_why="its output could not be read whole (${out%%$'\n'*}${out:+, }exit $rc)"
+    return 1
+  fi
+  data="${out#*$'\n'}"; data="${data%.}"
+  first="${data%%$'\n'*}"
+  if [[ "$data" == *$'\n'*$'\n'* && "$first" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}\ defaults\[[0-9]+:[0-9a-f]+\]\ $ ]]; then
+    data="${data#*$'\n'}"
+  fi
+  if [[ "$data" == "The domain/default pair of ($1, NSAppSleepDisabled) does not exist"$'\n' ]]; then
+    return 0
+  fi
+  missing_why="its output is not only the message for a missing key"
+  return 1
+}
 keep_app_nap_entry() { # index
   local entry
   state_read "appNapOverrides.$1" json; entry="$read_value"
@@ -2837,11 +2930,13 @@ if (( app_nap_count > 0 )); then
     else
       # The key was absent before, so it goes. `defaults delete` fails when
       # the key is already gone, which is the wanted state. A failed delete
-      # clears the entry only when `defaults read` then says in so many
-      # words that the key does not exist. A read that succeeds means the
-      # key is still set; one that fails any other way (cfprefsd not
-      # answering, a timeout) proves nothing, so the entry stays for the
-      # next run.
+      # clears the entry only when `defaults read` then exits 1 and its
+      # whole output is the message defaults prints for this domain's key
+      # missing (read_says_missing). A read that succeeds means the key is
+      # still set; one that exits any other way (cfprefsd not answering, a
+      # timeout, a supervisor with no answer), or prints anything else
+      # (more lines, a NUL byte, output that cannot be read whole), proves
+      # nothing, so the entry stays for the next run.
       if run_bounded "$DEFAULTS" delete "$bundle" NSAppSleepDisabled; then
         log info "defaults delete $bundle NSAppSleepDisabled ok"
         changed=1
@@ -2866,11 +2961,16 @@ if (( app_nap_count > 0 )); then
           log error "defaults delete $bundle NSAppSleepDisabled failed and the key is still set; keeping journal entry for retry"
           failures+=("App Nap is still off for $bundle: defaults delete failed")
           keep_app_nap_entry "$i"
-        elif "$GREP" -q "does not exist" "$probe" 2>/dev/null; then
+        elif (( read_rc == 1 )) && read_says_missing "$bundle" "$probe"; then
           log info "defaults delete $bundle NSAppSleepDisabled: the key is already absent"
           changed=1
         else
-          log error "defaults delete $bundle NSAppSleepDisabled failed and defaults read could not tell whether the key is still set (exit $read_rc); keeping journal entry for retry"
+          if (( read_rc == 1 )); then
+            missing_why="defaults read exited 1, but $missing_why"
+          else
+            missing_why="defaults read exited $read_rc"
+          fi
+          log error "defaults delete $bundle NSAppSleepDisabled failed and defaults read could not tell whether the key is still set ($missing_why); keeping journal entry for retry"
           failures+=("App Nap may still be off for $bundle: defaults delete failed and the key could not be read")
           keep_app_nap_entry "$i"
         fi

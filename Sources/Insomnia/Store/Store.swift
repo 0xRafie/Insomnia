@@ -8,9 +8,14 @@ import Foundation
 /// it is read.
 struct Store: Sendable {
     let paths: Paths
+    /// Runs before each read of session.json (`loadSession`) and fails it
+    /// by throwing, as an I/O error would. Nil in the app; tests use it for
+    /// a read that fails once and then succeeds.
+    let sessionReadCheck: (@Sendable () throws -> Void)?
 
-    init(paths: Paths) {
+    init(paths: Paths, sessionReadCheck: (@Sendable () throws -> Void)? = nil) {
         self.paths = paths
+        self.sessionReadCheck = sessionReadCheck
     }
 
     // MARK: Generic
@@ -151,6 +156,7 @@ struct Store: Sendable {
     /// aside as it moves any file that is not a session, before anything
     /// does arithmetic with it.
     func loadSession() throws -> Session? {
+        try sessionReadCheck?()
         let s: Session?
         do {
             s = try read(Session.self, from: paths.sessionFile)

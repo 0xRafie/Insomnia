@@ -8,7 +8,7 @@ final class OsascriptAdministratorPromptTests: XCTestCase {
     private var dir: URL!
 
     override func setUpWithError() throws {
-        dir = FileManager.default.temporaryDirectory
+        dir = TestScratch.directory
             .appendingPathComponent("insomnia-prompt-tests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     }
@@ -446,7 +446,7 @@ final class RootCommandTests: XCTestCase {
     private var receipts: SleepOffReceipts!
 
     override func setUpWithError() throws {
-        dir = FileManager.default.temporaryDirectory
+        dir = TestScratch.directory
             .appendingPathComponent("insomnia-root-command-tests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         receipts = try TestReceipts.make(in: dir)
@@ -1075,8 +1075,10 @@ final class RootCommandTests: XCTestCase {
     /// ls cannot read, stops the command the same way. The entries are
     /// the whole list the command's ls shows, which reads no real list
     /// (RootCommandProcess.withTestReceipts): no real list is read or
-    /// changed. `id -u` resolves the name for real. The control is the
-    /// entry install.sh adds.
+    /// changed. `id -u` is a stand-in that asks no directory
+    /// (TestReceipts.writeFakeId). An id that prints the user's uid and
+    /// then fails stops the command too: only id's exit status makes what
+    /// it printed an answer. The control is the entry install.sh adds.
     func testAReceiptWithAnotherModeOrListStopsBeforeAnyQuestion() throws {
         let says = "is missing, is not the 82-byte file install.sh made, mode 600 with one access control entry that lets uid \(uid) read it and nothing else, or someone other than root can change it or a folder above it. Run install.sh again; sleep was not turned off"
         let base: SleepOffReceipts = receipts
@@ -1101,6 +1103,21 @@ final class RootCommandTests: XCTestCase {
                 XCTAssertEqual(receipt, SleepOffReceipts.initialContent, label)
                 XCTAssertTrue(r.stderr.contains(says), "\(label): \(r.stderr)")
             }
+        }
+        let idMode = base.folder + ".id.mode"
+        for (name, command) in try bothCommands() {
+            try Data(nonce1.utf8).write(to: marker)
+            resetReceipt()
+            try Data("output-then-fail".utf8).write(to: URL(fileURLWithPath: idMode))
+            let r = try runRootCommand(marker: marker, nonce: nonce1, command: command, receipts: base, in: dir)
+            unlink(idMode)
+            let label = "id prints the uid, then fails, \(name)"
+            XCTAssertEqual(r.status, 7, "\(label): \(r.stderr)")
+            XCTAssertEqual(r.pmsetCalls, [], "\(label): nothing read, nothing written")
+            XCTAssertEqual(r.sudoCalls, [], "\(label): nothing asked")
+            XCTAssertEqual(r.perlCalls, [], "\(label): nothing written")
+            XCTAssertEqual(receipt, SleepOffReceipts.initialContent, label)
+            XCTAssertTrue(r.stderr.contains(says), "\(label): \(r.stderr)")
         }
         for (name, command) in try bothCommands() {
             try Data(nonce1.utf8).write(to: marker)
@@ -1779,7 +1796,7 @@ final class RootCommandSudoAnswerTests: XCTestCase {
     private var dir: URL!
 
     override func setUpWithError() throws {
-        dir = FileManager.default.temporaryDirectory
+        dir = TestScratch.directory
             .appendingPathComponent("insomnia-sudo-answer-tests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     }
@@ -1958,7 +1975,7 @@ final class PendingStartRemovalTests: XCTestCase {
     private var dir: URL!
 
     override func setUpWithError() throws {
-        dir = FileManager.default.temporaryDirectory
+        dir = TestScratch.directory
             .appendingPathComponent("insomnia-marker-tests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     }
@@ -2219,7 +2236,7 @@ final class PmsetSleepGuardPromptTests: XCTestCase {
     private var dir: URL!
 
     override func setUpWithError() throws {
-        dir = FileManager.default.temporaryDirectory
+        dir = TestScratch.directory
             .appendingPathComponent("insomnia-guard-tests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     }
