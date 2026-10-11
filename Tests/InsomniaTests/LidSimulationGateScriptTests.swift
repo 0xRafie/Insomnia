@@ -38,7 +38,7 @@ final class LidSimulationGateScriptTests: XCTestCase {
         // `swift build` succeeds without building; --show-bin-path names the
         // plain directory, or the sim one for the opt-in scratch path.
         try stub("swift", """
-            for a in "$@"; do [[ $a == --scratch-path ]] && dir=\(sim.path); done
+            for a in "$@"; do [[ $a == --scratch-path ]] && dir='\(sim.path)'; done
             for a in "$@"; do [[ $a == --show-bin-path ]] && echo "${dir:-\(plain.path)}"; done
             exit 0
             """)

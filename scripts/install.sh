@@ -202,7 +202,8 @@ command_line() { local line; line="$(printf '%q ' "$@")"; printf '%s' "${line% }
 # Run one external call with a time limit, so a call that stalls (a sudo
 # policy or directory-service lookup, a launchd that does not answer) cannot
 # keep this run waiting forever. Its combined output is left in
-# BOUNDED_OUTPUT (trailing newline removed) and its exit status returned, or
+# BOUNDED_OUTPUT (trailing newline removed, and BOUNDED_NEWLINE 1 when there
+# was one) and its exit status returned, or
 # 124 when it did not finish within CALL_TIMEOUT_SECONDS and was stopped, or
 # 125 when it is sudo and still running. No pid is kept or printed for it:
 # by the time anyone acted on one, it could name another process.
@@ -235,13 +236,19 @@ command_line() { local line; line="$(printf '%q ' "$@")"; printf '%s' "${line% }
 # holds no number from 0 to 255, gives 124.
 BOUNDED_OUTPUT=""
 BOUNDED_WHOLE=0
+# install.sh reads no BOUNDED_NEWLINE (uninstall.sh does); bounded() sets it
+# so that it stays the same as uninstall.sh's.
+# shellcheck disable=SC2034
+BOUNDED_NEWLINE=0
 # install.sh decides from a call's output only where it also reads
 # BOUNDED_WHOLE (leftover_runs); bounded() stays the same as uninstall.sh's.
+# shellcheck disable=SC2034  # BOUNDED_NEWLINE, as above
 bounded() { # command args...
   local base supervisor rc deadline file="" size opened=0 read_rc=0
   base="$("$MKTEMP" "$WORK/call.XXXXXX")"
   BOUNDED_OUTPUT=""
   BOUNDED_WHOLE=0
+  BOUNDED_NEWLINE=0
   supervise "$base" "$@" </dev/null >/dev/null 2>&1 &
   supervisor=$!
   if [[ "$1" == "$SUDO" ]]; then
@@ -270,6 +277,7 @@ bounded() { # command args...
       BOUNDED_WHOLE=1
     fi
   fi
+  if [[ "$BOUNDED_OUTPUT" == *$'\n' ]]; then BOUNDED_NEWLINE=1; fi
   BOUNDED_OUTPUT="${BOUNDED_OUTPUT%$'\n'}"
   return "$rc"
 }

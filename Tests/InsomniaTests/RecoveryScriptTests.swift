@@ -12647,7 +12647,9 @@ final class RecoveryScriptTests: XCTestCase {
         let dead = fx.appsDir.appendingPathComponent(".Insomnia.app.staging.4242.AAAAAA")
         try fx.writeBundle(at: dead.appendingPathComponent("Insomnia.app"), marker: "staged")
         let olderCandidate = fx.plist.deletingLastPathComponent().appendingPathComponent("com.insomnia.backstop.candidate-1.plist")
-        try "older".write(to: olderCandidate, atomically: true, encoding: .utf8)
+        // An older run's candidate for this bundle: the sweep removes only
+        // the candidates that run this install's $APP.
+        try fx.agentPlistData().write(to: olderCandidate)
         let candidateDir = fx.plist.deletingLastPathComponent().appendingPathComponent(".com.insomnia.backstop.staging")
         let tmp = try fx.privateTmp()
 

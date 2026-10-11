@@ -642,20 +642,30 @@ final class SleepOffReceiptsTests: XCTestCase {
     }
 
     /// Only an absolute path with no empty, `.` or `..` component and no
-    /// link on the way is a folder the checks accept. The temporary
-    /// directory's own path goes through /var, a link to /private/var.
+    /// link on the way is a folder the checks accept. A link the test makes
+    /// beside its home leads to the same folder; so does /var, a link to
+    /// /private/var, when the scratch folder is under it (Darwin's per-user
+    /// temp dir, as on hosted CI; a run that sets TMPDIR elsewhere has no
+    /// /var on the way).
     func testOnlyAPlainAbsoluteFolderWithNoLinkIsAccepted() throws {
         let real = receipts.folder
         let base = (real as NSString).deletingLastPathComponent
-        XCTAssertTrue(real.hasPrefix("/private/var/"), real)
-        let viaVar = String(real.dropFirst("/private".count))
+        let link = base + "-link"
+        XCTAssertEqual(symlink(base, link), 0, link)
+        defer { unlink(link) }
+        XCTAssertThrowsError(try SleepOffReceipts(folder: link + "/receipts", owners: [0, getuid()], user: getuid(), lists: .listed([.installed(for: getuid())])).identity()) { error in
+            XCTAssertEqual(error.localizedDescription, "\(link) is not a folder")
+        }
         for folder in ["receipts", base + "/./receipts", base + "/../" + (base as NSString).lastPathComponent + "/receipts", base + "//receipts", real + "/", "/"] {
             XCTAssertThrowsError(try SleepOffReceipts(folder: folder, owners: [0, getuid()], user: getuid(), lists: .listed([.installed(for: getuid())])).identity(), folder) { error in
                 XCTAssertTrue(error.localizedDescription.hasSuffix("is not a plain absolute path"), "\(folder): \(error.localizedDescription)")
             }
         }
-        XCTAssertThrowsError(try SleepOffReceipts(folder: viaVar, owners: [0, getuid()], user: getuid(), lists: .listed([.installed(for: getuid())])).identity()) { error in
-            XCTAssertEqual(error.localizedDescription, "/var is not a folder")
+        if real.hasPrefix("/private/var/") {
+            let viaVar = String(real.dropFirst("/private".count))
+            XCTAssertThrowsError(try SleepOffReceipts(folder: viaVar, owners: [0, getuid()], user: getuid(), lists: .listed([.installed(for: getuid())])).identity()) { error in
+                XCTAssertEqual(error.localizedDescription, "/var is not a folder")
+            }
         }
         XCTAssertNoThrow(try SleepOffReceipts(folder: real, owners: [0, getuid()], user: getuid(), lists: .listed([.installed(for: getuid())])).identity())
     }

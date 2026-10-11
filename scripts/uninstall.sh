@@ -3122,6 +3122,68 @@ as_root() { # command args...
   esac
   return "$rc"
 }
+# Whose the plist or candidate $1 is, from what it runs. It is read from a
+# private copy (copy_private: a regular file, not a link, read whole),
+# never in place. install.sh and the app write ProgramArguments
+# /bin/sh -c <program> sh <requirement> <bundle>; builds before the sealed
+# bundle wrote /bin/bash <their folder>/backstop.sh. It is this folder's
+# when that bundle is $APP, or that script $APP_SUPPORT/backstop.sh: the
+# same path, or the same name in a folder that is this one's by device and
+# inode (a link to this whole folder), and the file is this user's: the
+# plist of another account whose LaunchAgents folder is shared with this
+# one runs the same bundle, but that account owns it. Two folders of this
+# user that run one bundle write the same bytes; their plists cannot be
+# told apart, and one of them counts as this folder's. Sets plist_seen to
+# own (plist_id: the identity it was read with), other (plist_whose says
+# why: it runs another bundle or script, or another user owns it), gone
+# (no such file now), odd (a link or not a regular file, which Insomnia
+# never writes) or unknown (with plist_why). A change of owner
+# after the read changes the file's change time, so remove_plist's
+# identity check before the rm sees it.
+own_plist() { # path
+  local rc=0 n first runs want mine
+  plist_seen=unknown; plist_why=""; plist_id=""; plist_whose=""
+  [[ -e "$1" || -L "$1" ]] || { plist_seen=gone; return 0; }
+  copy_private "$1" read.agent.plist || rc=$?
+  case "$rc" in
+    0) ;;
+    4) plist_seen=odd; return 0 ;;
+    *) plist_why="it could not be read ($copy_why)"; return 0 ;;
+  esac
+  plist_id="$copy_id"
+  if [[ ! -O "$1" ]]; then
+    plist_seen=other; plist_whose="another user owns it"
+    return 0
+  fi
+  n="$(plutil_on -extract ProgramArguments raw -o - "$copy_path" 2>/dev/null)" || n=""
+  first="$(plutil_on -extract ProgramArguments.0 raw -o - "$copy_path" 2>/dev/null)" || first=""
+  if [[ "$n" == 6 && "$first" == /bin/sh ]]; then
+    want="$APP"
+    runs="$(plutil_on -extract ProgramArguments.5 raw -o - "$copy_path" 2>/dev/null)" || runs=""
+  elif [[ "$n" == 2 && "$first" == /bin/bash ]]; then
+    want="$APP_SUPPORT/backstop.sh"
+    runs="$(plutil_on -extract ProgramArguments.1 raw -o - "$copy_path" 2>/dev/null)" || runs=""
+  else
+    plist_why="its ProgramArguments are not the ones Insomnia writes"
+    return 0
+  fi
+  if [[ "$runs" != /* ]]; then
+    plist_why="what its ProgramArguments run is not an absolute path"
+    return 0
+  fi
+  plist_whose="it runs $runs, not this folder's ${want##*/}"
+  if [[ "$runs" == "$want" ]]; then plist_seen=own; return 0; fi
+  if [[ "${runs##*/}" != "${want##*/}" ]]; then plist_seen=other; return 0; fi
+  path_identity "${want%/*}" || { plist_why="it runs $runs, and ${want%/*} could not be identified ($own_why)"; return 0; }
+  mine="$path_id"
+  rc=0; path_identity "${runs%/*}" || rc=$?
+  case "$rc" in
+    0) if [[ "$path_id" == "$mine" ]]; then plist_seen=own; else plist_seen=other; fi ;;
+    # Its folder is gone or cannot be reached; this folder's can.
+    1) plist_seen=other ;;
+    *) plist_why="it runs $runs, whose folder could not be identified ($own_why)" ;;
+  esac
+}
 # After the LaunchAgent was booted out (agent_out), a stop loads it again
 # from its plist, which stays in place until the shared files are gone,
 # so this folder's recovery runs as it did before the uninstall. It runs
@@ -3477,68 +3539,6 @@ agents_dir_home() {
     # A link to nothing: there is nothing in it to remove.
     1) agents_home=none ;;
     *) agents_why="$own_why" ;;
-  esac
-}
-# Whose the plist or candidate $1 is, from what it runs. It is read from a
-# private copy (copy_private: a regular file, not a link, read whole),
-# never in place. install.sh and the app write ProgramArguments
-# /bin/sh -c <program> sh <requirement> <bundle>; builds before the sealed
-# bundle wrote /bin/bash <their folder>/backstop.sh. It is this folder's
-# when that bundle is $APP, or that script $APP_SUPPORT/backstop.sh: the
-# same path, or the same name in a folder that is this one's by device and
-# inode (a link to this whole folder), and the file is this user's: the
-# plist of another account whose LaunchAgents folder is shared with this
-# one runs the same bundle, but that account owns it. Two folders of this
-# user that run one bundle write the same bytes; their plists cannot be
-# told apart, and one of them counts as this folder's. Sets plist_seen to
-# own (plist_id: the identity it was read with), other (plist_whose says
-# why: it runs another bundle or script, or another user owns it), gone
-# (no such file now), odd (a link or not a regular file, which Insomnia
-# never writes) or unknown (with plist_why). A change of owner
-# after the read changes the file's change time, so remove_plist's
-# identity check before the rm sees it.
-own_plist() { # path
-  local rc=0 n first runs want mine
-  plist_seen=unknown; plist_why=""; plist_id=""; plist_whose=""
-  [[ -e "$1" || -L "$1" ]] || { plist_seen=gone; return 0; }
-  copy_private "$1" agent.plist || rc=$?
-  case "$rc" in
-    0) ;;
-    4) plist_seen=odd; return 0 ;;
-    *) plist_why="it could not be read ($copy_why)"; return 0 ;;
-  esac
-  plist_id="$copy_id"
-  if [[ ! -O "$1" ]]; then
-    plist_seen=other; plist_whose="another user owns it"
-    return 0
-  fi
-  n="$(plutil_on -extract ProgramArguments raw -o - "$copy_path" 2>/dev/null)" || n=""
-  first="$(plutil_on -extract ProgramArguments.0 raw -o - "$copy_path" 2>/dev/null)" || first=""
-  if [[ "$n" == 6 && "$first" == /bin/sh ]]; then
-    want="$APP"
-    runs="$(plutil_on -extract ProgramArguments.5 raw -o - "$copy_path" 2>/dev/null)" || runs=""
-  elif [[ "$n" == 2 && "$first" == /bin/bash ]]; then
-    want="$APP_SUPPORT/backstop.sh"
-    runs="$(plutil_on -extract ProgramArguments.1 raw -o - "$copy_path" 2>/dev/null)" || runs=""
-  else
-    plist_why="its ProgramArguments are not the ones Insomnia writes"
-    return 0
-  fi
-  if [[ "$runs" != /* ]]; then
-    plist_why="what its ProgramArguments run is not an absolute path"
-    return 0
-  fi
-  plist_whose="it runs $runs, not this folder's ${want##*/}"
-  if [[ "$runs" == "$want" ]]; then plist_seen=own; return 0; fi
-  if [[ "${runs##*/}" != "${want##*/}" ]]; then plist_seen=other; return 0; fi
-  path_identity "${want%/*}" || { plist_why="it runs $runs, and ${want%/*} could not be identified ($own_why)"; return 0; }
-  mine="$path_id"
-  rc=0; path_identity "${runs%/*}" || rc=$?
-  case "$rc" in
-    0) if [[ "$path_id" == "$mine" ]]; then plist_seen=own; else plist_seen=other; fi ;;
-    # Its folder is gone or cannot be reached; this folder's can.
-    1) plist_seen=other ;;
-    *) plist_why="it runs $runs, whose folder could not be identified ($own_why)" ;;
   esac
 }
 # Whether $1 is the file launchd loaded another folder's agent from
