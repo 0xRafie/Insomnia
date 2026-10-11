@@ -39,8 +39,9 @@ jobs:
             experimental: true
     runs-on: ${{ matrix.image }}
     continue-on-error: ${{ matrix.experimental }}
-    # The test watchdog below allows 50 minutes; the rest covers the build
-    # before it and the release build and lid simulation check after it.
+    # The test watchdog below allows 50 minutes for swift test, which builds
+    # the tests and then runs them; the other 10 cover setup, the release
+    # build and the lid simulation check.
     timeout-minutes: 60
     steps:
       - name: Check out
@@ -126,10 +127,11 @@ jobs:
         # NSUnbufferedIO makes XCTest write each line as it happens. With
         # the default 16 KB stdout buffer the log of a hung run stops up to
         # 16 KB before the test that hung, which has already misled one
-        # investigation. If the run is still going after 50 minutes (a
-        # normal run takes about 3), the watchdog samples every xctest
-        # process so the log shows what the hung test is waiting on, then
-        # fails the step instead of waiting for the job timeout.
+        # investigation. If swift test is still going after 50 minutes (on
+        # main in October 2026 it took 11 to 16, build included), the
+        # watchdog samples every xctest process so the log shows what the
+        # hung test is waiting on, then fails the step instead of waiting
+        # for the job timeout.
         env:
           NSUnbufferedIO: "YES"
         run: |
