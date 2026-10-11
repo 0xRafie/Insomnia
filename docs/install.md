@@ -315,6 +315,15 @@ print` does not confirm the unload or the reload. Unresolved recovery prevents
 replacing either; follow the reported instructions before retrying. The
 installer checks the sudoers rule again once it holds the recovery lock, and
 stops if the rule is gone, as after an `uninstall.sh` that took the lock first.
+Before the lock, its other steps that touch the disk or ask the system have
+a 30 s limit too: its private folders, the copy and the signature checks of
+the new bundle, the copy of the new rule, the support folders, and the open
+and lock of the lock file. A read that does not answer is stopped as below.
+A copy, folder or lock step that does not finish is never signalled: the
+install stops there, says what it had installed so far, leaves its private
+folders in place, and asks you to rerun it once that step has ended. The
+quit request has the same limit, and the wait for the app to exit follows
+it as before. The source build and the password prompt have no limit.
 Each call it makes to `sudo`, `pgrep`, `ps`, `plutil`, `launchctl` or
 `codesign` while it holds the lock has a 30 s limit, which a supervising
 process enforces even if the installer is killed meanwhile. The call keeps
@@ -410,7 +419,12 @@ stops it before any `backstop.sh` runs or anything is removed. From the zip
 it goes on: the sealed backstop then keeps any frozen process that only the
 app binary can resume, and the uninstall stops before removing anything. It
 asks for your password (`sudo -v`) before the lock as well, so every `sudo`
-call under the lock is `sudo -n` with the 30 s limit. Once it holds the
+call under the lock is `sudo -n` with the 30 s limit. Its private folder,
+the `id` reads of your account, the support folder, and the open and lock
+of the lock file have the 30 s limit too, and one that does not finish
+stops the uninstall with nothing removed. A folder or lock step is never
+signalled; rerun the uninstaller once it has ended. The quit request has
+the same limit, and the wait for the app to exit follows it as before. Once it holds the
 lock, no Info.plist is read: its own process check counts a process it
 first sees then as unverified and blocks, and the `backstop.sh` it runs gets
 the version and the identity in its environment and uses the version only

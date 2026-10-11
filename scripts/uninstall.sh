@@ -77,7 +77,6 @@ LOCKF=/usr/bin/lockf
 DEFAULTS=/usr/bin/defaults
 ID=/usr/bin/id
 KILL=/bin/kill
-DATE=/bin/date
 MKDIR=/bin/mkdir
 RM=/bin/rm
 RMDIR=/bin/rmdir
@@ -184,8 +183,9 @@ DEFAULT_AGENTS=(
   com.electron.ollama             # Ollama
 )
 LOCK="$APP_SUPPORT/.recovery.lock"
-UID_NUM="$("$ID" -u)"
-ACCOUNT="$("$ID" -un)"
+# This account's uid and name, read once WORK is made (see read_account).
+UID_NUM=""
+ACCOUNT=""
 
 step() { printf '\n==> %s\n' "$*"; }
 
@@ -808,6 +808,67 @@ change_unit() { # command args...
   wait "$!" || status=$?
   printf '%s\0' "$status" 2 "" "" end
 }
+# What a command printed, for a command this shell needs the output of
+# before it has a WORK for the file change keeps that in: the mktemp that
+# makes WORK. capture makes the command as change does, in a unit of its
+# own (capture_unit) that ignores SIGTERM, SIGHUP and SIGPIPE, keeps fd 9,
+# and is started and settled as a supervisor is, and waits for it no longer
+# than CHANGE_TIMEOUT_SECONDS. The unit reads the command's standard
+# output itself, through the pipe of a $(...), to its end; the command's
+# standard input and error are /dev/null, so it keeps neither of this
+# run's outputs. The unit sends the command's exit status and then the
+# text, as send_output does, or a read that failed (2) for a text longer
+# than READ_MAX_BYTES. $(...) drops NUL bytes, so a caller takes only text
+# in the form it expects. Returns the command's status, with
+# CHANGE_SETTLED=1 and the text in CAPTURED when it came whole; or 124,
+# with CHANGE_SETTLED=0, CHANGE_UNSETTLED=1 and CAPTURED empty, when that
+# did not all come in time (see change). Nothing signals the command.
+# READ_TEXT and READ_HEAD are as they were before.
+CAPTURED=""
+capture() { # command args...
+  local was=$CHANGE_UNSETTLED rc=124 status took=0
+  local text="${READ_TEXT:-}" head="${READ_HEAD:-}" deadline=$(( SECONDS + CHANGE_TIMEOUT_SECONDS ))
+  CAPTURED=""
+  CHANGE_SETTLED=0
+  CHANGE_UNSETTLED=1
+  if exec 5< <(exec </dev/null 2>/dev/null; capture_unit "$@" & settle "$!"); then
+    if pipe_field "$deadline" && [[ "$FIELD" =~ ^[0-9]{1,3}$ ]] && (( 10#$FIELD <= 255 )); then
+      status=$(( 10#$FIELD ))
+      take_output "$deadline" || took=$?
+      if (( took != 3 )); then
+        rc=$status
+        CHANGE_SETTLED=1
+        CHANGE_UNSETTLED=$was
+        (( took != 0 )) || CAPTURED="$READ_TEXT"
+      fi
+    fi
+    exec 5<&-
+  fi
+  READ_TEXT="$text"
+  READ_HEAD="$head"
+  return "$rc"
+}
+# The unit of one capture. errexit is off here, as in change_unit. The
+# status follows the text after a newline, so the text keeps its own
+# newlines at its end.
+capture_unit() { # command args...
+  local out status
+  set +e
+  trap '' TERM HUP PIPE
+  out="$("$@" </dev/null 2>/dev/null 3<&- 4>&-; printf '\n%s' "$?")"
+  status="${out##*$'\n'}"
+  out="${out%$'\n'*}"
+  printf '%s\0' "$status" || return
+  if capture_fits "$out"; then
+    printf '%s\0' 0 "$out" "" end
+  else
+    printf '%s\0' 2 "" "" end
+  fi
+}
+capture_fits() { # text
+  local LC_ALL=C
+  (( ${#1} <= READ_MAX_BYTES ))
+}
 # change, and the end of the run when the change was not seen to finish:
 # stop_unsettled, which each script defines, says what it was and exits 1.
 # Returns the change's status otherwise.
@@ -1047,11 +1108,28 @@ snapshot() { # file copy
   BOUNDED_NEW_FILE="$2" bounded "$CP" -X "$1" "$2" || rc=$?
   return "$rc"
 }
+# Ends this run after a step it made before the recovery lock was not seen
+# to finish (see change): nothing more is made or removed, and the cleanup
+# at exit leaves what it would remove (see tidy).
+stop_preparing() { # what
+  echo "Uninstall stopped: $1 did not finish within ${CHANGE_TIMEOUT_SECONDS}s, so whether it took place is not known. Nothing was removed. Rerun this script once it has ended." >&2
+  exit 1
+}
 # Scratch space for bounded() and for the private copies of the journal the
 # checks in step 4 read: this run's own directory, emptied on exit as a
 # change of its own (see tidy), unless a change this run made was not seen
-# to finish.
-WORK="$("$MKTEMP" -d "${TMPDIR:-/tmp}/insomnia-uninstall.XXXXXX")"
+# to finish. mktemp runs through capture, which waits for it no longer than
+# CHANGE_TIMEOUT_SECONDS, and what it printed must be the one folder it
+# makes from the template.
+work_template="${TMPDIR:-/tmp}/insomnia-uninstall.XXXXXX"
+work_rc=0
+capture "$MKTEMP" -d "$work_template" || work_rc=$?
+(( CHANGE_SETTLED )) || stop_preparing "making a private folder in ${TMPDIR:-/tmp} ('mktemp -d $work_template')"
+WORK="${CAPTURED%$'\n'}"
+if (( work_rc != 0 )) || [[ "$CAPTURED" != "$WORK"$'\n' || "$WORK" != "${work_template%XXXXXX}"* || ! "${WORK#"${work_template%XXXXXX}"}" =~ ^[A-Za-z0-9]{6}$ ]]; then
+  echo "Could not make a private folder in ${TMPDIR:-/tmp} ('mktemp -d $work_template' exited $work_rc). Nothing was removed." >&2
+  exit 1
+fi
 remove_work() {
   "$RM" -f "$WORK"/call.* "$WORK"/notes.* "$WORK"/*.json 2>/dev/null || true
   "$RMDIR" "$WORK" 2>/dev/null
@@ -1083,6 +1161,26 @@ read_result() { # status
     printf 'exited 0, but what it printed could not be read back in full'
   fi
 }
+
+# This account's uid (UID_NUM) and name (ACCOUNT), each from a bounded id
+# call whose output must be one line in the form expected; the run stops
+# before anything is changed otherwise.
+read_account() {
+  local rc=0 uid_form=$'^[0-9]+\n$' name_form=$'^[^\n]+\n$'
+  bounded "$ID" -u || rc=$?
+  if (( rc != 0 || BOUNDED_READ != 0 )) || [[ ! "$READ_TEXT" =~ $uid_form ]]; then
+    echo "Could not read this account's user ID ('id -u' $(read_result "$rc")). Nothing was removed." >&2
+    exit 1
+  fi
+  UID_NUM="${READ_TEXT%$'\n'}"
+  bounded "$ID" -un || rc=$?
+  if (( rc != 0 || BOUNDED_READ != 0 )) || [[ ! "$READ_TEXT" =~ $name_form ]]; then
+    echo "Could not read this account's name ('id -un' $(read_result "$rc")). Nothing was removed." >&2
+    exit 1
+  fi
+  ACCOUNT="${READ_TEXT%$'\n'}"
+}
+read_account
 
 # Prints one line per way the app's records about a kept display entry would
 # not decode, or nothing. Read from the text of state.json $1 itself, not
@@ -1414,23 +1512,43 @@ unrestored_level() { # level-key refused-key what
   return 0
 }
 
+# Seconds since the epoch for a UTC date and time given as base 10 numbers
+# (year from 1, month, day, hour, minute, second), in EPOCH. Returns 1, and
+# leaves EPOCH as it was, when no such date and time exists: the month is 1
+# to 12, the day one that month has in that year, hours 0 to 23, minutes
+# and seconds 0 to 59. The shell works it out itself, so nothing it calls
+# can wait: the days come from the civil date as days_from_civil does in
+# https://howardhinnant.github.io/date_algorithms.html.
+EPOCH=0
+epoch_from() { # year month day hour minute second
+  local y=$(( 10#$1 )) m=$(( 10#$2 )) d=$(( 10#$3 )) h=$(( 10#$4 )) mi=$(( 10#$5 )) s=$(( 10#$6 )) days=31 era yoe doy
+  (( y >= 1 && m >= 1 && m <= 12 && d >= 1 && h <= 23 && mi <= 59 && s <= 59 )) || return 1
+  case "$m" in
+    4|6|9|11) days=30 ;;
+    2) days=28; if (( y % 4 == 0 && ( y % 100 != 0 || y % 400 == 0 ) )); then days=29; fi ;;
+  esac
+  (( d <= days )) || return 1
+  (( m > 2 )) || y=$(( y - 1 ))
+  era=$(( y / 400 ))
+  yoe=$(( y - era * 400 ))
+  doy=$(( (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1 ))
+  EPOCH=$(( (era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468) * 86400 + h * 3600 + mi * 60 + s ))
+  return 0
+}
 # Same rules as backstop.sh: a date in the form Store.parseDate reads, and
 # the keys and types the app's Session decoder needs.
 epoch_of() { # string
-  local form='^([0-9]{4})-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|([+-])([0-9]{2}):([0-9]{2}))$'
-  local clock offset=0 e
+  local form='^([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(Z|([+-])([0-9]{2}):([0-9]{2}))$'
+  local offset=0
   [[ "$1" =~ $form ]] || return 0
   (( 10#${BASH_REMATCH[1]} >= 1970 )) || return 0
-  if [[ "${BASH_REMATCH[2]}" != Z ]]; then
-    (( 10#${BASH_REMATCH[4]} <= 23 && 10#${BASH_REMATCH[5]} <= 59 )) || return 0
-    offset=$(( 10#${BASH_REMATCH[4]} * 3600 + 10#${BASH_REMATCH[5]} * 60 ))
-    if [[ "${BASH_REMATCH[3]}" == - ]]; then offset=$(( -offset )); fi
+  if [[ "${BASH_REMATCH[7]}" != Z ]]; then
+    (( 10#${BASH_REMATCH[9]} <= 23 && 10#${BASH_REMATCH[10]} <= 59 )) || return 0
+    offset=$(( 10#${BASH_REMATCH[9]} * 3600 + 10#${BASH_REMATCH[10]} * 60 ))
+    if [[ "${BASH_REMATCH[8]}" == - ]]; then offset=$(( -offset )); fi
   fi
-  clock="${1:0:19}"
-  e="$("$DATE" -j -u -f '%Y-%m-%dT%H:%M:%S' "$clock" +%s 2>/dev/null)" || return 0
-  if [[ "$("$DATE" -u -r "$e" +%Y-%m-%dT%H:%M:%S 2>/dev/null)" == "$clock" ]]; then
-    echo $(( e - offset ))
-  fi
+  epoch_from "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}" "${BASH_REMATCH[5]}" "${BASH_REMATCH[6]}" || return 0
+  echo $(( EPOCH - offset ))
   return 0
 }
 
@@ -1703,14 +1821,13 @@ list_unrecorded_app_nap() {
     [[ "$value" == 1 ]] || continue
     if (( found == 0 )); then
       found=1
-      cat <<MSG
-NSAppSleepDisabled is YES for these agent apps and Insomnia has no record of
-what it was before (an older build set it without recording). They are left
-as they are. To turn App Nap back on for one, run:
-MSG
+      printf '%s\n' \
+        "NSAppSleepDisabled is YES for these agent apps and Insomnia has no record of" \
+        "what it was before (an older build set it without recording). They are left" \
+        "as they are. To turn App Nap back on for one, run:"
     fi
     printf '  defaults delete %q NSAppSleepDisabled\n' "$id"
-  done <<< "$ids"
+  done < <(printf '%s\n' "$ids" 2>/dev/null)
   if (( found == 0 )); then
     echo "none of the $checked agent apps checked has NSAppSleepDisabled set"
   fi
@@ -1782,49 +1899,47 @@ remove_owned() { # path...
 
 abort_incomplete() { # backstop exit status, problem lines...
   local rc="$1"; shift
-  cat >&2 <<MSG
-
-Uninstall stopped BEFORE removing anything: Insomnia's changes are not fully
-undone (backstop exit status $rc). Still journaled in $STATE:
-MSG
+  printf '%s\n' \
+    "" \
+    "Uninstall stopped BEFORE removing anything: Insomnia's changes are not fully" \
+    "undone (backstop exit status $rc). Still journaled in $STATE:" >&2
   local p
   for p in "$@"; do printf '  - %s\n' "$p" >&2; done
-  cat >&2 <<MSG
-
-Nothing was removed on purpose: the LaunchAgent keeps retrying every minute,
-the sudoers rule keeps pmset undoable, and the journal keeps the evidence.
-
-What to do, then rerun this script:
-  - Saved audio (volume/mute), display brightness or keyboard backlight:
-    open Insomnia.app; it restores them from the journal at launch. If the
-    display is dark, press the brightness-up key first.
-  - An output device still muted from a lid close: connect it and open
-    Insomnia.app, which restores its volume. If the device is gone for
-    good, open Insomnia.app and choose "Stop waiting for <device>" in its
-    menu; the device then stays as it is.
-  - pmset failures (sleep / Low Power Mode): check $SUDOERS
-    (rerun scripts/install.sh to reinstall it), or run
-    'sudo pmset -a disablesleep 0' / 'sudo pmset -b lowpowermode 0' yourself.
-  - Frozen or legacy pids: open Insomnia.app to resolve them, or inspect each
-    with 'ps -o pid,stat,lstart,command -p <pid>' and 'kill -CONT <pid>' it
-    yourself if it is a process you recognise.
-  - App Nap (NSAppSleepDisabled): the recovery agent retries 'defaults write'
-    or 'defaults delete' every minute, and Insomnia.app restores them at
-    launch. If 'defaults' keeps failing, see the log.
-  - Unreadable state.json: neither the app nor the recovery agent repairs or
-    removes it. Repair it by hand from the log, or move it away yourself once
-    you know its changes are undone.
-  - session.json that does not parse: the recovery agent renames it to
-    session.json.unreadable-<time> as soon as the journal is clean, and the
-    app does the same at launch. It needs no action of its own.
-  - session.json that cannot be read at all: its end time is unknown, so
-    the app and the agent treat it as expired, undo the journal, and then
-    rename it to session.json.unreadable-<time> without opening it. If it
-    is still here, that rename failed (see the log): remove it or move it
-    out of this folder, then rerun. Do not make it readable where it is:
-    the app would then resume it.
-  - Log: $LOG_DIR/insomnia.log
-MSG
+  printf '%s\n' \
+    "" \
+    "Nothing was removed on purpose: the LaunchAgent keeps retrying every minute," \
+    "the sudoers rule keeps pmset undoable, and the journal keeps the evidence." \
+    "" \
+    "What to do, then rerun this script:" \
+    "  - Saved audio (volume/mute), display brightness or keyboard backlight:" \
+    "    open Insomnia.app; it restores them from the journal at launch. If the" \
+    "    display is dark, press the brightness-up key first." \
+    "  - An output device still muted from a lid close: connect it and open" \
+    "    Insomnia.app, which restores its volume. If the device is gone for" \
+    "    good, open Insomnia.app and choose \"Stop waiting for <device>\" in its" \
+    "    menu; the device then stays as it is." \
+    "  - pmset failures (sleep / Low Power Mode): check $SUDOERS" \
+    "    (rerun scripts/install.sh to reinstall it), or run" \
+    "    'sudo pmset -a disablesleep 0' / 'sudo pmset -b lowpowermode 0' yourself." \
+    "  - Frozen or legacy pids: open Insomnia.app to resolve them, or inspect each" \
+    "    with 'ps -o pid,stat,lstart,command -p <pid>' and 'kill -CONT <pid>' it" \
+    "    yourself if it is a process you recognise." \
+    "  - App Nap (NSAppSleepDisabled): the recovery agent retries 'defaults write'" \
+    "    or 'defaults delete' every minute, and Insomnia.app restores them at" \
+    "    launch. If 'defaults' keeps failing, see the log." \
+    "  - Unreadable state.json: neither the app nor the recovery agent repairs or" \
+    "    removes it. Repair it by hand from the log, or move it away yourself once" \
+    "    you know its changes are undone." \
+    "  - session.json that does not parse: the recovery agent renames it to" \
+    "    session.json.unreadable-<time> as soon as the journal is clean, and the" \
+    "    app does the same at launch. It needs no action of its own." \
+    "  - session.json that cannot be read at all: its end time is unknown, so" \
+    "    the app and the agent treat it as expired, undo the journal, and then" \
+    "    rename it to session.json.unreadable-<time> without opening it. If it" \
+    "    is still here, that rename failed (see the log): remove it or move it" \
+    "    out of this folder, then rerun. Do not make it readable where it is:" \
+    "    the app would then resume it." \
+    "  - Log: $LOG_DIR/insomnia.log" >&2
   exit 1
 }
 
@@ -2017,7 +2132,7 @@ sudoers_not_ours() { # file content
     esac
     echo "it has a line install.sh does not write: $line"
     return 0
-  done <<< "$1"
+  done < <(printf '%s\n' "$1" 2>/dev/null)
   (( grants > 0 )) || echo "it grants nothing"
   return 0
 }
@@ -2162,7 +2277,7 @@ r_acl() { # status type-and-id name...
     else
       end=2
     fi
-  done <<< "$out"
+  done < <(printf '%s\n' "$out" 2>/dev/null)
   (( end == 1 )) || r_die "$s" "the access control lists of ${names[*]} could not be read in full (perl: $out)"
 }
 # Exits 7 unless every folder from the one that holds $SUDOERS_LOCK up to /
@@ -2331,7 +2446,7 @@ root_functions() { # name...
   local line
   while IFS= read -r line; do
     printf '%s\n' "${line#"${line%%[! ]*}"}"
-  done <<< "$(declare -f "$@")"
+  done < <(declare -f "$@")
 }
 # Runs r_remove as root, in one sudo call, bounded like every
 # other call made under the recovery lock: `sudo -n` never prompts (the
@@ -2453,7 +2568,7 @@ sudoers_for_others() { # file content
     fi
     echo "has a line that is not for $USER: $line"
     return 0
-  done <<< "$1"
+  done < <(printf '%s\n' "$1" 2>/dev/null)
   return 0
 }
 # Stops the run when the rule's text $1 has a line for anyone but this
@@ -2722,7 +2837,9 @@ step "Quitting Insomnia"
 if (( app_was_running )); then
   if (( ${#APP_FOUND[@]} > 0 )); then
     echo "Insomnia is running ($(list "${APP_FOUND[@]}")); asking it to quit."
-    "$OSASCRIPT" -e "tell application id \"$BUNDLE_ID\" to quit" >/dev/null 2>&1 || true
+    # Bounded, so an osascript that does not answer does not hold the run;
+    # whether the app quit is what await_exit checks.
+    bounded "$OSASCRIPT" -e "tell application id \"$BUNDLE_ID\" to quit" || true
   fi
   await_exit
 fi
@@ -2731,10 +2848,31 @@ fi
 
 # 2. Take the recovery lock and keep it to the end ---------------------------
 step "Taking the recovery lock"
-"$MKDIR" -p "$APP_SUPPORT"
-exec 9<>"$LOCK"
+# Each step is a change (see change), so one that does not finish stops the
+# run instead of holding it. The lock file is opened first in the change's
+# own process, which makes it when it is missing and waits there should
+# the disk stall; this shell then opens it again for fd 9, a residual open
+# of its own that only a file which stalls after that first open can hold.
+# lockf locks fd 9 itself, which the change keeps.
 lock_rc=0
-"$LOCKF" -t "$LOCK_TIMEOUT_SECONDS" 9 2>/dev/null || lock_rc=$?
+change "$MKDIR" -p "$APP_SUPPORT" || lock_rc=$?
+(( CHANGE_SETTLED )) || stop_preparing "making $APP_SUPPORT"
+if (( lock_rc != 0 )); then
+  echo "Could not make $APP_SUPPORT (see the error above). Nothing was removed." >&2
+  exit 1
+fi
+# shellcheck disable=SC2317  # run through change
+lock_open() {
+  { : 8<>"$LOCK"; } 2>/dev/null
+}
+change lock_open || lock_rc=$?
+(( CHANGE_SETTLED )) || stop_preparing "opening $LOCK"
+if (( lock_rc != 0 )) || ! { exec 9<>"$LOCK"; } 2>/dev/null; then
+  echo "Could not open the recovery lock $LOCK. Nothing was removed." >&2
+  exit 1
+fi
+change quietly "$LOCKF" -t "$LOCK_TIMEOUT_SECONDS" 9 || lock_rc=$?
+(( CHANGE_SETTLED )) || stop_preparing "taking the recovery lock $LOCK"
 if (( lock_rc != 0 )); then
   echo "The recovery lock $LOCK is held by another process (a running backstop or the app)." >&2
   echo "Wait a minute and rerun. Nothing was removed." >&2

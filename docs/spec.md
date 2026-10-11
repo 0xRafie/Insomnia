@@ -223,12 +223,19 @@ recovery; newly written journals use `frozenProcesses`.
   `plutil`, `cat`, `stat`, `ps`) has 30 s, a checked status, and its
   output in a private directory. One that fails, is cut short, holds a
   NUL byte or does not answer stops the run: what was undone stays undone
-  and the rest stays journaled. These run directly, without a limit: the
-  `stat` of fd 9 and of the lock file that decides whether to share a
-  caller's lock, the `date` conversions and the `sysctl` boot reads, which
-  read only the kernel, and the `mktemp -d` of its private directory. Its
-  log lines, journal publish and removals are changes with a limit of
-  their own (below). A backstop that `install.sh` or `uninstall.sh` runs
+  and the rest stays journaled. Its reads of the time now (`date -u +%s`,
+  which tells whether the session has ended, and the stamp a moved-aside
+  session.json is named after) and of `sysctl kern.bootsessionuuid` are
+  bounded reads too: a time now that fails or does not answer stops the
+  run with nothing undone, and a stamp that does not keeps session.json in
+  place. The dates in the session, the journal and `ps -o lstart` are
+  converted by bash arithmetic, which runs no command; a date that does not
+  exist (February 30, hour 24) counts as unreadable, and a process whose
+  start date does not convert is kept in the journal, not signaled. The
+  account's uid is bash's own `EUID`. Its log lines, journal publish and
+  removals, the `mktemp -d` of its private directory, and the `stat` of
+  fd 9 and of the lock file that decides whether to share a caller's lock
+  are changes with a limit of their own (below). A backstop that `install.sh` or `uninstall.sh` runs
   has a 300 s limit on the whole run; one the LaunchAgent runs has none. A backstop sealed in a bundle from an earlier release ignores
   these variables and reads the Info.plist and the journal itself, without
   a limit on each read; only the 300 s limit applies to it.
@@ -309,7 +316,25 @@ recovery; newly written journals use `frozenProcesses`.
   (`CHANGE_TIMEOUT_SECONDS`): the backstop's log lines, the `mkdir` of its
   folder and the tightening of files an older build left loose (both before
   it takes the lock), its journal publish and removals, the installers'
-  plist publish and removals, and each cleanup step at exit. The command
+  plist publish and removals, and each cleanup step at exit. So are the
+  steps each script takes to prepare a run: its private folder, made by
+  `mktemp -d` through `capture`, a change that reads back what the command
+  printed (the folder's name) through a pipe of its own, since no private
+  folder exists yet for an output file; the backstop's first open of the
+  answer file for the app binary, and the checks of both descriptors and
+  the removal of its name once its shell has them (the `mktemp` that makes
+  it is a bounded read); `install.sh`'s staging and build folders, the
+  `ditto` copies of the new bundle, its `chmod` calls, the copy of the new
+  rule it writes for `visudo`, and the `mkdir` of the support, log and
+  LaunchAgents folders; `uninstall.sh`'s `mkdir` of the support folder; and,
+  in all three, a first open of the lock file, which makes it when it is
+  missing, then the `lockf` that locks fd 9. The preparing reads are
+  bounded calls: `install.sh`'s `sysctl`, `codesign` and `plutil` reads of
+  the new bundle and its `osascript` quit request, and `uninstall.sh`'s `id`
+  reads of the account and its quit request. A preparing step not seen to
+  finish stops the run before the lock with nothing more changed: the
+  installer says what it had installed so far, the uninstaller that nothing
+  was removed, and the backstop that nothing was read or undone. The command
   runs in a process of its own that keeps fd 9, with its output in a file
   made and pinned in the run's private folder (in /dev/null before that
   folder exists), and that process sends the status and the text down a
@@ -322,14 +347,23 @@ recovery; newly written journals use `frozenProcesses`.
   output or error: while one is in effect, bash 3.2 keeps the shell's own
   copy on a descriptor of its own, the change's processes would inherit
   it, and the caller's output would stay open until the command ends.
-  Still without a limit of their own: the backstop's `mktemp -d` for its
-  private folder, the answer file it makes and pins for the app binary
-  before the lock (the binary must be a direct child of its shell), the
-  `stat` of fd 9 and of the lock file, the open of the lock file, its
-  `date` conversions and `sysctl kern.bootsessionuuid` reads, and the
-  installers' here-documents and here-strings, which bash 3.2 writes to a
-  temporary file (root's are part of the text root runs, which this build
-  does not change).
+  The installers' messages are printed with `printf`, and lists are read
+  through a pipe (`< <(...)`), so their shells write no temporary file for
+  a here-document or here-string; the one here-document left, the
+  LaunchAgent plist, is written inside a change. Still without a limit of
+  their own: each shell's own opens after a first open in a change has
+  returned (fd 9 on the lock file, and the backstop's fd 7 and fd 6 on the
+  answer file, which the binary must inherit from its shell, as its direct
+  child), since bash cannot take a descriptor from another process; the
+  shells' file tests (`[[ -e ]]`, `[[ -f ]]`); `install.sh`'s source build
+  (`build-app.sh`, which runs `swift build` for minutes); the password
+  prompt (`sudo -v`, and `sudo visudo -cf`, which may prompt too); the
+  backstop's `kill -CONT` of a process it froze and the installers'
+  `kill -0` of the owner of a staging folder left behind; and what
+  the scripts print to the terminal. A `mktemp` not seen to finish may
+  still make its folder after the run stopped, under a name no run knows,
+  which is then left in `TMPDIR`. Root's text, a `bash -c` run through a
+  bounded `sudo`, is within that call's limit.
 - `uninstall.sh`'s own journal check reads each file once, by a bounded `cp`
   into a private directory, and runs every check on that copy, each with an
   explicit status that does not depend on `set -e`. A read that fails, is

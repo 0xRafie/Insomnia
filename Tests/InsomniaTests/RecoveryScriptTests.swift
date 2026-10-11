@@ -936,7 +936,7 @@ final class RecoveryScriptTests: XCTestCase {
             let work = fx.root.appendingPathComponent("work.\(script.lastPathComponent)", isDirectory: true)
             try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
             var functions = try Self.readLayerSource(text, script: script.lastPathComponent, work: work)
-            for name in ["epoch_of", "epoch_at"] {
+            for name in ["epoch_from", "epoch_of", "epoch_at"] {
                 functions += try Self.shellFunction(name, in: text, script.lastPathComponent)
             }
             let harness = fx.root.appendingPathComponent("epoch_at.\(script.lastPathComponent)")
@@ -12535,7 +12535,7 @@ final class RecoveryScriptTests: XCTestCase {
         }
         let backstop = try text("backstop.sh"), uninstall = try text("uninstall.sh"), install = try text("install.sh")
         XCTAssertEqual(try Self.sharedReadLayer(in: backstop, "backstop.sh"), try Self.sharedReadLayer(in: uninstall, "uninstall.sh"))
-        for name in ["journal_shape_problems", "session_shape_problems", "epoch_of", "epoch_at", "defaults_said_absent"] {
+        for name in ["journal_shape_problems", "session_shape_problems", "epoch_from", "epoch_of", "epoch_at", "defaults_said_absent"] {
             XCTAssertEqual(try Self.shellFunction(name, in: backstop, "backstop.sh"), try Self.shellFunction(name, in: uninstall, "uninstall.sh"), name)
         }
         func infoBlock(_ t: String, _ script: String) throws -> String {
@@ -12768,6 +12768,84 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(fx.exists(fx.session), "the next run removes the session")
     }
 
+    /// The backstop's mktemp of its work folder (a capture, made before the
+    /// run has a work folder for a change's output) takes longer than
+    /// CHANGE_TIMEOUT_SECONDS. The run logs that and stops there, before it
+    /// tightens anything, opens the lock or reads anything, and nothing
+    /// signals the mktemp. Read through one pipe, the run's output ends once
+    /// it exits. Once let go, the mktemp makes its folder, whose name no run
+    /// knows, so it stays; the next run undoes what the journal records and
+    /// removes only its own folder.
+    func testBackstopStopsWhenMakingItsWorkFolderDoesNotFinishInTime() throws {
+        try fx.writeBackstopCopy(extraConstants: ["CHANGE_TIMEOUT_SECONDS": "2", "MKTEMP": fx.bin.appendingPathComponent("mktemp").path])
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        let dirty = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#
+        try fx.writeState(dirty)
+        try fx.hold("mktemp", "*/insomnia-backstop.XXXXXX")
+        let tmp = try fx.privateTmp()
+        let template = tmp.appendingPathComponent("insomnia-backstop.XXXXXX").path
+
+        let r = try fx.runThroughOnePipe(fx.backstop, endWithin: 2)
+
+        XCTAssertEqual(r.status, 1, r.output + fx.log())
+        XCTAssertNotNil(r.endedAfter, "the output ends with the run (exit after \(r.exitedAfter) s), while the mktemp is held: \(r.output)")
+        XCTAssertTrue(fx.log().contains("[error] backstop: recovery stopped: creating a private folder for this run's reads in \(tmp.path) did not finish within 2s; nothing was read or undone this run, and the next run will retry\n"), fx.log())
+        XCTAssertEqual(fx.calls(), ["mktemp -d \(template)", "mktemp HELD \(template)"])
+        XCTAssertEqual(fx.chmodCalls(), [], "nothing was tightened")
+        XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), dirty)
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertEqual(try fx.contents(of: tmp).filter { $0.hasPrefix("insomnia-backstop.") }, [], "the held mktemp has not made its folder yet")
+        XCTAssertFalse(fx.exists(fx.lock), "the run stopped before it opened the lock")
+        XCTAssertNotNil(fx.hungPid("mktemp", within: 5), "\(fx.calls())")
+        XCTAssertNil(fx.commandEnded(), "nothing signalled the mktemp")
+
+        fx.releaseCommand()
+        XCTAssertTrue(fx.hungProcessGone("mktemp", within: 10), "the mktemp ends once let go")
+        XCTAssertEqual(fx.commandEnded(), "released")
+        XCTAssertTrue(r.drain(within: 5), "the output has not ended")
+        XCTAssertFalse(r.output.contains("printed after its hold"), r.output)
+        let stray = try fx.contents(of: tmp).filter { $0.hasPrefix("insomnia-backstop.") }
+        XCTAssertEqual(stray.count, 1, "the held mktemp made its folder once let go")
+        let after = try fx.run(fx.backstop)
+        XCTAssertEqual(after.status, 0, after.stderr + fx.log())
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertFalse(fx.exists(fx.session), "the next run removes the session")
+        XCTAssertEqual(try fx.contents(of: tmp).filter { $0.hasPrefix("insomnia-backstop.") }, stray,
+                       "the next run removes its own folder and leaves the one whose name no run knows")
+    }
+
+    /// The backstop's read of the time now, which tells whether the session
+    /// has ended, does not answer: the date, which ignores SIGTERM, is
+    /// killed at READ_TIMEOUT_SECONDS and reaped. The run logs that whether
+    /// the session has ended is not known and stops with nothing undone,
+    /// the journal and the session as they were. Once the date answers, the
+    /// next run undoes what the journal records.
+    func testBackstopStopsWhenTheTimeNowDoesNotAnswer() throws {
+        try fx.writeBackstopCopy(extraConstants: ["READ_TIMEOUT_SECONDS": "2"])
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        let dirty = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#
+        try fx.writeState(dirty)
+        let hang = fx.root.appendingPathComponent("date.now.hang")
+        try "".write(to: hang, atomically: true, encoding: .utf8)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 1, r.stderr + fx.log())
+        XCTAssertTrue(fx.log().contains("[error] backstop: could not read the time now ('date -u +%s' did not answer within 2s), so whether the session has ended is not known; nothing was undone this run, and the next run will retry\n"), fx.log())
+        XCTAssertEqual(fx.calls(), [], "nothing was undone")
+        XCTAssertTrue(fx.hungProcessGone("date", within: 0))
+        XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), dirty)
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertTrue(try fx.lockIsFree())
+        XCTAssertEqual(try fx.contents(of: fx.privateTmp()), [])
+
+        try FileManager.default.removeItem(at: hang)
+        let after = try fx.run(fx.backstop)
+        XCTAssertEqual(after.status, 0, after.stderr + fx.log())
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertFalse(fx.exists(fx.session), "the next run removes the session")
+    }
+
     /// install.sh's rename of the new LaunchAgent plist into place takes
     /// longer than CHANGE_TIMEOUT_SECONDS. The install stops there without
     /// signalling the mv: it removes neither the set-aside bundle nor its
@@ -12863,6 +12941,106 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(again.status, 0, again.stderr + again.stdout)
         XCTAssertFalse(fx.exists(fx.state))
         XCTAssertTrue(fx.exists(fx.config), "config.json survives without --purge")
+        XCTAssertTrue(try fx.lockIsFree())
+    }
+
+    /// install.sh's mkdir of the support, log and LaunchAgents folders
+    /// (step 4: the sudoers rule is installed and the new bundle staged)
+    /// takes longer than CHANGE_TIMEOUT_SECONDS. The install stops there,
+    /// before it opens the recovery lock, without signalling the mkdir. It
+    /// says what is installed so far and leaves its staging folder and
+    /// scratch files, since the mkdir may still use them. Read through one
+    /// pipe, the run's output ends once it exits. A rerun after the mkdir
+    /// ends installs as usual and removes what the stopped run left.
+    func testInstallStopsWhenMakingItsFoldersDoesNotFinishInTime() throws {
+        try fx.writeInstallCopies(extraConstants: ["CHANGE_TIMEOUT_SECONDS": "2"])
+        try fx.prepareInstall()
+        try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("launchctl", "loaded")
+        try fx.hold("mkdir", fx.home.path)
+        let folders = [fx.home, fx.home.appendingPathComponent("Logs"), fx.home.appendingPathComponent("LaunchAgents")].map(\.path)
+
+        let r = try fx.runThroughOnePipe(fx.installRedirected, extraEnvironment: ["USER": ScriptFixture.account], endWithin: 2)
+
+        XCTAssertEqual(r.status, 1, r.output)
+        XCTAssertNotNil(r.endedAfter, "the output ends with the run (exit after \(r.exitedAfter) s), while the mkdir is held: \(r.output)")
+        XCTAssertTrue(r.output.contains("Install stopped: making \(folders[0]), \(folders[1]) and \(folders[2]) did not finish within 2s, so whether it took place\nis not known. \(fx.sudoers.path) is installed; the app at "), r.output)
+        XCTAssertTrue(r.output.contains(" and the LaunchAgent were not touched. Rerun this script once it has ended.\n"), r.output)
+        XCTAssertTrue(r.output.contains("Left in place, since a change this run made was not seen to finish"), r.output)
+        let calls = fx.calls()
+        XCTAssertTrue(calls.contains("mkdir -p \(folders.joined(separator: " "))"), "\(calls)")
+        XCTAssertEqual(calls.last, "mkdir HELD \(fx.home.path)", "nothing after the held mkdir: \(calls)")
+        XCTAssertFalse(calls.contains("mkdir FD9-OPEN"), "the run had not opened the recovery lock: \(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl bootout") || $0.hasPrefix("launchctl bootstrap") }, "\(calls)")
+        XCTAssertTrue(fx.exists(fx.sudoers), "the rule was installed before the mkdir")
+        XCTAssertFalse(fx.exists(fx.app), "the app was not installed")
+        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "trusted")
+        XCTAssertEqual(try fx.contents(of: fx.appsDir).filter { $0.hasPrefix(".Insomnia.app.staging.") }.count, 1, "the staging folder is left")
+        XCTAssertFalse(fx.exists(fx.lock), "the run stopped before it opened the lock")
+        XCTAssertNotNil(fx.hungPid("mkdir", within: 5), "\(calls)")
+        XCTAssertNil(fx.commandEnded(), "nothing signalled the mkdir")
+        let stopped = fx.lastPid
+
+        fx.releaseCommand()
+        XCTAssertTrue(fx.hungProcessGone("mkdir", within: 10), "the mkdir ends once let go")
+        XCTAssertEqual(fx.commandEnded(), "released")
+        XCTAssertTrue(r.drain(within: 5), "the output has not ended")
+        XCTAssertFalse(r.output.contains("printed after its hold"), r.output)
+
+        fx.setMode("kill.fail", "\(stopped)")   // the fake kill: the stopped run is gone
+        let again = try fx.run(fx.installRedirected, extraEnvironment: ["USER": ScriptFixture.account])
+        XCTAssertEqual(again.status, 0, again.stderr + again.stdout)
+        XCTAssertEqual(try fx.installedBinaryFirstLine(), "#!/bin/bash")
+        XCTAssertEqual(try fx.contents(of: fx.appsDir), ["Insomnia.app"], "the stopped run's staging folder is gone")
+        XCTAssertEqual(try fx.contents(of: fx.plist.deletingLastPathComponent()), ["com.insomnia.backstop.plist"])
+        XCTAssertTrue(try fx.lockIsFree())
+    }
+
+    /// uninstall.sh's mkdir of its support folder, the first step of taking
+    /// the recovery lock, takes longer than CHANGE_TIMEOUT_SECONDS. The run
+    /// stops there without signalling the mkdir and removes nothing; its
+    /// work folder stays, since the mkdir may still use it. Read through one
+    /// pipe, the run's output ends once it exits. A rerun after the mkdir
+    /// ends finishes the uninstall.
+    func testUninstallStopsWhenMakingItsSupportFolderDoesNotFinishInTime() throws {
+        try fx.writeUninstallCopy(extraConstants: ["MKDIR": fx.bin.appendingPathComponent("mkdir").path, "CHANGE_TIMEOUT_SECONDS": "2"])
+        try fx.installMachinery()
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try fx.hold("mkdir", fx.home.path)
+        let tmp = try fx.privateTmp()
+
+        let r = try fx.runThroughOnePipe(fx.uninstall, endWithin: 2)
+
+        XCTAssertEqual(r.status, 1, r.output)
+        XCTAssertNotNil(r.endedAfter, "the output ends with the run (exit after \(r.exitedAfter) s), while the mkdir is held: \(r.output)")
+        XCTAssertTrue(r.output.contains("Uninstall stopped: making \(fx.home.path) did not finish within 2s, so whether it took place is not known. Nothing was removed. Rerun this script once it has ended.\n"), r.output)
+        XCTAssertTrue(r.output.contains(" in place, since a change this run made was not seen to finish and may still use it."), r.output)
+        let calls = fx.calls()
+        XCTAssertEqual(calls.last, "mkdir HELD \(fx.home.path)", "nothing after the held mkdir: \(calls)")
+        XCTAssertFalse(calls.contains("mkdir FD9-OPEN"), "the run had not opened the recovery lock: \(calls)")
+        XCTAssertFalse(calls.contains("sudo -n \(fx.fakePmset) -a disablesleep 0"), "the backstop did not run: \(calls)")
+        for kept in [fx.app, fx.plist, fx.state, fx.sudoers] {
+            XCTAssertTrue(fx.exists(kept), "nothing was removed: \(kept.path)")
+        }
+        XCTAssertFalse(fx.exists(fx.lock), "the run stopped before it opened the lock")
+        XCTAssertEqual(try fx.contents(of: tmp).filter { $0.hasPrefix("insomnia-uninstall.") }.count, 1, "the work folder is left")
+        XCTAssertNotNil(fx.hungPid("mkdir", within: 5), "\(calls)")
+        XCTAssertNil(fx.commandEnded(), "nothing signalled the mkdir")
+
+        fx.releaseCommand()
+        XCTAssertTrue(fx.hungProcessGone("mkdir", within: 10), "the mkdir ends once let go")
+        XCTAssertEqual(fx.commandEnded(), "released")
+        XCTAssertTrue(r.drain(within: 5), "the output has not ended")
+        XCTAssertFalse(r.output.contains("printed after its hold"), r.output)
+
+        let again = try fx.run(fx.uninstall)
+        XCTAssertEqual(again.status, 0, again.stderr + again.stdout)
+        XCTAssertTrue(fx.calls().contains("sudo -n \(fx.fakePmset) -a disablesleep 0"), "\(fx.calls())")
+        for gone in [fx.app, fx.plist, fx.state, fx.sudoers] {
+            XCTAssertFalse(fx.exists(gone), "the rerun removes \(gone.path)")
+        }
         XCTAssertTrue(try fx.lockIsFree())
     }
 
@@ -14322,8 +14500,9 @@ private final class ScriptFixture {
         // path that matches the glob in rm.hold waits for releaseCommand
         // first (see holdHere). uninstall.sh's RM is the real rm unless a
         // test patches in this one. A mkdir of a path that matches the glob
-        // in mkdir.hold waits the same way; backstop.sh's MKDIR is the
-        // real mkdir unless a test patches in this one.
+        // in mkdir.hold waits the same way, and so does a mktemp whose
+        // template matches the glob in mktemp.hold; backstop.sh's MKDIR and
+        // MKTEMP are the real tools unless a test patches in these.
         for (tool, real) in [("rm", "/bin/rm"), ("rmdir", "/bin/rmdir"), ("mktemp", "/usr/bin/mktemp"), ("mkdir", "/bin/mkdir")] {
             let killed = tool != "rm" ? "" : """
             \(holdHere("rm"))
@@ -14348,10 +14527,10 @@ private final class ScriptFixture {
               done
             fi
             """
-            let held = tool != "mkdir" ? "" : """
-            \(holdHere("mkdir"))
-            if [[ -f "\(r)/mkdir.hold" && ! -e "\(r)/mkdir.hung.pid" ]]; then
-              IFS= read -r pattern < "\(r)/mkdir.hold" || true
+            let held = tool != "mkdir" && tool != "mktemp" ? "" : """
+            \(holdHere(tool))
+            if [[ -f "\(r)/\(tool).hold" && ! -e "\(r)/\(tool).hung.pid" ]]; then
+              IFS= read -r pattern < "\(r)/\(tool).hold" || true
               for a in "$@"; do
                 if [[ -n "$pattern" && "$a" != -* && "$a" == $pattern ]]; then
                   hold_here "$a"
@@ -14800,8 +14979,12 @@ private final class ScriptFixture {
         // Not logged: it changes nothing. With date.hold present the stamp
         // of a backstop log line (`-u +%Y-%m-%dT%H:%M:%SZ`) waits for
         // releaseCommand first (see holdHere), the way a log line stalls.
+        // With date.now.hang present the time now (`-u +%s`) never answers
+        // (see hangHere).
         try writeFake("date", """
         \(holdHere("date"))
+        \(hangHere("date"))
+        if [[ "$*" == "-u +%s" && -f "\(r)/date.now.hang" ]]; then hang_here; fi
         if [[ "$*" == "-u +%Y%m%dT%H%M%SZ" && -f "\(r)/date.mode" ]]; then
           cat "\(r)/date.mode"; echo; exit 0
         fi

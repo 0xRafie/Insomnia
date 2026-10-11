@@ -44,7 +44,9 @@ The installer also stops, and says why, when the sudoers rule has a line for
 another account or changed while it ran, when an access control list on the
 rule or its folders allows more than reading, or when a process named
 Insomnia that it cannot identify is running. Show the user that message.
-Never edit `/etc/sudoers.d` or an ACL yourself.
+Never edit `/etc/sudoers.d` or an ACL yourself. When it says one of its own
+steps did not finish within 30s, it also says what it installed so far;
+the user reruns the same command once that step has ended.
 
 To build from source, follow "Build from source" on the same page. Its
 `./scripts/install.sh` also needs the password.

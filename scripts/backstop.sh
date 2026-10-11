@@ -762,6 +762,67 @@ change_unit() { # command args...
   wait "$!" || status=$?
   printf '%s\0' "$status" 2 "" "" end
 }
+# What a command printed, for a command this shell needs the output of
+# before it has a WORK for the file change keeps that in: the mktemp that
+# makes WORK. capture makes the command as change does, in a unit of its
+# own (capture_unit) that ignores SIGTERM, SIGHUP and SIGPIPE, keeps fd 9,
+# and is started and settled as a supervisor is, and waits for it no longer
+# than CHANGE_TIMEOUT_SECONDS. The unit reads the command's standard
+# output itself, through the pipe of a $(...), to its end; the command's
+# standard input and error are /dev/null, so it keeps neither of this
+# run's outputs. The unit sends the command's exit status and then the
+# text, as send_output does, or a read that failed (2) for a text longer
+# than READ_MAX_BYTES. $(...) drops NUL bytes, so a caller takes only text
+# in the form it expects. Returns the command's status, with
+# CHANGE_SETTLED=1 and the text in CAPTURED when it came whole; or 124,
+# with CHANGE_SETTLED=0, CHANGE_UNSETTLED=1 and CAPTURED empty, when that
+# did not all come in time (see change). Nothing signals the command.
+# READ_TEXT and READ_HEAD are as they were before.
+CAPTURED=""
+capture() { # command args...
+  local was=$CHANGE_UNSETTLED rc=124 status took=0
+  local text="${READ_TEXT:-}" head="${READ_HEAD:-}" deadline=$(( SECONDS + CHANGE_TIMEOUT_SECONDS ))
+  CAPTURED=""
+  CHANGE_SETTLED=0
+  CHANGE_UNSETTLED=1
+  if exec 5< <(exec </dev/null 2>/dev/null; capture_unit "$@" & settle "$!"); then
+    if pipe_field "$deadline" && [[ "$FIELD" =~ ^[0-9]{1,3}$ ]] && (( 10#$FIELD <= 255 )); then
+      status=$(( 10#$FIELD ))
+      take_output "$deadline" || took=$?
+      if (( took != 3 )); then
+        rc=$status
+        CHANGE_SETTLED=1
+        CHANGE_UNSETTLED=$was
+        (( took != 0 )) || CAPTURED="$READ_TEXT"
+      fi
+    fi
+    exec 5<&-
+  fi
+  READ_TEXT="$text"
+  READ_HEAD="$head"
+  return "$rc"
+}
+# The unit of one capture. errexit is off here, as in change_unit. The
+# status follows the text after a newline, so the text keeps its own
+# newlines at its end.
+capture_unit() { # command args...
+  local out status
+  set +e
+  trap '' TERM HUP PIPE
+  out="$("$@" </dev/null 2>/dev/null 3<&- 4>&-; printf '\n%s' "$?")"
+  status="${out##*$'\n'}"
+  out="${out%$'\n'*}"
+  printf '%s\0' "$status" || return
+  if capture_fits "$out"; then
+    printf '%s\0' 0 "$out" "" end
+  else
+    printf '%s\0' 2 "" "" end
+  fi
+}
+capture_fits() { # text
+  local LC_ALL=C
+  (( ${#1} <= READ_MAX_BYTES ))
+}
 # change, and the end of the run when the change was not seen to finish:
 # stop_unsettled, which each script defines, says what it was and exits 1.
 # Returns the change's status otherwise.
@@ -1085,8 +1146,26 @@ tighten() { # path...
 # This run's own folder for the output of its reads and its private copies
 # of session.json and state.json (mktemp -d: a new name, mode 0700), removed
 # when the run exits. One killed by SIGKILL stays in the temporary folder,
-# which the system empties.
-if ! WORK="$("$MKTEMP" -d "${TMPDIR:-/tmp}/insomnia-backstop.XXXXXX" 2>/dev/null)"; then
+# which the system empties. The mktemp runs through capture, so a stalled
+# disk cannot hold this run here for longer than CHANGE_TIMEOUT_SECONDS: a
+# mktemp not seen to finish ends the run before it reads or undoes
+# anything, nothing signals it, and it keeps the lock a caller shares with
+# this run (fd 9) until it ends. Its answer is taken only in the form
+# mktemp prints: the template with six letters or digits for the Xs, and
+# one newline.
+# The end of the run when a step before the recovery lock (see capture and
+# change) was not seen to finish.
+stop_before_lock() { # what
+  log error "recovery stopped: $1 did not finish within ${CHANGE_TIMEOUT_SECONDS}s; nothing was read or undone this run, and the next run will retry"
+  exit 1
+}
+work_template="${TMPDIR:-/tmp}/insomnia-backstop.XXXXXX"
+work_rc=0
+capture "$MKTEMP" -d "$work_template" || work_rc=$?
+(( CHANGE_SETTLED )) || stop_before_lock "creating a private folder for this run's reads in ${TMPDIR:-/tmp}"
+WORK="${CAPTURED%$'\n'}"
+if (( work_rc != 0 )) || [[ "$CAPTURED" != "$WORK"$'\n' || "$WORK" != "${work_template%XXXXXX}"* || ! "${WORK#"${work_template%XXXXXX}"}" =~ ^[A-Za-z0-9]{6}$ ]]; then
+  WORK=""
   log error "could not create a private folder for this run's reads in ${TMPDIR:-/tmp}; nothing read or undone, will retry"
   exit 1
 fi
@@ -1114,23 +1193,77 @@ tighten "$APP_SUPPORT" "$LOG_DIR" "$LOG" "$LOCK" "$STATE" "$SESSION"
 # within the caller's limit for the whole run (see run_backstop in
 # uninstall.sh). APP_ANSWER_READY is 0 when it could not be made, and once
 # it has been used.
+# Each step of that but the two opens runs in a process of its own with a
+# deadline: mktemp as a bounded read, whose answer is taken only in the
+# form mktemp prints; then, each as a change (see change), a first open of
+# the name, read-write as this shell then opens it (answer_open), and,
+# once this shell has it on fd 7 and fd 6, the checks pin_output makes of
+# both descriptors and the removal of the name (answer_pinned). A change
+# not seen to finish ends the run before it takes the lock or reads
+# anything. The opens themselves are this shell's: the binary is its child
+# and inherits fd 7 from it, and bash cannot take a descriptor from another
+# process. One that stalls here, right after answer_open's has returned, is
+# not bounded.
+# shellcheck disable=SC2317  # run through change
+answer_open() { # file
+  [[ -f "$1" && ! -L "$1" ]] && { : 8<>"$1"; }
+} 2>/dev/null
+# shellcheck disable=SC2317  # run through change
+answer_pinned() { # file
+  local seven six
+  seven="$("$STAT" -f '%HT:%z:%d:%i' <&7 && printf x)" && six="$("$STAT" -f '%HT:%z:%d:%i' <&6 && printf x)" || return 1
+  [[ "$seven" == "Regular File:0:"*$'\n'x && "${seven%x}" != *$'\n'*$'\n' && "$six" == "$seven" ]] || return 1
+  "$RM" -f "$1" || return 1
+  [[ ! -e "$1" && ! -L "$1" ]]
+} 2>/dev/null
 APP_ANSWER_READY=0
-answer_file="$("$MKTEMP" "$WORK/answer.XXXXXX" 2>/dev/null)" || answer_file=""
-if [[ -n "$answer_file" ]] && pin_output "$answer_file"; then
-  exec 7>&4 6<&3
-  APP_ANSWER_READY=1
-elif [[ -n "$answer_file" ]]; then
-  "$RM" -f "$answer_file" 2>/dev/null || true
+answer_file=""
+if bounded "$MKTEMP" "$WORK/answer.XXXXXX" && (( BOUNDED_READ == 0 )) && [[ "$READ_TEXT" == "$WORK/answer."??????$'\n' ]]; then
+  answer_file="${READ_TEXT%$'\n'}"
 fi
-exec 3<&- 4>&-
+if [[ -n "$answer_file" ]]; then
+  answer_rc=0
+  change answer_open "$answer_file" || answer_rc=$?
+  (( CHANGE_SETTLED )) || stop_before_lock "opening $answer_file"
+  if (( answer_rc == 0 )) && { exec 7<>"$answer_file" 6<>"$answer_file"; } 2>/dev/null; then
+    change answer_pinned "$answer_file" || answer_rc=$?
+    (( CHANGE_SETTLED )) || stop_before_lock "checking and unlinking $answer_file"
+    (( answer_rc != 0 )) || APP_ANSWER_READY=1
+  fi
+  if (( ! APP_ANSWER_READY )); then
+    exec 6<&- 7>&-
+    change quietly "$RM" -f "$answer_file" || true
+    (( CHANGE_SETTLED )) || stop_before_lock "removing $answer_file"
+  fi
+fi
 # The device and inode of $1, or with no file named of standard input
 # (fstat): fd 9 is checked as itself, not through /dev/fd/9 (see
 # pin_output). Without an fd 9 the redirection fails and stat does not run.
+# shellcheck disable=SC2317  # run through change
 identity() { "$STAT" -f %d:%i "$@" 2>/dev/null; }
+# fd 9's identity and the lock file's, one line each (a line empty when
+# that stat failed), in a change of its own (see change), which keeps fd 9.
+# Unless both lines come, whole and in that form, this run takes the lock
+# as its own; while a caller holds it, it then waits LOCK_TIMEOUT_SECONDS
+# and stops with nothing changed.
+# shellcheck disable=SC2317  # run through change
+lock_identities() {
+  local held
+  held="$(identity <&9)" || held=""
+  printf '%s\n%s\n' "$held" "$(identity "$LOCK")"
+} 2>/dev/null
 lock_shared=0
-lock_held="$(identity 2>/dev/null <&9)" || lock_held=""
-if [[ -n "$lock_held" && "$lock_held" == "$(identity "$LOCK")" ]]; then
-  lock_shared=1 # fd 9 is the caller's handle on the lock file; share its lock.
+lock_held=""
+CHANGE_QUIET=1
+change lock_identities || true
+CHANGE_QUIET=0
+(( CHANGE_SETTLED )) || stop_before_lock "reading the identity of fd 9 and $LOCK"
+identities_form=$'^([0-9]+:[0-9]+)?\n([0-9]+:[0-9]+)?\n$'
+if [[ "$CHANGE_SAID" =~ $identities_form ]]; then
+  lock_held="${BASH_REMATCH[1]}"
+  if [[ -n "$lock_held" && "$lock_held" == "${BASH_REMATCH[2]}" ]]; then
+    lock_shared=1 # fd 9 is the caller's handle on the lock file; share its lock.
+  fi
 fi
 
 # --- The installed app's --resume-frozen version -------------------------------
@@ -1257,11 +1390,24 @@ else
   INFO_PROBLEM="it was not read: no app binary was at $INSOMNIA_BIN before the recovery lock"
 fi
 
+# The lock file is opened by this shell, which keeps fd 9 to the end, right
+# after a change (see change) has opened it the same way (lock_open); an
+# open that stalls here all the same is not bounded. lockf, which locks
+# what fd 9 is open on and exits, runs as a change too, and the lock it
+# takes stays with this shell's fd 9; one not seen to finish ends the run,
+# and keeps fd 9, and with it any lock it took, until it ends.
+# shellcheck disable=SC2317  # run through change
+lock_open() {
+  { : 8<>"$LOCK"; } 2>/dev/null
+}
 if (( ! lock_shared )); then
+  change lock_open || true
+  (( CHANGE_SETTLED )) || stop_before_lock "opening $LOCK"
   exec 9<>"$LOCK"
 fi
 lock_rc=0
-"$LOCKF" -t "$LOCK_TIMEOUT_SECONDS" 9 2>/dev/null || lock_rc=$?
+change quietly "$LOCKF" -t "$LOCK_TIMEOUT_SECONDS" 9 || lock_rc=$?
+(( CHANGE_SETTLED )) || stop_before_lock "taking the recovery lock $LOCK"
 if (( lock_rc != 0 )); then
   log error "recovery lock $LOCK still held after ${LOCK_TIMEOUT_SECONDS}s (lockf exit $lock_rc); nothing changed, will retry"
   exit 75
@@ -1928,29 +2074,83 @@ journal_shape_problems() { # file
   return 0
 }
 
+# Seconds since the epoch for a UTC date and time given as base 10 numbers
+# (year from 1, month, day, hour, minute, second), in EPOCH. Returns 1, and
+# leaves EPOCH as it was, when no such date and time exists: the month is 1
+# to 12, the day one that month has in that year, hours 0 to 23, minutes
+# and seconds 0 to 59. The shell works it out itself, so nothing it calls
+# can wait: the days come from the civil date as days_from_civil does in
+# https://howardhinnant.github.io/date_algorithms.html.
+EPOCH=0
+epoch_from() { # year month day hour minute second
+  local y=$(( 10#$1 )) m=$(( 10#$2 )) d=$(( 10#$3 )) h=$(( 10#$4 )) mi=$(( 10#$5 )) s=$(( 10#$6 )) days=31 era yoe doy
+  (( y >= 1 && m >= 1 && m <= 12 && d >= 1 && h <= 23 && mi <= 59 && s <= 59 )) || return 1
+  case "$m" in
+    4|6|9|11) days=30 ;;
+    2) days=28; if (( y % 4 == 0 && ( y % 100 != 0 || y % 400 == 0 ) )); then days=29; fi ;;
+  esac
+  (( d <= days )) || return 1
+  (( m > 2 )) || y=$(( y - 1 ))
+  era=$(( y / 400 ))
+  yoe=$(( y - era * 400 ))
+  doy=$(( (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1 ))
+  EPOCH=$(( (era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468) * 86400 + h * 3600 + mi * 60 + s ))
+  return 0
+}
 # Seconds since the epoch for a date in the one form session.json may hold,
 # or nothing. Store.parseDate in the app reads exactly this form:
 # 2027-01-15T08:00:00Z, which is what Store.swift writes, or the same with
 # an offset such as +02:00 or -05:30 in place of Z. Whole seconds, a date
-# and time that exist, years 1970 to 9999, offsets up to 23:59. `date -j -f`
-# rolls an impossible day or second over, so the result is formatted back
-# and must match.
+# and time that exist (epoch_from), years 1970 to 9999, offsets up to 23:59.
 epoch_of() { # string
-  local form='^([0-9]{4})-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|([+-])([0-9]{2}):([0-9]{2}))$'
-  local clock offset=0 e
+  local form='^([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(Z|([+-])([0-9]{2}):([0-9]{2}))$'
+  local offset=0
   [[ "$1" =~ $form ]] || return 0
   (( 10#${BASH_REMATCH[1]} >= 1970 )) || return 0
-  if [[ "${BASH_REMATCH[2]}" != Z ]]; then
-    (( 10#${BASH_REMATCH[4]} <= 23 && 10#${BASH_REMATCH[5]} <= 59 )) || return 0
-    offset=$(( 10#${BASH_REMATCH[4]} * 3600 + 10#${BASH_REMATCH[5]} * 60 ))
-    if [[ "${BASH_REMATCH[3]}" == - ]]; then offset=$(( -offset )); fi
+  if [[ "${BASH_REMATCH[7]}" != Z ]]; then
+    (( 10#${BASH_REMATCH[9]} <= 23 && 10#${BASH_REMATCH[10]} <= 59 )) || return 0
+    offset=$(( 10#${BASH_REMATCH[9]} * 3600 + 10#${BASH_REMATCH[10]} * 60 ))
+    if [[ "${BASH_REMATCH[8]}" == - ]]; then offset=$(( -offset )); fi
   fi
-  clock="${1:0:19}"
-  e="$("$DATE" -j -u -f '%Y-%m-%dT%H:%M:%S' "$clock" +%s 2>/dev/null)" || return 0
-  if [[ "$("$DATE" -u -r "$e" +%Y-%m-%dT%H:%M:%S 2>/dev/null)" == "$clock" ]]; then
-    echo $(( e - offset ))
-  fi
+  epoch_from "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}" "${BASH_REMATCH[5]}" "${BASH_REMATCH[6]}" || return 0
+  echo $(( EPOCH - offset ))
   return 0
+}
+
+# The start second of a process from what `ps -o lstart=` prints under
+# TZ=UTC and LC_ALL=C (Sat Oct 10 08:05:03 2026), in EPOCH, worked out in
+# the shell (epoch_from); 1 when the words are not in that form or name no
+# such date.
+lstart_epoch() { # weekday month day time year
+  local months="Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec " before
+  [[ "$1" =~ ^(Sun|Mon|Tue|Wed|Thu|Fri|Sat)$ && "$2" =~ ^[A-Z][a-z]{2}$ && "$months" == *"$2 "* ]] || return 1
+  [[ "$3" =~ ^[0-9]{1,2}$ && "$5" =~ ^[0-9]{4}$ ]] || return 1
+  # Last, so BASH_REMATCH holds its groups.
+  [[ "$4" =~ ^([0-9]{2}):([0-9]{2}):([0-9]{2})$ ]] || return 1
+  before="${months%%"$2 "*}"
+  epoch_from "$5" "$(( ${#before} / 4 + 1 ))" "$3" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+}
+# kern.bootsessionuuid, in BOOT_SESSION, from a bounded read, trailing
+# newlines cut as $(...) would cut them: empty when the read failed, did
+# not answer or printed more than one line.
+BOOT_SESSION=""
+read_boot_session() {
+  local rc=0 out
+  BOOT_SESSION=""
+  bounded "$SYSCTL" -n kern.bootsessionuuid || rc=$?
+  (( rc == 0 && BOUNDED_READ == 0 )) || return 0
+  out="${READ_TEXT%"${READ_TEXT##*[!$'\n']}"}"
+  [[ "$out" == *$'\n'* ]] || BOOT_SESSION="$out"
+  return 0
+}
+# What a bounded read's status says, for a message: "did not answer within
+# READ_TIMEOUT_SECONDS" for 124, "failed" otherwise.
+read_said() { # status
+  if (( $1 == 124 )); then
+    echo "did not answer within ${READ_TIMEOUT_SECONDS}s"
+  else
+    echo "failed"
+  fi
 }
 
 # epoch_of the string at a keypath, read exactly as the app's decoder sees
@@ -2061,10 +2261,22 @@ if [[ -e "$SESSION" ]]; then
         notes_reset
       elif [[ -n "$session_problems" ]]; then
         session_state=malformed
-      elif (( ${ends_epoch:-0} > $("$DATE" -u +%s) )); then
-        session_state=valid
       else
-        session_state=expired
+        # The time now, from a bounded read: one that fails or does not
+        # answer leaves whether the session has ended unknown, so nothing is
+        # undone this run.
+        now_rc=0
+        bounded "$DATE" -u +%s || now_rc=$?
+        now_form=$'^[0-9]{1,12}\n$'
+        if (( now_rc != 0 || BOUNDED_READ != 0 )) || [[ ! "$READ_TEXT" =~ $now_form ]]; then
+          log error "could not read the time now ('date -u +%s' $(read_said "$now_rc")), so whether the session has ended is not known; nothing was undone this run, and the next run will retry"
+          exit 1
+        fi
+        if (( ${ends_epoch:-0} > 10#${READ_TEXT%$'\n'} )); then
+          session_state=valid
+        else
+          session_state=expired
+        fi
       fi
     fi
   fi
@@ -2181,7 +2393,13 @@ quarantine_session() {
   done
   what="session.json unreadable"
   [[ "$session_state" == unreadable ]] && what="session.json cannot be read ($unreadable_why)"
-  base="$SESSION.unreadable-$("$DATE" -u +%Y%m%dT%H%M%SZ)"
+  local stamp_rc=0 stamp_form=$'^[0-9]{8}T[0-9]{6}Z\n$'
+  bounded "$DATE" -u +%Y%m%dT%H%M%SZ || stamp_rc=$?
+  if (( stamp_rc != 0 || BOUNDED_READ != 0 )) || [[ ! "$READ_TEXT" =~ $stamp_form ]]; then
+    log error "$what; the time for its new name could not be read ('date -u +%Y%m%dT%H%M%SZ' $(read_said "$stamp_rc")), so it was kept in place, and the next run tries again: $SESSION"
+    return 1
+  fi
+  base="$SESSION.unreadable-${READ_TEXT%$'\n'}"
   dest="$base"; n=0
   while [[ -e "$dest" || -L "$dest" ]]; do n=$((n + 1)); dest="$base-$n"; done
   if change_or_stop "moving $SESSION to $dest" quietly "$MV" -n "$SESSION" "$dest" && [[ ! -e "$SESSION" && ! -L "$SESSION" ]] && [[ -e "$dest" || -L "$dest" ]]; then
@@ -2282,7 +2500,8 @@ prepare_low_power_off() {
   local t tmp ok=1
   t="$(type_of "$STATE_COPY" keptDisplayUnderLowPower)" || read_stopped "keptDisplayUnderLowPower in $STATE"
   [[ "$t" == float || "$t" == integer ]] || return 0
-  boot_value="$("$SYSCTL" -n kern.bootsessionuuid 2>/dev/null || true)"
+  read_boot_session
+  boot_value="$BOOT_SESSION"
   journal_value keptDisplayUnderLowPowerBoot || true
   [[ "$VALUE" == "$boot_value" ]] && return 0
   tmp="$APP_SUPPORT/.state.json.backstop-boot.$$"
@@ -2359,8 +2578,9 @@ observe() { # pid
   w="${word[0]:-}" mon="${word[1]:-}" day="${word[2]:-}" time="${word[3]:-}"
   year="${word[4]:-}" stat="${word[5]:-}" uid="${word[6]:-}"
   [[ -n "$w" && -n "$mon" && -n "$day" && -n "$time" && -n "$year" && -n "$stat" && -n "$uid" ]] || return 0
-  p_epoch="$("$DATE" -j -u -f '%a %b %d %H:%M:%S %Y' "$w $mon $day $time $year" +%s 2>/dev/null || true)"
-  [[ -n "$p_epoch" ]] && [[ "$uid" =~ ^[0-9]+$ ]] || return 0
+  lstart_epoch "$w" "$mon" "$day" "$time" "$year" || return 0
+  p_epoch="$EPOCH"
+  [[ "$uid" =~ ^[0-9]+$ ]] || return 0
   p_stat="$stat"; p_uid="$uid"
   observation=seen
 }
@@ -2494,8 +2714,10 @@ resume_via_app() {
   done
 }
 if (( frozen_count > 0 )); then
-  boot_now="$("$SYSCTL" -n kern.bootsessionuuid 2>/dev/null || true)"
-  uid_now="$(id -u)"
+  read_boot_session
+  boot_now="$BOOT_SESSION"
+  # bash sets EUID itself when it starts: no id call.
+  uid_now="$EUID"
   i=0
   while (( i < frozen_count )); do
     journal_value "frozenProcesses.$i.pid" || true

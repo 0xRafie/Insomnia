@@ -139,7 +139,9 @@ SUDOERS_LOCK=/private/etc/sudoers.d/.insomnia-sudoers.lock
 # Tests patch this line to the test account, the only way to run the root
 # transaction without root.
 ROOT_UID=0
-UID_NUM="$(id -u)"
+# This account's user ID: bash sets EUID itself when it starts, to the ID
+# `id -u` prints, so no call reads it.
+UID_NUM="$EUID"
 # Where the new bundle is assembled and signed (step 3) and where the previous
 # one waits during the swap (step 6). Both inside $APP_DIR, so the swap is two
 # renames on one filesystem. The staging directory's name carries the PID of
@@ -772,6 +774,67 @@ change_unit() { # command args...
   wait "$!" || status=$?
   printf '%s\0' "$status" 2 "" "" end
 }
+# What a command printed, for a command this shell needs the output of
+# before it has a WORK for the file change keeps that in: the mktemp that
+# makes WORK. capture makes the command as change does, in a unit of its
+# own (capture_unit) that ignores SIGTERM, SIGHUP and SIGPIPE, keeps fd 9,
+# and is started and settled as a supervisor is, and waits for it no longer
+# than CHANGE_TIMEOUT_SECONDS. The unit reads the command's standard
+# output itself, through the pipe of a $(...), to its end; the command's
+# standard input and error are /dev/null, so it keeps neither of this
+# run's outputs. The unit sends the command's exit status and then the
+# text, as send_output does, or a read that failed (2) for a text longer
+# than READ_MAX_BYTES. $(...) drops NUL bytes, so a caller takes only text
+# in the form it expects. Returns the command's status, with
+# CHANGE_SETTLED=1 and the text in CAPTURED when it came whole; or 124,
+# with CHANGE_SETTLED=0, CHANGE_UNSETTLED=1 and CAPTURED empty, when that
+# did not all come in time (see change). Nothing signals the command.
+# READ_TEXT and READ_HEAD are as they were before.
+CAPTURED=""
+capture() { # command args...
+  local was=$CHANGE_UNSETTLED rc=124 status took=0
+  local text="${READ_TEXT:-}" head="${READ_HEAD:-}" deadline=$(( SECONDS + CHANGE_TIMEOUT_SECONDS ))
+  CAPTURED=""
+  CHANGE_SETTLED=0
+  CHANGE_UNSETTLED=1
+  if exec 5< <(exec </dev/null 2>/dev/null; capture_unit "$@" & settle "$!"); then
+    if pipe_field "$deadline" && [[ "$FIELD" =~ ^[0-9]{1,3}$ ]] && (( 10#$FIELD <= 255 )); then
+      status=$(( 10#$FIELD ))
+      take_output "$deadline" || took=$?
+      if (( took != 3 )); then
+        rc=$status
+        CHANGE_SETTLED=1
+        CHANGE_UNSETTLED=$was
+        (( took != 0 )) || CAPTURED="$READ_TEXT"
+      fi
+    fi
+    exec 5<&-
+  fi
+  READ_TEXT="$text"
+  READ_HEAD="$head"
+  return "$rc"
+}
+# The unit of one capture. errexit is off here, as in change_unit. The
+# status follows the text after a newline, so the text keeps its own
+# newlines at its end.
+capture_unit() { # command args...
+  local out status
+  set +e
+  trap '' TERM HUP PIPE
+  out="$("$@" </dev/null 2>/dev/null 3<&- 4>&-; printf '\n%s' "$?")"
+  status="${out##*$'\n'}"
+  out="${out%$'\n'*}"
+  printf '%s\0' "$status" || return
+  if capture_fits "$out"; then
+    printf '%s\0' 0 "$out" "" end
+  else
+    printf '%s\0' 2 "" "" end
+  fi
+}
+capture_fits() { # text
+  local LC_ALL=C
+  (( ${#1} <= READ_MAX_BYTES ))
+}
 # change, and the end of the run when the change was not seen to finish:
 # stop_unsettled, which each script defines, says what it was and exits 1.
 # Returns the change's status otherwise.
@@ -1253,7 +1316,7 @@ sudoers_for_others() { # file content
     fi
     echo "has a line that is not for $USER: $line"
     return 0
-  done <<< "$1"
+  done < <(printf '%s\n' "$1" 2>/dev/null)
   return 0
 }
 # Stops the install when the rule's text $1 has a line for anyone but $USER
@@ -1455,7 +1518,7 @@ r_acl() { # status type-and-id name...
     else
       end=2
     fi
-  done <<< "$out"
+  done < <(printf '%s\n' "$out" 2>/dev/null)
   (( end == 1 )) || r_die "$s" "the access control lists of ${names[*]} could not be read in full (perl: $out)"
 }
 # Exits 7 unless every folder from the one that holds $SUDOERS_LOCK up to /
@@ -1668,7 +1731,7 @@ root_functions() { # name...
   local line
   while IFS= read -r line; do
     printf '%s\n' "${line#"${line%%[! ]*}"}"
-  done <<< "$(declare -f "$@")"
+  done < <(declare -f "$@")
 }
 # Runs r_replace as root, in one sudo call. The shell's script
 # is this script's fixed tool paths, the account's name and user ID, and the
@@ -1702,9 +1765,61 @@ cleanup() {
     echo "Left in place, since a change this run made was not seen to finish and may still use them: ${LEFT_BEHIND[*]}" >&2
   fi
 }
+# Ends this run after a step it made before the recovery lock was not seen
+# to finish (see change and capture): nothing more is changed, and the
+# cleanup at exit leaves what it would remove (see tidy). $2 says what is
+# installed so far.
+NOT_TOUCHED="The sudoers rule, the app and the LaunchAgent were not touched."
+stop_preparing() { # what installed-so-far
+  printf '\nInstall stopped: %s did not finish within %ss, so whether it took place\n' "$1" "$CHANGE_TIMEOUT_SECONDS" >&2
+  printf '%s\n' "is not known. $2 Rerun this script once it has ended." >&2
+  exit 1
+}
+# A folder mktemp -d made from template $1, through capture, in MADE_DIR:
+# what it printed must be the one folder it made from the template, and the
+# run stops otherwise, $3 saying what is installed so far. $2 names it.
+MADE_DIR=""
+make_dir_from() { # template what installed-so-far
+  local rc=0 prefix="${1%XXXXXX}" name
+  MADE_DIR=""
+  capture "$MKTEMP" -d "$1" || rc=$?
+  (( CHANGE_SETTLED )) || stop_preparing "making $2 ('mktemp -d $1')" "$3"
+  name="${CAPTURED%$'\n'}"
+  if (( rc != 0 )) || [[ "$CAPTURED" != "$name"$'\n' || "$name" != "$prefix"* || ! "${name#"$prefix"}" =~ ^[A-Za-z0-9]{6}$ ]]; then
+    echo "could not make $2 ('mktemp -d $1' exited $rc). $3" >&2
+    exit 1
+  fi
+  MADE_DIR="$name"
+}
 trap cleanup EXIT
 # Scratch space for bounded(): this run's own directory, emptied on exit.
-WORK="$("$MKTEMP" -d "${TMPDIR:-/tmp}/insomnia-install.XXXXXX")"
+make_dir_from "${TMPDIR:-/tmp}/insomnia-install.XXXXXX" "a private folder in ${TMPDIR:-/tmp}" "$NOT_TOUCHED"
+WORK="$MADE_DIR"
+
+# The non-empty lines of $1 in TEXT_LINES, split in the shell itself: no
+# here-string, whose temporary file can fail to be written.
+TEXT_LINES=()
+text_lines() { # text
+  local rest="$1" line
+  TEXT_LINES=()
+  while [[ -n "$rest" ]]; do
+    line="${rest%%$'\n'*}"
+    if [[ "$rest" == *$'\n'* ]]; then rest="${rest#*$'\n'}"; else rest=""; fi
+    [[ -z "$line" ]] || TEXT_LINES+=("$line")
+  done
+  return 0
+}
+# What `plutil -extract <key> raw` printed for a key of the copy's
+# Info.plist, trailing newlines cut, in PLIST_VALUE: empty when the read
+# failed or did not answer.
+PLIST_VALUE=""
+plist_value() { # key
+  local rc=0
+  PLIST_VALUE=""
+  bounded "$PLUTIL" -extract "$1" raw -o - "$INFO_PLIST" || rc=$?
+  (( rc == 0 && BOUNDED_READ == 0 )) || return 0
+  PLIST_VALUE="${READ_TEXT%"${READ_TEXT##*[!$'\n']}"}"
+}
 
 # 1. The bundle to install ---------------------------------------------------
 #    Built or verified before the password prompt: nothing on the machine has
@@ -1715,7 +1830,14 @@ if [[ -n "$PREBUILT" ]]; then
   # Apple Silicon). hw.optional.arm64 describes the hardware, so a shell
   # running under Rosetta on an Apple Silicon Mac still reads 1; an Intel
   # Mac reads 0 or has no such key.
-  arm64="$("$SYSCTL" -n hw.optional.arm64 2>/dev/null || true)"
+  arm64_rc=0
+  arm64=""
+  bounded "$SYSCTL" -n hw.optional.arm64 || arm64_rc=$?
+  if (( arm64_rc == 124 || arm64_rc == 125 || arm64_rc == 126 )); then
+    echo "'sysctl -n hw.optional.arm64' $(call_result "$arm64_rc"), so whether this Mac has Apple Silicon is not known. Nothing was changed." >&2
+    exit 1
+  fi
+  if (( arm64_rc == 0 && BOUNDED_READ == 0 )); then arm64="$BOUNDED_OUTPUT"; fi
   if [[ "$arm64" != 1 ]]; then
     echo "Release bundles of Insomnia run on Apple Silicon Macs only, and this Mac is not one ('sysctl -n hw.optional.arm64' gave ${arm64:-no value}). Build and install from a source checkout instead (README, Build from source). Nothing was changed." >&2
     exit 1
@@ -1728,9 +1850,13 @@ if [[ -n "$PREBUILT" ]]; then
   # stages and pins. $PREBUILT may sit where someone else can write (a
   # shared folder, /tmp); a bundle swapped there while the password prompt
   # waits is never copied in. BUILD_DIR is removed at exit, as for a build.
-  BUILD_DIR="$("$MKTEMP" -d)"
+  make_dir_from "${TMPDIR:-/tmp}/insomnia-build.XXXXXX" "a private folder in ${TMPDIR:-/tmp} for the copy" "$NOT_TOUCHED"
+  BUILD_DIR="$MADE_DIR"
   CHECKED_APP="$BUILD_DIR/Insomnia.app"
-  if ! "$DITTO" "$PREBUILT" "$CHECKED_APP"; then
+  copy_rc=0
+  change "$DITTO" "$PREBUILT" "$CHECKED_APP" || copy_rc=$?
+  (( CHANGE_SETTLED )) || stop_preparing "copying $PREBUILT to $CHECKED_APP" "$NOT_TOUCHED"
+  if (( copy_rc != 0 )); then
     echo "could not copy $PREBUILT to check it. Nothing was changed." >&2
     exit 1
   fi
@@ -1738,17 +1864,26 @@ if [[ -n "$PREBUILT" ]]; then
   # Signature first: nothing below is read from the bundle until it is known
   # to be intact. --strict rejects what newer codesign would, --deep covers
   # nested code should a later build add any.
-  if ! "$CODESIGN" --verify --strict --deep "$CHECKED_APP"; then
+  verify_rc=0
+  bounded "$CODESIGN" --verify --strict --deep "$CHECKED_APP" || verify_rc=$?
+  if (( verify_rc != 0 )); then
+    [[ -z "$BOUNDED_OUTPUT" ]] || printf '%s\n' "$BOUNDED_OUTPUT" >&2
+    if (( verify_rc == 124 || verify_rc == 125 || verify_rc == 126 )); then
+      echo "'codesign --verify --strict --deep' of the copy of $PREBUILT $(call_result "$verify_rc"). Nothing was changed." >&2
+      exit 1
+    fi
     echo "$PREBUILT fails 'codesign --verify --strict --deep': the download is damaged or was modified. Nothing was changed." >&2
     echo "Check the zip against SHA256SUMS and 'gh attestation verify' (README, Install) and download it again." >&2
     exit 1
   fi
-  PREBUILT_ID="$("$PLUTIL" -extract CFBundleIdentifier raw -o - "$INFO_PLIST" 2>/dev/null || true)"
+  plist_value CFBundleIdentifier
+  PREBUILT_ID="$PLIST_VALUE"
   if [[ "$PREBUILT_ID" != "$BUNDLE_ID" ]]; then
     echo "$PREBUILT has bundle identifier '${PREBUILT_ID:-<none>}', not $BUNDLE_ID. Nothing was changed." >&2
     exit 1
   fi
-  PREBUILT_VERSION="$("$PLUTIL" -extract CFBundleShortVersionString raw -o - "$INFO_PLIST" 2>/dev/null || true)"
+  plist_value CFBundleShortVersionString
+  PREBUILT_VERSION="$PLIST_VALUE"
   if [[ ! "$PREBUILT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     echo "$PREBUILT has no usable CFBundleShortVersionString ('${PREBUILT_VERSION:-<none>}'). Nothing was changed." >&2
     exit 1
@@ -1771,14 +1906,13 @@ if [[ -n "$PREBUILT" ]]; then
     echo "Continue only if you checked the zip yourself with SHA256SUMS and 'gh attestation verify' (README, Install)."
     echo "Releases are not notarized, so macOS blocks the first launch of a downloaded one until you allow it in System Settings > Privacy & Security."
   else
-    cat >&2 <<REFUSE
-The origin of Insomnia $PREBUILT_VERSION at $PREBUILT is not verified. Its signature shows the bundle is
-intact, not who made it: anyone can sign a bundle with this identifier, and this install.sh cannot tell
-where it came from. Installing it would run its backstop.sh as you at login and every 60 s. Nothing was changed.
-Verify the zip yourself first ('shasum -a 256 -c SHA256SUMS' and 'gh attestation verify' with --signer-workflow,
-see the README), then rerun with the flag that says so:
-  $(command_line "$0" --allow-unverified-origin --app "$PREBUILT")
-REFUSE
+    printf '%s\n' \
+      "The origin of Insomnia $PREBUILT_VERSION at $PREBUILT is not verified. Its signature shows the bundle is" \
+      "intact, not who made it: anyone can sign a bundle with this identifier, and this install.sh cannot tell" \
+      "where it came from. Installing it would run its backstop.sh as you at login and every 60 s. Nothing was changed." \
+      "Verify the zip yourself first ('shasum -a 256 -c SHA256SUMS' and 'gh attestation verify' with --signer-workflow," \
+      "see the README), then rerun with the flag that says so:" \
+      "  $(command_line "$0" --allow-unverified-origin --app "$PREBUILT")" >&2
     exit 1
   fi
   SOURCE_APP="$CHECKED_APP"
@@ -1790,7 +1924,10 @@ else
     fi
     exit 1
   fi
-  BUILD_DIR="$("$MKTEMP" -d)"
+  make_dir_from "${TMPDIR:-/tmp}/insomnia-build.XXXXXX" "a private folder in ${TMPDIR:-/tmp} for the build" "$NOT_TOUCHED"
+  BUILD_DIR="$MADE_DIR"
+  # The build has no limit: it runs swift build, which takes minutes, and
+  # changes nothing on this Mac but the checkout's .build and BUILD_DIR.
   "$SCRIPT_DIR/build-app.sh" --output "$BUILD_DIR"
   SOURCE_APP="$BUILD_DIR/Insomnia.app"
 fi
@@ -1873,8 +2010,27 @@ if (( sudoers_present )); then
   sudoers_expect=same
   stop_for_rule_of_others "$sudoers_text"
 fi
-TMP_SUDOERS="$("$MKTEMP")"
-sudoers_rule_text > "$TMP_SUDOERS"
+# The candidate rule, made and written through change (capture for its
+# name), so a stalled disk stops the run instead of holding it.
+tmp_rc=0
+capture "$MKTEMP" || tmp_rc=$?
+(( CHANGE_SETTLED )) || stop_preparing "making a temporary file for the new rule ('mktemp')" "$NOT_TOUCHED"
+if (( tmp_rc != 0 )) || [[ "$CAPTURED" != /*$'\n' || "${CAPTURED%$'\n'}" == *$'\n'* ]]; then
+  echo "could not make a temporary file for the new rule ('mktemp' exited $tmp_rc). Nothing was changed." >&2
+  exit 1
+fi
+TMP_SUDOERS="${CAPTURED%$'\n'}"
+# shellcheck disable=SC2317  # run through change
+write_rule_candidate() {
+  [[ -f "$TMP_SUDOERS" && ! -L "$TMP_SUDOERS" ]] || return 1
+  sudoers_rule_text > "$TMP_SUDOERS"
+}
+change write_rule_candidate || tmp_rc=$?
+(( CHANGE_SETTLED )) || stop_preparing "writing the new rule to $TMP_SUDOERS" "$NOT_TOUCHED"
+if (( tmp_rc != 0 )); then
+  echo "could not write the new rule to $TMP_SUDOERS. Nothing was changed." >&2
+  exit 1
+fi
 if ! "$SUDO" "$VISUDO" -cf "$TMP_SUDOERS" >/dev/null; then
   echo "sudoers file failed validation (or sudo did not authenticate); not installed. Nothing was changed." >&2
   exit 1
@@ -1946,7 +2102,9 @@ if app_running; then
   # real app to quit.
   if (( ${#APP_FOUND[@]} > 0 )); then
     echo "Insomnia is running ($(list "${APP_FOUND[@]}")); quitting it first (this ends any session)."
-    "$OSASCRIPT" -e "tell application id \"$BUNDLE_ID\" to quit" >/dev/null 2>&1 || true
+    # Bounded, so an osascript that does not answer does not hold the run;
+    # whether the app quit is what the loop below checks.
+    bounded "$OSASCRIPT" -e "tell application id \"$BUNDLE_ID\" to quit" || true
   fi
   for (( i = 0; i < QUIT_WAIT_SECONDS; i++ )); do
     app_running || break
@@ -1960,8 +2118,19 @@ if app_running; then
 else
   report_others
 fi
-"$MKDIR" -p "$APP_DIR"
-STAGE="$("$MKTEMP" -d "$APP_DIR/.Insomnia.app.staging.$$.XXXXXX")"
+# From here to the recovery lock, each step that makes or copies something
+# is a change (see change), and each read of the new bundle a bounded call:
+# one that does not finish stops the run instead of holding it.
+RULE_ONLY="$SUDOERS is installed; the app at $APP and the LaunchAgent were not touched."
+stage_rc=0
+change "$MKDIR" -p "$APP_DIR" || stage_rc=$?
+(( CHANGE_SETTLED )) || stop_preparing "making $APP_DIR" "$RULE_ONLY"
+if (( stage_rc != 0 )); then
+  echo "could not make $APP_DIR (see the error above). $RULE_ONLY" >&2
+  exit 1
+fi
+make_dir_from "$APP_DIR/.Insomnia.app.staging.$$.XXXXXX" "a staging folder in $APP_DIR" "$RULE_ONLY"
+STAGE="$MADE_DIR"
 NEW_APP="$STAGE/Insomnia.app"
 # The bundle is copied here whole and reaches $APP in one rename under the
 # recovery lock (step 5), so backstop.sh never sees this binary beside an
@@ -1969,7 +2138,12 @@ NEW_APP="$STAGE/Insomnia.app"
 # only once Info.plist declares InsomniaResumeFrozenVersion).
 # ditto keeps the signature's resource seal and every attribute intact (a
 # downloaded bundle keeps its quarantine flag; Gatekeeper decides at launch).
-"$DITTO" "$SOURCE_APP" "$NEW_APP"
+change "$DITTO" "$SOURCE_APP" "$NEW_APP" || stage_rc=$?
+(( CHANGE_SETTLED )) || stop_preparing "copying $SOURCE_APP to $NEW_APP" "$RULE_ONLY"
+if (( stage_rc != 0 )); then
+  echo "could not copy $SOURCE_APP to $NEW_APP (see the error above). $RULE_ONLY" >&2
+  exit 1
+fi
 # It keeps the source's modes and ACLs as well. A zip unpacked by a tool
 # that keeps group or other write bits, a build made under umask 002, or a
 # bundle given an ACL would let other accounts edit the installed bundle.
@@ -1978,7 +2152,13 @@ NEW_APP="$STAGE/Insomnia.app"
 # and the bundle still verifies (the check below runs on this copy).
 # Extended attributes, the quarantine flag among them, stay. chmod -R
 # skips symbolic links.
-if ! "$CHMOD" -R go-w "$NEW_APP" || ! "$CHMOD" -R -N "$NEW_APP"; then
+change "$CHMOD" -R go-w "$NEW_APP" || stage_rc=$?
+(( CHANGE_SETTLED )) || stop_preparing "removing group and other write permission from $NEW_APP" "$RULE_ONLY"
+if (( stage_rc == 0 )); then
+  change "$CHMOD" -R -N "$NEW_APP" || stage_rc=$?
+  (( CHANGE_SETTLED )) || stop_preparing "removing ACLs from $NEW_APP" "$RULE_ONLY"
+fi
+if (( stage_rc != 0 )); then
   echo "could not remove group and other write permission and ACLs from the staged bundle $NEW_APP (see the error above). $SUDOERS is installed; the app at $APP and the LaunchAgent were not touched." >&2
   exit 1
 fi
@@ -1988,7 +2168,18 @@ fi
 # copy; an edited script fails that check. No executable is left in a
 # writable directory.
 BACKSTOP="$NEW_APP/Contents/Resources/backstop.sh"
-echo "signed $("$CODESIGN" -dv "$NEW_APP" 2>&1 | grep -i identifier || true)"
+# codesign -dv describes the signature on its standard error; its lines
+# that name an identifier are shown, any case, as grep -i would pick them.
+sign_rc=0
+signed=""
+bounded "$CODESIGN" -dv "$NEW_APP" || sign_rc=$?
+if (( sign_rc == 0 && BOUNDED_READ == 0 )); then
+  text_lines "$READ_TEXT"
+  for line in ${TEXT_LINES[@]+"${TEXT_LINES[@]}"}; do
+    [[ "$line" != *[Ii][Dd][Ee][Nn][Tt][Ii][Ff][Ii][Ee][Rr]* ]] || signed+="${signed:+$'\n'}$line"
+  done
+fi
+echo "signed $signed"
 # What the agent pins: the bundle's designated requirement, in the form
 # `codesign -d -r-` prints (an implicit one carries a leading "# "). For an
 # ad-hoc signature, which source builds and releases have, that is the cdhash
@@ -1997,22 +2188,43 @@ echo "signed $("$CODESIGN" -dv "$NEW_APP" 2>&1 | grep -i identifier || true)"
 # instead. It does not depend on the path, so it still holds
 # once the bundle is at $APP. The app reads the same text through the
 # Security framework (CodeRequirement.swift) to recognise this plist.
-REQUIREMENT="$("$CODESIGN" -d -r- "$NEW_APP" 2>&1 | sed -n 's/^#\{0,1\} *designated => //p' | head -n 1)"
+REQUIREMENT=""
+requirement_rc=0
+requirement_form='^#? *designated => (.*)$'
+bounded "$CODESIGN" -d -r- "$NEW_APP" || requirement_rc=$?
+if (( requirement_rc == 0 && BOUNDED_READ == 0 )); then
+  text_lines "$READ_TEXT"
+  for line in ${TEXT_LINES[@]+"${TEXT_LINES[@]}"}; do
+    if [[ "$line" =~ $requirement_form ]]; then
+      REQUIREMENT="${BASH_REMATCH[1]}"
+      break
+    fi
+  done
+fi
 if [[ -z "$REQUIREMENT" ]]; then
-  echo "could not read the designated requirement of the new bundle ('codesign -d -r-'); the LaunchAgent cannot pin it. $SUDOERS is installed; the app at $APP and the LaunchAgent were not touched." >&2
+  echo "could not read the designated requirement of the new bundle ('codesign -d -r-' $(read_result "$requirement_rc")); the LaunchAgent cannot pin it. $SUDOERS is installed; the app at $APP and the LaunchAgent were not touched." >&2
   exit 1
 fi
 # The check the agent will run every minute, run once here so a bundle the
 # agent would refuse is caught now instead of at the first recovery.
-if ! "$CODESIGN" --verify --strict "-R=$REQUIREMENT" "$NEW_APP"; then
-  echo "the new bundle does not satisfy its own requirement ($REQUIREMENT); the LaunchAgent would never run backstop.sh. $SUDOERS is installed; the app at $APP and the LaunchAgent were not touched." >&2
+verify_rc=0
+bounded "$CODESIGN" --verify --strict "-R=$REQUIREMENT" "$NEW_APP" || verify_rc=$?
+if (( verify_rc != 0 )); then
+  [[ -z "$BOUNDED_OUTPUT" ]] || printf '%s\n' "$BOUNDED_OUTPUT" >&2
+  echo "the new bundle does not satisfy its own requirement ($REQUIREMENT; 'codesign --verify' $(call_result "$verify_rc")); the LaunchAgent would never run backstop.sh. $SUDOERS is installed; the app at $APP and the LaunchAgent were not touched." >&2
   exit 1
 fi
 echo "LaunchAgent will require: $REQUIREMENT"
 
 # 4. Directories -------------------------------------------------------------
 step "Creating $APP_SUPPORT, $LOG_DIR and $LAUNCH_AGENTS"
-"$MKDIR" -p "$APP_SUPPORT" "$LOG_DIR" "$LAUNCH_AGENTS"
+dirs_rc=0
+change "$MKDIR" -p "$APP_SUPPORT" "$LOG_DIR" "$LAUNCH_AGENTS" || dirs_rc=$?
+(( CHANGE_SETTLED )) || stop_preparing "making $APP_SUPPORT, $LOG_DIR and $LAUNCH_AGENTS" "$RULE_ONLY"
+if (( dirs_rc != 0 )); then
+  echo "could not make $APP_SUPPORT, $LOG_DIR and $LAUNCH_AGENTS (see the error above). $RULE_ONLY" >&2
+  exit 1
+fi
 
 # 5. Recovery and LaunchAgent replacement are one transaction under the
 #    recovery lock (the same flock(2) file the app and backstop use), so a
@@ -2039,9 +2251,24 @@ if ! read_info_version "$info_source"; then
 fi
 step "Taking the recovery lock"
 LOCK="$APP_SUPPORT/.recovery.lock"
-exec 9<>"$LOCK"
+# The lock file is opened first in a change's own process, which makes it
+# when it is missing and waits there should the disk stall; this shell then
+# opens it again for fd 9, a residual open of its own that only a file
+# which stalls after that first open can hold. lockf locks fd 9 itself,
+# which the change keeps, and one that does not finish stops the run.
+# shellcheck disable=SC2317  # run through change
+lock_open() {
+  { : 8<>"$LOCK"; } 2>/dev/null
+}
 lock_rc=0
-"$LOCKF" -t "$LOCK_TIMEOUT_SECONDS" 9 2>/dev/null || lock_rc=$?
+change lock_open || lock_rc=$?
+(( CHANGE_SETTLED )) || stop_preparing "opening $LOCK" "$RULE_ONLY"
+if (( lock_rc != 0 )) || ! { exec 9<>"$LOCK"; } 2>/dev/null; then
+  echo "Could not open the recovery lock $LOCK. $RULE_ONLY" >&2
+  exit 1
+fi
+change quietly "$LOCKF" -t "$LOCK_TIMEOUT_SECONDS" 9 || lock_rc=$?
+(( CHANGE_SETTLED )) || stop_preparing "taking the recovery lock $LOCK" "$RULE_ONLY"
 if (( lock_rc != 0 )); then
   echo "The recovery lock $LOCK is held by another process (the app or a running backstop)." >&2
   echo "Wait a minute and rerun. $SUDOERS is installed; the app at $APP and the LaunchAgent were not touched." >&2
@@ -2072,38 +2299,35 @@ fi
 rule_rc=0
 pmset_rule_effective || rule_rc=$?
 if (( rule_rc == 124 )); then
-  cat >&2 <<FAIL
-
-Install stopped: 'sudo -n -l', which checks the rule in $SUDOERS again now that
-this run holds the recovery lock, did not answer within ${CALL_TIMEOUT_SECONDS}s. The check
-stopped on SIGTERM and this run exits, which lets go of the lock, so the app and
-the LaunchAgent's backstop can take it again and undo a session left over. The
-app at $APP and the LaunchAgent were not touched; the new build was discarded.
-Rerun this script once sudo answers.
-FAIL
+  printf '%s\n' \
+    "" \
+    "Install stopped: 'sudo -n -l', which checks the rule in $SUDOERS again now that" \
+    "this run holds the recovery lock, did not answer within ${CALL_TIMEOUT_SECONDS}s. The check" \
+    "stopped on SIGTERM and this run exits, which lets go of the lock, so the app and" \
+    "the LaunchAgent's backstop can take it again and undo a session left over. The" \
+    "app at $APP and the LaunchAgent were not touched; the new build was discarded." \
+    "Rerun this script once sudo answers." >&2
   exit 1
 elif (( rule_rc == 125 )); then
-  cat >&2 <<FAIL
-
-Install stopped: 'sudo -n -l', which checks the rule in $SUDOERS again now that
-this run holds the recovery lock, did not answer within ${CALL_TIMEOUT_SECONDS}s. $(sudo_alive_note).
-It keeps the recovery lock until it ends, so until then the app cannot start a
-session and the LaunchAgent's backstop cannot undo one. If it does not end by
-itself, stop it:
-  sudo kill ${BOUNDED_PID:-<pid>}
-The app at $APP and the LaunchAgent were not touched; the new build was
-discarded. Rerun this script once it has ended.
-FAIL
+  printf '%s\n' \
+    "" \
+    "Install stopped: 'sudo -n -l', which checks the rule in $SUDOERS again now that" \
+    "this run holds the recovery lock, did not answer within ${CALL_TIMEOUT_SECONDS}s. $(sudo_alive_note)." \
+    "It keeps the recovery lock until it ends, so until then the app cannot start a" \
+    "session and the LaunchAgent's backstop cannot undo one. If it does not end by" \
+    "itself, stop it:" \
+    "  sudo kill ${BOUNDED_PID:-<pid>}" \
+    "The app at $APP and the LaunchAgent were not touched; the new build was" \
+    "discarded. Rerun this script once it has ended." >&2
   exit 1
 elif (( rule_rc != 0 )); then
-  cat >&2 <<FAIL
-
-Install stopped: 'sudo -n pmset' was permitted when $SUDOERS was installed above,
-but is not now that this run holds the recovery lock. Something removed or changed
-the rule while this run waited (uninstall.sh removes it under the same lock), and
-without it no session can undo pmset. The app at $APP and the LaunchAgent were not
-touched; the new build was discarded. Rerun this script to install the rule again.
-FAIL
+  printf '%s\n' \
+    "" \
+    "Install stopped: 'sudo -n pmset' was permitted when $SUDOERS was installed above," \
+    "but is not now that this run holds the recovery lock. Something removed or changed" \
+    "the rule while this run waited (uninstall.sh removes it under the same lock), and" \
+    "without it no session can undo pmset. The app at $APP and the LaunchAgent were not" \
+    "touched; the new build was discarded. Rerun this script to install the rule again." >&2
   exit 1
 fi
 
@@ -2121,15 +2345,14 @@ fi
 if [[ -d "$PREVIOUS_APP" && ! -e "$APP" ]]; then
   # Stopped between the two renames: nothing at $APP.
   if ! move_bundle "$PREVIOUS_APP" "$APP"; then
-    cat >&2 <<FAIL
-
-Install stopped: nothing is at $APP, and putting back the previous app that an
-interrupted run set aside at $PREVIOUS_APP failed. It stays there; nothing else
-was moved or unloaded, and the new build was discarded. Installed so far: $SUDOERS.
-The LaunchAgent finds no app at $APP until it is back. Before you log out, move
-it back and rerun this script:
-  $(command_line mv "$PREVIOUS_APP" "$APP")
-FAIL
+    printf '%s\n' \
+      "" \
+      "Install stopped: nothing is at $APP, and putting back the previous app that an" \
+      "interrupted run set aside at $PREVIOUS_APP failed. It stays there; nothing else" \
+      "was moved or unloaded, and the new build was discarded. Installed so far: $SUDOERS." \
+      "The LaunchAgent finds no app at $APP until it is back. Before you log out, move" \
+      "it back and rerun this script:" \
+      "  $(command_line mv "$PREVIOUS_APP" "$APP")" >&2
     exit 1
   fi
   echo "restored $APP, which an interrupted run had set aside"
@@ -2204,16 +2427,15 @@ step "Ending any stale session and checking the recovery journal"
 recovery_rc=0
 run_backstop "$BACKSTOP" || recovery_rc=$?
 if (( recovery_rc == 125 )); then
-  cat >&2 <<FAIL
-
-Install stopped: the backstop (pid ${BOUNDED_PID:-?}) or a process it started is still running.
-Either the backstop did not finish within ${BACKSTOP_TIMEOUT_SECONDS}s and had not ended three seconds
-after its SIGTERM, or it ended and left that process running. Nothing is killed, because
-it may be running sudo pmset, and the recovery lock stays held until all of them have
-ended. The app at $APP
-and the LaunchAgent were not replaced or unloaded; the new build was discarded.
-Installed so far: $SUDOERS. Rerun this script once they have ended.
-FAIL
+  printf '%s\n' \
+    "" \
+    "Install stopped: the backstop (pid ${BOUNDED_PID:-?}) or a process it started is still running." \
+    "Either the backstop did not finish within ${BACKSTOP_TIMEOUT_SECONDS}s and had not ended three seconds" \
+    "after its SIGTERM, or it ended and left that process running. Nothing is killed, because" \
+    "it may be running sudo pmset, and the recovery lock stays held until all of them have" \
+    "ended. The app at $APP" \
+    "and the LaunchAgent were not replaced or unloaded; the new build was discarded." \
+    "Installed so far: $SUDOERS. Rerun this script once they have ended." >&2
   exit 1
 fi
 recovery_note=""
@@ -2265,17 +2487,16 @@ or the LaunchAgent:
   $(command_line /bin/bash "$SCRIPT_DIR/backstop.sh" --force)
 Then rerun this script to install the app and the LaunchAgent."
   fi
-  cat >&2 <<FAIL
-
-Install stopped: the backstop could not fully undo a previous session
-(exit status $recovery_rc).$recovery_note $pair_note
-Installed so far: $SUDOERS.
-$agent_note
-Check $LOG_DIR/insomnia.log and resolve what it reports. Saved audio, display
-brightness or keyboard backlight needs the app; if one is installed, open it:
-  $(command_line open "$APP")
-$manual_step
-FAIL
+  printf '%s\n' \
+    "" \
+    "Install stopped: the backstop could not fully undo a previous session" \
+    "(exit status $recovery_rc).$recovery_note $pair_note" \
+    "Installed so far: $SUDOERS." \
+    "$agent_note" \
+    "Check $LOG_DIR/insomnia.log and resolve what it reports. Saved audio, display" \
+    "brightness or keyboard backlight needs the app; if one is installed, open it:" \
+    "  $(command_line open "$APP")" \
+    "$manual_step" >&2
   exit 1
 fi
 
@@ -2287,14 +2508,13 @@ if [[ -d "$PREVIOUS_APP" ]]; then
   if (( pins_rc == 124 )); then
     # Which bundle goes back is not known, so neither moves and no job is
     # unloaded: whatever job is loaded keeps the build it pins.
-    cat >&2 <<FAIL
-
-Install stopped: an interrupted run left a build at $APP and set the previous app
-aside at $PREVIOUS_APP. $PINS_UNKNOWN
-Neither bundle was moved and no LaunchAgent job was unloaded; the new build was
-discarded. Installed so far: $SUDOERS. The recovery journal was clean when
-checked above. Rerun this script once that is resolved.
-FAIL
+    printf '%s\n' \
+      "" \
+      "Install stopped: an interrupted run left a build at $APP and set the previous app" \
+      "aside at $PREVIOUS_APP. $PINS_UNKNOWN" \
+      "Neither bundle was moved and no LaunchAgent job was unloaded; the new build was" \
+      "discarded. Installed so far: $SUDOERS. The recovery journal was clean when" \
+      "checked above. Rerun this script once that is resolved." >&2
     exit 1
   fi
   if (( pins_rc == 0 )); then
@@ -2311,18 +2531,17 @@ FAIL
     if [[ "$held" != no ]]; then
       unload_job "$held"
       if [[ "$UNLOADED" != no ]]; then
-        cat >&2 <<FAIL
-
-Install stopped: an interrupted run left its build at $APP and the previous app
-at $PREVIOUS_APP, and $PLIST pins the previous one.
-A job with label $LABEL may still be loaded from that run, and unloading it was
-not confirmed ($UNLOADED_HOW). That job pins the build at $APP, so
-neither bundle was moved. Installed so far: $SUDOERS. The recovery journal was
-clean when checked above.
-The next login loads $PLIST, which does not match the app at $APP. Before you
-log out, unload the job and rerun this script:
-  launchctl bootout gui/$UID_NUM/$LABEL
-FAIL
+        printf '%s\n' \
+          "" \
+          "Install stopped: an interrupted run left its build at $APP and the previous app" \
+          "at $PREVIOUS_APP, and $PLIST pins the previous one." \
+          "A job with label $LABEL may still be loaded from that run, and unloading it was" \
+          "not confirmed ($UNLOADED_HOW). That job pins the build at $APP, so" \
+          "neither bundle was moved. Installed so far: $SUDOERS. The recovery journal was" \
+          "clean when checked above." \
+          "The next login loads $PLIST, which does not match the app at $APP. Before you" \
+          "log out, unload the job and rerun this script:" \
+          "  launchctl bootout gui/$UID_NUM/$LABEL" >&2
         exit 1
       fi
     fi
@@ -2332,15 +2551,14 @@ FAIL
 "
     fi
     if ! move_bundle "$APP" "$STAGE/Interrupted.app"; then
-      cat >&2 <<FAIL
-
-Install stopped: an interrupted run left its build at $APP and the previous app
-at $PREVIOUS_APP, which $PLIST pins, and moving that build out of $APP failed.
-Neither bundle was moved; the new build was discarded. Installed so far: $SUDOERS.
-${unloaded_note}The next login loads $PLIST, which does not match the app at $APP.
-Before you log out, fix what kept the bundle from moving (see the error above)
-and rerun this script, which puts the previous app back.
-FAIL
+      printf '%s\n' \
+        "" \
+        "Install stopped: an interrupted run left its build at $APP and the previous app" \
+        "at $PREVIOUS_APP, which $PLIST pins, and moving that build out of $APP failed." \
+        "Neither bundle was moved; the new build was discarded. Installed so far: $SUDOERS." \
+        "${unloaded_note}The next login loads $PLIST, which does not match the app at $APP." \
+        "Before you log out, fix what kept the bundle from moving (see the error above)" \
+        "and rerun this script, which puts the previous app back." >&2
       exit 1
     fi
     if ! move_bundle "$PREVIOUS_APP" "$APP"; then
@@ -2349,19 +2567,18 @@ FAIL
       # run's: no bundle is deleted while none is at $APP.
       kept="$STAGE"
       STAGE=""
-      cat >&2 <<FAIL
-
-Install stopped: an interrupted run left its build at $APP and the previous app
-at $PREVIOUS_APP, which $PLIST pins. That build was moved out of the way, but
-moving the previous app back to $APP failed, so nothing is at $APP.
-The previous app stays at $PREVIOUS_APP; the interrupted run's build and the new
-build are kept in $kept. Installed so far: $SUDOERS.
-${unloaded_note}The LaunchAgent finds no app at $APP until the previous one is back. Before
-you log out, move it back and load its agent:
-  $(command_line mv "$PREVIOUS_APP" "$APP")
-  $(command_line launchctl bootstrap "gui/$UID_NUM" "$PLIST")
-or rerun this script, which puts it back first.
-FAIL
+      printf '%s\n' \
+        "" \
+        "Install stopped: an interrupted run left its build at $APP and the previous app" \
+        "at $PREVIOUS_APP, which $PLIST pins. That build was moved out of the way, but" \
+        "moving the previous app back to $APP failed, so nothing is at $APP." \
+        "The previous app stays at $PREVIOUS_APP; the interrupted run's build and the new" \
+        "build are kept in $kept. Installed so far: $SUDOERS." \
+        "${unloaded_note}The LaunchAgent finds no app at $APP until the previous one is back. Before" \
+        "you log out, move it back and load its agent:" \
+        "  $(command_line mv "$PREVIOUS_APP" "$APP")" \
+        "  $(command_line launchctl bootstrap "gui/$UID_NUM" "$PLIST")" \
+        "or rerun this script, which puts it back first." >&2
       exit 1
     fi
     echo "restored $APP, which an interrupted run had set aside; $PLIST pins it"
@@ -2386,17 +2603,16 @@ so which plist it runs is unknown. Check 'launchctl print gui/$UID_NUM/$LABEL'."
 load the previous one again:
   $(command_line launchctl bootstrap "gui/$UID_NUM" "$PLIST")"
         fi
-        cat >&2 <<FAIL
-
-Install stopped: the job an interrupted run left was unloaded and the previous app
-is back at $APP, which $PLIST pins, but loading $PLIST again was not
-confirmed ($reload_reason).
-The new build was discarded. Installed so far: $SUDOERS. The recovery journal
-was clean when checked above, and the next login loads $PLIST, which matches
-the app at $APP.
-$job_note
-Then rerun this script.
-FAIL
+        printf '%s\n' \
+          "" \
+          "Install stopped: the job an interrupted run left was unloaded and the previous app" \
+          "is back at $APP, which $PLIST pins, but loading $PLIST again was not" \
+          "confirmed ($reload_reason)." \
+          "The new build was discarded. Installed so far: $SUDOERS. The recovery journal" \
+          "was clean when checked above, and the next login loads $PLIST, which matches" \
+          "the app at $APP." \
+          "$job_note" \
+          "Then rerun this script." >&2
         exit 1
       fi
       echo "unloaded the job the interrupted run left and loaded $PLIST again (launchctl print confirms)"
@@ -2477,13 +2693,12 @@ change_or_stop "writing the new LaunchAgent plist $CANDIDATE" write_candidate
 lint_rc=0
 bounded "$PLUTIL" -lint "$CANDIDATE" || lint_rc=$?
 if (( lint_rc != 0 )); then
-  cat >&2 <<FAIL
-
-Install stopped: 'plutil -lint' on the new LaunchAgent plist $(call_result "$lint_rc")${BOUNDED_OUTPUT:+ ($BOUNDED_OUTPUT)}.
-The plist at $PLIST and the app at $APP were not replaced and no job was
-unloaded in this step; the new build was discarded. Installed so far: $SUDOERS.
-Rerun this script.
-FAIL
+  printf '%s\n' \
+    "" \
+    "Install stopped: 'plutil -lint' on the new LaunchAgent plist $(call_result "$lint_rc")${BOUNDED_OUTPUT:+ ($BOUNDED_OUTPUT)}." \
+    "The plist at $PLIST and the app at $APP were not replaced and no job was" \
+    "unloaded in this step; the new build was discarded. Installed so far: $SUDOERS." \
+    "Rerun this script." >&2
   exit 1
 fi
 
@@ -2504,14 +2719,13 @@ if [[ "$UNLOADED" != no ]]; then
   $(command_line launchctl bootstrap "gui/$UID_NUM" "$PLIST")
 "
   fi
-  cat >&2 <<FAIL
-
-Install stopped: unloading the previous LaunchAgent job was not confirmed
-($UNLOADED_HOW), so the app at $APP was not replaced and the new
-build was discarded. $PLIST was not modified.
-$SUDOERS is installed and the recovery journal was clean when checked above.
-${reload_hint}Check 'launchctl print gui/$UID_NUM/$LABEL' and rerun this script.
-FAIL
+  printf '%s\n' \
+    "" \
+    "Install stopped: unloading the previous LaunchAgent job was not confirmed" \
+    "($UNLOADED_HOW), so the app at $APP was not replaced and the new" \
+    "build was discarded. $PLIST was not modified." \
+    "$SUDOERS is installed and the recovery journal was clean when checked above." \
+    "${reload_hint}Check 'launchctl print gui/$UID_NUM/$LABEL' and rerun this script." >&2
   exit 1
 fi
 # A rename that fails is handled like a failed load: no job of this run was
@@ -2628,14 +2842,13 @@ next login loads would refuse to run."
     else
       plist_note="No plist exists at $PLIST, so no agent loads at the next login."
     fi
-    cat >&2 <<FAIL
-
-Install stopped: $reason.
-$kept_why $kept_note
-$plist_note
-$SUDOERS is installed and the recovery journal was clean when checked above.
-${fix_note%.} before you log out.
-FAIL
+    printf '%s\n' \
+      "" \
+      "Install stopped: $reason." \
+      "$kept_why $kept_note" \
+      "$plist_note" \
+      "$SUDOERS is installed and the recovery journal was clean when checked above." \
+      "${fix_note%.} before you log out." >&2
     exit 1
   fi
   if (( set_aside )); then
@@ -2654,18 +2867,17 @@ FAIL
         restore="move it back:
   $(command_line mv "$PREVIOUS_APP" "$APP")"
       fi
-      cat >&2 <<FAIL
-
-$stopped
-Putting the previous app back at $APP then failed (see the error above), so
-nothing is at $APP. The previous app stays at $PREVIOUS_APP and the new build
-at $NEW_APP; neither was deleted.
-$plist_note
-$SUDOERS is installed and the recovery journal was clean when checked above.
-The LaunchAgent finds no app at $APP until the previous one is back. Before you
-log out, $restore
-or rerun this script, which puts it back first.
-FAIL
+      printf '%s\n' \
+        "" \
+        "$stopped" \
+        "Putting the previous app back at $APP then failed (see the error above), so" \
+        "nothing is at $APP. The previous app stays at $PREVIOUS_APP and the new build" \
+        "at $NEW_APP; neither was deleted." \
+        "$plist_note" \
+        "$SUDOERS is installed and the recovery journal was clean when checked above." \
+        "The LaunchAgent finds no app at $APP until the previous one is back. Before you" \
+        "log out, $restore" \
+        "or rerun this script, which puts it back first." >&2
       exit 1
     fi
     app_note="The previous app was put back at $APP; the new build was discarded."
@@ -2720,15 +2932,14 @@ loaded, load the previous one yourself:
   else
     plist_note="No plist exists at $PLIST."
   fi
-  cat >&2 <<FAIL
-
-$stopped
-$plist_note
-$app_note
-$outcome
-$SUDOERS is installed and the recovery journal was clean when checked above.
-$fix_note
-FAIL
+  printf '%s\n' \
+    "" \
+    "$stopped" \
+    "$plist_note" \
+    "$app_note" \
+    "$outcome" \
+    "$SUDOERS is installed and the recovery journal was clean when checked above." \
+    "$fix_note" >&2
   exit 1
 fi
 
@@ -2737,11 +2948,10 @@ step "Installed"
 # The uninstaller shipped beside this script: scripts/ in a checkout, the
 # zip's top level in a release (which may be unpacked inside a checkout).
 UNINSTALL="$SCRIPT_DIR/uninstall.sh"
-cat <<NEXT
-Next steps:
-  1. Launch:            $(command_line open "$APP")
-  2. Optional:          System Settings > Wi-Fi > Ask to join hotspots: Automatically
-  3. Config lives at:   $APP_SUPPORT/config.json
-  4. Logs:              $LOG_DIR/insomnia.log
-  5. Uninstall:         $(command_line "$UNINSTALL")
-NEXT
+printf '%s\n' \
+  "Next steps:" \
+  "  1. Launch:            $(command_line open "$APP")" \
+  "  2. Optional:          System Settings > Wi-Fi > Ask to join hotspots: Automatically" \
+  "  3. Config lives at:   $APP_SUPPORT/config.json" \
+  "  4. Logs:              $LOG_DIR/insomnia.log" \
+  "  5. Uninstall:         $(command_line "$UNINSTALL")"
