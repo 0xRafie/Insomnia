@@ -27,8 +27,8 @@ without `--purge` they stay.
 **Recovery is not "everything always gets undone."** The backstop does not
 monitor battery or temperature. Saved audio needs the app to reopen, and
 unconfirmed process freezes may need manual inspection. If a warning remains,
-resolve it before leaving the Mac unattended. Real-machine crash, reboot, and
-installation scenarios still need [release validation](release-validation.md).
+resolve it before leaving the Mac unattended. Each release's real-Mac crash,
+reboot and installation checks are in [release validation](release-validation.md).
 
 ## Recovery limits and manual attention
 
