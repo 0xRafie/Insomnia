@@ -65,30 +65,37 @@ one, so its `install.sh` needs `--app`, and its `uninstall.sh` runs only the
 1. Set `CFBundleShortVersionString` in `Resources/Info.plist` to the new
    version (and bump `CFBundleVersion`). Commit on main. `0.1.0` is taken
    (see Channels).
-2. Tag that commit `v<version>`, the same digits, and push the tag:
+2. Test that commit before anything is published. Start a manual run on it
+   (Actions, Release, Run workflow, with the nightly box left unticked),
+   download the zip from the run's artifact, check it with
+   `shasum -a 256 -c SHA256SUMS`, and install it with
+   `./install.sh --allow-unverified-origin --app ./Insomnia.app` on a Mac you
+   can afford to reinstall on. Then run the
+   [real-Mac checks](#real-mac-checks-before-a-release) and record the
+   results in `docs/release-validation.md`. Fix anything that fails and
+   start again from step 1.
+3. Tag the tested commit `v<version>`, the same digits, and push the tag:
 
    ```bash
-   git tag v0.2.0
+   git tag v0.2.0 <tested commit>
    git push origin v0.2.0
    ```
 
    The workflow refuses a tag whose digits differ from the plist.
-3. Watch the run. It runs `swift test`, builds and ad-hoc signs the bundle,
+4. Watch the run. It runs `swift test`, builds and ad-hoc signs the bundle,
    packages it, attests the zip and creates the GitHub Release, marked
    Latest, with notes that include the checksum and the verify commands.
    `gh release create` fails if the tag already has a release, so a rerun
    never replaces published assets.
-4. Download the zip from the release and check it the way a user would (see
-   below), then install it with the command in the release notes
-   (`./install.sh --allow-unverified-origin --app ./Insomnia.app`) on a Mac
-   you can afford to reinstall on. Then run the
-   [real-Mac checks](#real-mac-checks-before-a-release) and record the
-   results in `docs/release-validation.md`.
+5. Download the zip from the release and check it the way a user would (see
+   below), then install it with the command in the release notes on a Mac
+   you can afford to reinstall on.
 
 A manual run (Actions, Release, Run workflow) with the nightly box left
 unticked builds and packages the chosen branch and uploads the zip and
 `SHA256SUMS` as a workflow artifact. It does not attest or publish anything,
-so it is the way to try the pipeline.
+so it is the way to try the pipeline and to get the build that step 2
+tests.
 
 ## Nightly prereleases
 
@@ -184,10 +191,12 @@ are run by hand after a real install, and their results go in
 
 ## Real-Mac checks before a release
 
-Run these on a real Mac before each stable release, on the build the
-release ships, and record the results in `docs/release-validation.md` with
-the commit, the Mac, the macOS version and the date. A passing `swift test`,
-a source review or a green CI run is not a result.
+Run these on a real Mac before each stable release, on a workflow build of
+the commit the release will be tagged on (step 2 of
+[Cutting a stable release](#cutting-a-stable-release)), and record the
+results in `docs/release-validation.md` with the commit, the Mac, the macOS
+version and the date. A passing `swift test`, a source review or a green CI
+run is not a result.
 
 The simulated lid close/open check is the exception. A release build leaves
 out the `simulate-lid.sh` watcher, so run that check on a source build of the
