@@ -408,22 +408,32 @@ final class ReleaseWorkflowTests: XCTestCase {
         XCTAssertTrue(try readmeInstallSection().contains("Apple Silicon"), "the README's Install section")
     }
 
-    /// The README's Install section lets a reader, or the coding agent the
-    /// README is pasted into, choose a channel, and sends v0.1.0, which no
-    /// workflow built, to its own release notes.
+    /// The README's Install section gives the coding agent prompt for either
+    /// channel and points at docs/install.md, which lets a reader choose a
+    /// channel and sends v0.1.0, which no workflow built, to its own release
+    /// notes.
     func testTheReadmeOffersBothChannelsAndSetsV010Apart() throws {
         let install = try readmeInstallSection().split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        for phrase in ["Install the latest stable Insomnia release by following https://github.com/krishhgg/Insomnia/blob/main/skills/install-insomnia/SKILL.md",
+                       "the newest Insomnia nightly prerelease", "](docs/install.md)"] {
+            XCTAssertTrue(install.contains(phrase), "the README's Install section lacks: \(phrase)")
+        }
+        let skill = try String(contentsOf: repoRoot.appendingPathComponent("skills/install-insomnia/SKILL.md"), encoding: .utf8)
+        XCTAssertTrue(skill.contains("docs/install.md"), "the install skill follows docs/install.md")
+        let guide = try String(contentsOf: repoRoot.appendingPathComponent("docs/install.md"), encoding: .utf8)
+            .split(whereSeparator: \.isWhitespace).joined(separator: " ")
         for phrase in ["Stable: the release GitHub marks Latest", "Nightly: prereleases tagged `nightly-", "A nightly is never marked Latest",
                        "`refs/tags/v<version>` for a stable release or `refs/heads/main` for a nightly",
                        "--source-ref <ref> --source-digest <commit>",
-                       "If the release you picked is `v0.1.0`", "Install the latest stable Insomnia release from", "the newest Insomnia nightly prerelease"] {
-            XCTAssertTrue(install.contains(phrase), "the README's Install section lacks: \(phrase)")
+                       "If the release you picked is `v0.1.0`"] {
+            XCTAssertTrue(guide.contains(phrase), "docs/install.md lacks: \(phrase)")
         }
     }
 
+    private var repoRoot: URL { workflowsDir.deletingLastPathComponent().deletingLastPathComponent() }
+
     private func readmeInstallSection() throws -> String {
-        let repo = workflowsDir.deletingLastPathComponent().deletingLastPathComponent()
-        let readme = try String(contentsOf: repo.appendingPathComponent("README.md"), encoding: .utf8)
+        let readme = try String(contentsOf: repoRoot.appendingPathComponent("README.md"), encoding: .utf8)
         let install = try XCTUnwrap(readme.range(of: "\n## Install\n"), "README has no Install section")
         let end = readme.range(of: "\n## ", range: install.upperBound..<readme.endIndex)?.lowerBound ?? readme.endIndex
         return String(readme[install.upperBound..<end])

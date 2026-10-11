@@ -68,8 +68,8 @@
     {
       "id": "sudoers-rule-is-four-exact-lines",
       "severity": "high",
-      "scope": ["scripts/install.sh", "scripts/uninstall.sh", "Sources/Insomnia/Core/SleepGuard.swift", "README.md", "SECURITY.md", "docs/spec.md"],
-      "rule": "The file install.sh writes to /etc/sudoers.d/insomnia grants NOPASSWD for exactly these four commands and nothing else: /usr/bin/pmset -a disablesleep 1, /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -b lowpowermode 1, /usr/bin/pmset -b lowpowermode 0. No wildcard, no ALL, no bare /usr/bin/pmset, no other command, and it is validated with visudo -cf before it is installed. SleepGuard.swift runs only those four argument lists, and README.md, SECURITY.md and docs/spec.md list the same four."
+      "scope": ["scripts/install.sh", "scripts/uninstall.sh", "Sources/Insomnia/Core/SleepGuard.swift", "README.md", "docs/install.md", "SECURITY.md", "docs/spec.md"],
+      "rule": "The file install.sh writes to /etc/sudoers.d/insomnia grants NOPASSWD for exactly these four commands and nothing else: /usr/bin/pmset -a disablesleep 1, /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -b lowpowermode 1, /usr/bin/pmset -b lowpowermode 0. No wildcard, no ALL, no bare /usr/bin/pmset, no other command, and it is validated with visudo -cf before it is installed. SleepGuard.swift runs only those four argument lists, and README.md, docs/install.md, SECURITY.md and docs/spec.md list the same four."
     },
     {
       "id": "behavior-changes-come-with-regression-tests",
