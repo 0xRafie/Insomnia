@@ -1068,7 +1068,7 @@ provided by the standalone backstop. Performance effects depend on workload.
     skipped and logged.
   - Post a notification: "Network was down 2m 10s. Nudged 2 tmux panes.
     Check GUI agents."
-- Recommended one-time setting, documented in the README: System Settings >
+- Recommended one-time setting, documented in docs/extras.md: System Settings >
   Wi-Fi > "Ask to join hotspots" = Automatically.
 
 ### 8. Reconcile and backstop (recovery goals)
@@ -1606,7 +1606,12 @@ Insomnia/
     simulate-lid.sh        file trigger for the lid-close action path (debug and
                            INSOMNIA_LID_SIMULATION=1 builds only)
   docs/spec.md
-  README.md                setup, hotspot setting, Chrome note
+  docs/install.md          install, upgrade and uninstall steps
+  docs/lid-close.md        lid-close actions and their defaults
+  docs/recovery.md         recovery details and manual attention
+  docs/extras.md           hotspot, tmux, Chrome, configuration and privacy
+  skills/                  agent playbooks: install-insomnia, maintain-insomnia
+  README.md                short overview that links the docs
 ```
 
 ## Install
