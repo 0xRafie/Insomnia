@@ -25,20 +25,17 @@ jobs:
     # default Xcode (no xcode-select). GitHub picks the point release and
     # moves it forward, so the first step records the one each run used.
     #   macos-26 (arm64): Xcode 26.6 default, 26.4.1 also installed.
-    #   xcode-27 (arm64, public preview): Xcode 27 on macOS 27. Its failures
-    #   are reported but do not fail the run until the macOS 27 fixes land.
+    #   xcode-27 (arm64, public preview): Xcode 27 on macOS 27.
+    # On 2026-10-11 these were macOS 26.6.2 (25G83) and 27.0.1 (26A434).
     strategy:
       fail-fast: false
       matrix:
         include:
           - image: macos-26
             label: macOS 26
-            experimental: false
           - image: xcode-27
             label: macOS 27
-            experimental: true
     runs-on: ${{ matrix.image }}
-    continue-on-error: ${{ matrix.experimental }}
     # The test watchdog below allows 50 minutes for swift test, which builds
     # the tests and then runs them; the other 10 cover setup, the release
     # build and the lid simulation check.
