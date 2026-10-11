@@ -3198,7 +3198,7 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.writeState(dirty)
 
         let holder = try fx.holdLock()
-        defer { XCTAssertEqual(holder.stop(), 0, "the lock holder, reaped once its cat read the end of its input") }
+        defer { XCTAssertEqual(holder.stop(), 0, "the lock holder, reaped once its cat read the end of its input: \(holder.problems)") }
 
         let r = try fx.run(fx.backstop)
 
@@ -4821,6 +4821,7 @@ final class RecoveryScriptTests: XCTestCase {
         held_shown=()
         held_raws=()
         held_gone=()
+        held_where=()
         while IFS= read -r line; do
           case "$line" in
             "held: "*)
@@ -4837,6 +4838,7 @@ final class RecoveryScriptTests: XCTestCase {
           esac
         done < "$1.printed"
         if [[ -f "$2" ]] && (( held_count > 0 )); then
+          json_held_where ""
           record_text_problems "$2" state "$3" "" restore > "$3.printed"
         fi
 
@@ -5136,8 +5138,55 @@ final class RecoveryScriptTests: XCTestCase {
     func testBothScriptsReadTheRecordsTheSameWay() throws {
         let reader = try Self.readerBlock("backstop.sh")
         XCTAssertEqual(reader, try Self.readerBlock("uninstall.sh"))
-        for name in ["json_whole", "json_decimal_reads", "json_range", "json_magnitude_above", "json_digits_times", "json_float", "json_string_check", "json_held_prefix", "json_held_token", "json_view_put", "json_window_trim", "record_text_problems"] {
+        for name in ["json_whole", "json_decimal_reads", "json_range", "json_magnitude_above", "json_digits_times", "json_float", "json_string_check", "json_held_prefix", "json_held_token", "json_held_where", "json_view_put", "json_window_trim", "record_text_problems"] {
             XCTAssertTrue(reader.contains("\n\(name)() {"), name)
+        }
+    }
+
+    /// Review40 R40-1: where json_held_where, in each script, has each
+    /// placeholder be in a copy (held_where) and which must be gone
+    /// (held_gone), from where it is in the view (held_shown) and the
+    /// arrays the edit wrote again. One in an entry kept goes under the
+    /// same key at the index the entry has in the copy, which may be
+    /// another; one in an entry taken out has no place and is gone; one
+    /// anywhere else stays where it is, such as in frozenProcessesX. One in
+    /// an entry with no index given, or with one that is not a number, has
+    /// no place ("?", which no string is shown as).
+    func testHeldWhereFollowsEachEntryToItsIndexInTheCopy() throws {
+        let shown = ["savedAudioOutputs[0].saveID", "frozenProcesses[1].bootSession", "frozenProcesses[0].bootSession", "appNapOverrides[2].bundleId",
+                     "frozenProcesses[5].bootSession", "endedSession", "frozenProcesses[2].bootSession", "appNapOverrides[0].bundleId",
+                     "frozenProcessesX[1].bootSession", "frozenProcesses[10].bootSession", "frozenProcesses[3].bootSession"]
+        let cases: [(moves: String, wants: [String])] = [
+            (" frozenProcesses=-,0,1,x,4,5,6,7,8,9,12 appNapOverrides=0,-,1",
+             ["savedAudioOutputs[0].saveID", "frozenProcesses[0].bootSession", "gone", "appNapOverrides[1].bundleId",
+              "frozenProcesses[5].bootSession", "endedSession", "frozenProcesses[1].bootSession", "appNapOverrides[0].bundleId",
+              "frozenProcessesX[1].bootSession", "frozenProcesses[12].bootSession", "?"]),
+            ("", shown),
+            (" frozenProcesses=0", ["savedAudioOutputs[0].saveID", "?", "frozenProcesses[0].bootSession", "appNapOverrides[2].bundleId",
+                                     "?", "endedSession", "?", "appNapOverrides[0].bundleId", "frozenProcessesX[1].bootSession", "?", "?"]),
+        ]
+        let f = try ScriptFixture()
+        defer { f.destroy() }
+        for script in ["backstop.sh", "uninstall.sh"] {
+            let runner = f.root.appendingPathComponent("held-where-\(script)")
+            try ("set -euo pipefail\n" + Self.readerBlock(script) + """
+
+            held_shown=(\(shown.map { "'\($0)'" }.joined(separator: " ")))
+            held_count=${#held_shown[@]}
+            held_gone=()
+            held_where=()
+            json_held_where "$1"
+            for (( n = 0; n < held_count; n++ )); do
+              if [[ -n "${held_gone[n]:-}" ]]; then echo "gone${held_where[n]}"; else echo "${held_where[n]}"; fi
+            done
+
+            """).write(to: runner, atomically: true, encoding: .utf8)
+            for c in cases {
+                let r = try f.run(runner, [c.moves])
+                XCTAssertEqual(r.status, 0, "\(script) \(c.moves): \(r.stderr)")
+                XCTAssertEqual(r.stderr, "", "\(script) \(c.moves)")
+                XCTAssertEqual(r.stdout, c.wants.map { $0 + "\n" }.joined(), "\(script) \(c.moves)")
+            }
         }
     }
 
@@ -5606,6 +5655,27 @@ final class RecoveryScriptTests: XCTestCase {
         json: #"[{"deviceUID":"d\u0000","name":"insomnia-held-999999999999999999-","volume":0.5,"muted":false},{"deviceUID":"insomnia-held-0-0","name":"insomnia-held-1000000000000000000-0","volume":0.5,"muted":false}]"#,
         raws: ["insomnia-held-999999999999999999-", "insomnia-held-0-0", "insomnia-held-1000000000000000000-0"])
 
+    /// Review40 R40-1: two saved outputs, as JSON text, alike but for their
+    /// device UIDs and their saveIDs, which hold \u0000. Their placeholders
+    /// are the same but for their numbers, and both are under saveID.
+    static let outputsAlikeButForSaveID = #"[{"deviceUID":"A","volume":0.5,"muted":true,"saveID":"a\u0000"},{"deviceUID":"B","volume":0.5,"muted":true,"saveID":"b\u0000"}]"#
+
+    /// Review40 R40-1: a journal with a frozen process the undo at the end
+    /// clears (of another boot) before two it keeps (pid 0), and an App Nap
+    /// entry it restores before two it keeps, the kept entries of each
+    /// array alike but for a string that holds \u0000. Each kept entry
+    /// moves up one.
+    static let keptEntriesAlikeButForNUL: String = {
+        let boot = { (n: Int, b: String) in #"{"pid":\#(n),"startedAt":1760000000,"startedAtMicros":5,"bootSession":"\#(b)"}"# }
+        return #"{"sleepDisabledByUs":true,"frozenProcesses":[\#(boot(4241, "previous-boot")),\#(boot(0, #"k\u0000"#)),\#(boot(0, #"m\u0000"#))],"appNapOverrides":[{"bundleId":"com.example.y","previous":false},{"bundleId":"a\u0000","previous":true},{"bundleId":"b\u0000","previous":true}]}"#
+    }()
+
+    /// What backstop.sh logs for an edited copy of the journal whose
+    /// placeholders are not each once in its own entry under its own key.
+    private static func notPublished(_ f: ScriptFixture) -> String {
+        "the edited copy of \(f.state.path) is not a journal the app loads with each string that holds \\u0000 once, in the entry and under the key it had in the journal; not published"
+    }
+
     private static func publishedJournalRows() -> [PublishedJournalRow] {
         let lit = "0.5000000298023223876953125000000000000001"
         let mid = "0.50000002980232238769531250"
@@ -5678,6 +5748,28 @@ final class RecoveryScriptTests: XCTestCase {
              #"{"sleepDisabledByUs":true,"endedSession":"e\u0000","savedAudioOutputs":\#(namesAfterEighteenNines.json)}"#,
              true, 1, [#"d\u0000"#] + namesAfterEighteenNines.raws, { [sleepOff($0)] },
              { s, f in s.sleepDisabledByUs = false; s.endedSession = try Data(contentsOf: f.session).base64EncodedString() }),
+            // Review40 R40-1: each saveID stays with its own output, which
+            // the app's state compares, through the undo at the end, the
+            // boot given before Low Power Mode goes off and the end
+            // recorded in the journal; and each kept entry moved up keeps
+            // its own string, the frozen processes with the same pid and
+            // start. savedOutputVolume stays, so the backstop exits 1, as
+            // uninstall does with the outputs it lists.
+            ("two saved outputs alike but for their UIDs and saveIDs",
+             #"{"sleepDisabledByUs":true,"savedAudioOutputs":\#(outputsAlikeButForSaveID),"savedOutputVolume":0.25}"#,
+             false, 1, [#"a\u0000"#, #"b\u0000"#], { [sleepOff($0)] }, { s, _ in s.sleepDisabledByUs = false }),
+            ("two saved outputs alike but for their UIDs and saveIDs, with Low Power Mode",
+             #"{"sleepDisabledByUs":true,"lowPowerSetByUs":true,"savedDisplayBrightness":\#(above),"displayRestoreRefused":true,"keptDisplayUnderLowPower":\#(above),"keptDisplayUnderLowPowerBoot":"boot-private","keptDisplayReadLit":\#(above),"savedAudioOutputs":\#(outputsAlikeButForSaveID),"savedOutputVolume":0.25}"#,
+             false, 1, [#"a\u0000"#, #"b\u0000"#], { [sleepOff($0), lowPowerOff($0)] },
+             { s, f in s.sleepDisabledByUs = false; s.lowPowerSetByUs = false; s.keptDisplayUnderLowPowerBoot = f.bootUUID }),
+            ("the end in the journal, beside two saved outputs alike but for their UIDs and saveIDs",
+             #"{"sleepDisabledByUs":true,"endedSession":"e\u0000","savedAudioOutputs":\#(outputsAlikeButForSaveID)}"#,
+             true, 1, [#"a\u0000"#, #"b\u0000"#], { [sleepOff($0)] },
+             { s, f in s.sleepDisabledByUs = false; s.endedSession = try Data(contentsOf: f.session).base64EncodedString() }),
+            ("kept entries alike but for a string that holds \\u0000, moved up after one taken out",
+             keptEntriesAlikeButForNUL, false, 1, [#"k\u0000"#, #"m\u0000"#, #"a\u0000"#, #"b\u0000"#],
+             { [sleepOff($0), "defaults write com.example.y NSAppSleepDisabled -bool false"] },
+             { s, _ in s.sleepDisabledByUs = false; s.frozenProcesses.removeFirst(); s.appNapOverrides.removeFirst() }),
         ]
     }
 
@@ -5715,7 +5807,8 @@ final class RecoveryScriptTests: XCTestCase {
     /// the run keeps is written as its own text, of any length, beside
     /// U+E000 in every form, the first copy of a key, in entries that
     /// moved up an array after others were taken out; no string of one
-    /// taken out comes back.
+    /// taken out comes back. Review40 R40-1: each stays in its own entry
+    /// where entries are alike but for it, moved up or not.
     func testPublishedJournalsKeepTheFloatsAndStringsTheAppReads() async throws {
         let rows = Self.publishedJournalRows()
         // One fixture per journal; the runs go several at a time.
@@ -5795,8 +5888,8 @@ final class RecoveryScriptTests: XCTestCase {
     }
 
     /// Review38 R38-1: a publication of a journal whose strings hold
-    /// \u0000 that does not have each back once, where it was, keeps what
-    /// is owed. PLUTIL is a fake that runs plutil and then, after one edit
+    /// \u0000 that does not have each back once, in its own entry under its
+    /// own key, keeps what is owed. PLUTIL is a fake that runs plutil and then, after one edit
     /// (a -replace of `key`), changes the copy with sed or fails. The undo
     /// at the end, over the journal whose entries move up
     /// (publishedJournalRows), placeholders insomnia-held-1-0 (the name)
@@ -5894,7 +5987,7 @@ final class RecoveryScriptTests: XCTestCase {
         for (row, (f, r)) in zip(rows, zip(fixtures, results)) {
             let label = row.0
             let log = f.log()
-            let notPublished = "the edited copy of \(f.state.path) is not a journal the app loads with each string that holds \\u0000 once, where it was in the journal; not published"
+            let notPublished = Self.notPublished(f)
             let sleepOff = "sudo -n \(f.fakePmset) -a disablesleep 0"
             let undoing = f.calls().filter { call in ["sudo", "defaults", "kill"].contains { call.hasPrefix($0 + " ") } }
             XCTAssertEqual(r.status, 1, "\(label): \(r.stderr) \(log)")
@@ -5924,6 +6017,113 @@ final class RecoveryScriptTests: XCTestCase {
                 XCTAssertEqual(published, row.1, label)
                 XCTAssertTrue(log.contains("appNapOverrides[0].bundleId holds \\u0000, which plutil cannot hold, and no placeholder for it could be had here, so what the app reads is not known here"), "\(label): \(log)")
                 XCTAssertEqual(undoing, [], label)
+            }
+        }
+    }
+
+    /// Review40 R40-1: a publication of a copy in which two strings that
+    /// hold \u0000, under the same key of two entries of one array alike
+    /// but for them, changed places keeps what is owed. PLUTIL is a fake
+    /// that runs plutil and then, after an edit of one of `keys`, swaps
+    /// the two placeholders with sed. The saveIDs of two saved outputs
+    /// (outputsAlikeButForSaveID) through the undo at the end, the kept
+    /// display entry's boot before Low Power Mode goes off, and the end
+    /// recorded in the journal; the boots of two frozen processes and the
+    /// bundle ids of two App Nap entries the undo keeps, each pair moved up
+    /// after an entry it takes out (keptEntriesAlikeButForNUL); and with
+    /// Low Power Mode kept on, the boot and the undo at the end both. No
+    /// copy with a swap is published. The undo at the end exits 1 with
+    /// state.json's bytes kept and every entry there for the next run;
+    /// after the boot or the end, Low Power Mode stays on or endedSession
+    /// stays, and the undo at the end publishes the journal with each
+    /// saveID still with its own output.
+    func testAPublicationThatMovesAStringToAnotherEntryKeepsWhatIsOwed() async throws {
+        let above = "0.500000059604644775390625"
+        let outputs = Self.outputsAlikeButForSaveID
+        let sleep = #"{"sleepDisabledByUs":true,"savedAudioOutputs":\#(outputs)}"#
+        let lowPower = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":true,"savedDisplayBrightness":\#(above),"displayRestoreRefused":true,"keptDisplayUnderLowPower":\#(above),"keptDisplayUnderLowPowerBoot":"boot-private","keptDisplayReadLit":\#(above),"savedAudioOutputs":\#(outputs)}"#
+        let ending = #"{"sleepDisabledByUs":true,"endedSession":"e\u0000","savedAudioOutputs":\#(outputs)}"#
+        // Swaps placeholders insomnia-held-0-a and insomnia-held-0-b in
+        // "$file", which holds no "swapped".
+        let swap = { (a: Int, b: Int) in
+            #"/usr/bin/sed -i '' -e 's/"insomnia-held-0-\#(a)"/"swapped"/' -e 's/"insomnia-held-0-\#(b)"/"insomnia-held-0-\#(a)"/' -e 's/"swapped"/"insomnia-held-0-\#(b)"/' "$file""#
+        }
+        // The placeholders are numbered in the journal's order, with
+        // endedSession's first.
+        let rows: [(label: String, journal: String, keys: [String], swap: String)] = [
+            ("the undo at the end: two saveIDs", sleep, ["sleepDisabledByUs"], swap(0, 1)),
+            ("the undo at the end: the boots of two frozen processes kept and moved up", Self.keptEntriesAlikeButForNUL, ["frozenProcesses"], swap(0, 1)),
+            ("the undo at the end: the bundle ids of two App Nap entries kept and moved up", Self.keptEntriesAlikeButForNUL, ["appNapOverrides"], swap(2, 3)),
+            ("the kept display entry's boot: two saveIDs", lowPower, ["keptDisplayUnderLowPowerBoot"], swap(0, 1)),
+            ("the end in the journal: two saveIDs", ending, ["endedSession"], swap(1, 2)),
+            ("Low Power Mode kept on: the boot and the undo at the end, two saveIDs", lowPower, ["keptDisplayUnderLowPowerBoot", "sleepDisabledByUs"], swap(0, 1)),
+        ]
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
+        for row in rows {
+            let f = try ScriptFixture.concurrentRow()
+            fixtures.append(f)
+            try f.writeState(row.journal)
+            if row.keys.contains("endedSession") {
+                // As in publishedJournalRows: the end can go to neither
+                // session.json's removal nor ended-session.json.
+                try f.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+                try setImmutable(f.session, true)
+                try "{}".write(to: f.endedSession, atomically: true, encoding: .utf8)
+                try setImmutable(f.endedSession, true)
+            }
+            let plutil = f.root.appendingPathComponent("plutil")
+            try """
+            #!/bin/bash
+            file="${!#}"
+            /usr/bin/plutil "$@" || exit $?
+            if [[ "${1:-}" == -replace ]]; then
+              case "${2:-}" in
+                \(row.keys.joined(separator: "|")))
+                  \(row.swap) || exit 1
+                  ;;
+              esac
+            fi
+            exit 0
+
+            """.write(to: plutil, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: plutil.path)
+            let text = try ScriptFixture.replaceOnce(try String(contentsOf: f.backstop, encoding: .utf8), "\nPLUTIL=/usr/bin/plutil\n", with: "\nPLUTIL='\(plutil.path)'\n")
+            try text.write(to: f.backstop, atomically: true, encoding: .utf8)
+        }
+
+        let results = try await ScriptFixture.runAll(fixtures.map { $0.launch($0.backstop) })
+
+        for (row, (f, r)) in zip(rows, zip(fixtures, results)) {
+            let label = row.label
+            let log = f.log()
+            let sleepOff = "sudo -n \(f.fakePmset) -a disablesleep 0"
+            let undoing = f.calls().filter { call in ["sudo", "defaults", "kill"].contains { call.hasPrefix($0 + " ") } }
+            let notPublishedCount = log.components(separatedBy: Self.notPublished(f)).count - 1
+            let journalKept = "could not publish the updated journal to \(f.state.path); previous journal kept, will retry"
+            let bootKept = "could not publish this boot for the kept display entry's record to \(f.state.path); Low Power Mode left on"
+            XCTAssertEqual(r.status, 1, "\(label): \(r.stderr) \(log)")
+            XCTAssertEqual(notPublishedCount, row.keys.count, "\(label): \(log)")
+            XCTAssertEqual(try f.contents(of: f.home).filter { $0.hasPrefix(".state.json") }, [], label)
+            XCTAssertEqual(log.contains(bootKept), row.keys.contains("keptDisplayUnderLowPowerBoot"), "\(label): \(log)")
+            if row.journal == Self.keptEntriesAlikeButForNUL {
+                XCTAssertEqual(undoing, [sleepOff, "defaults write com.example.y NSAppSleepDisabled -bool false"], label)
+            } else {
+                XCTAssertEqual(undoing, [sleepOff], label)
+            }
+            if row.keys.contains("sleepDisabledByUs") || row.keys.contains("frozenProcesses") || row.keys.contains("appNapOverrides") {
+                XCTAssertEqual(try String(contentsOf: f.state, encoding: .utf8), row.journal, label)
+                XCTAssertTrue(log.contains(journalKept), "\(label): \(log)")
+            } else {
+                // The boot or the end is not published; the undo at the
+                // end publishes the rest.
+                XCTAssertFalse(log.contains(journalKept), "\(label): \(log)")
+                if row.keys == ["endedSession"] {
+                    XCTAssertFalse(log.contains("(endedSession) instead"), "\(label): \(log)")
+                    XCTAssertTrue(log.contains("its end is recorded in"), "\(label): \(log)")
+                }
+                let raws = (row.keys == ["endedSession"] ? [#"e\u0000"#] : []) + [#"a\u0000"#, #"b\u0000"#]
+                try checkPublishedJournal((label, row.journal, false, 1, raws, { _ in [] }, { s, _ in s.sleepDisabledByUs = false }), f)
             }
         }
     }
@@ -6912,7 +7112,7 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.installMachinery()
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         let holder = try fx.holdLock()
-        defer { XCTAssertEqual(holder.stop(), 0, "the lock holder, reaped once its cat read the end of its input") }
+        defer { XCTAssertEqual(holder.stop(), 0, "the lock holder, reaped once its cat read the end of its input: \(holder.problems)") }
 
         let r = try fx.run(fx.uninstall)
 
@@ -6980,7 +7180,7 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         let holder = try fx.holdLock()
-        defer { XCTAssertEqual(holder.stop(), 0, "the lock holder, reaped once its cat read the end of its input") }
+        defer { XCTAssertEqual(holder.stop(), 0, "the lock holder, reaped once its cat read the end of its input: \(holder.problems)") }
         let other = fx.root.appendingPathComponent("other.file")
         try Data().write(to: other)
 
@@ -8410,7 +8610,7 @@ final class RecoveryScriptTests: XCTestCase {
 
         let holder = try fx.holdLock()
         let run = Result { try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"]) }
-        XCTAssertEqual(holder.stop(), 0, "the lock holder, reaped once its cat read the end of its input")
+        XCTAssertEqual(holder.stop(), 0, "the lock holder, reaped once its cat read the end of its input: \(holder.problems)")
         let blocked = try run.get()
 
         XCTAssertEqual(blocked.status, 75, blocked.stderr + blocked.stdout)
@@ -9284,7 +9484,7 @@ final class RecoveryScriptTests: XCTestCase {
         try "trusted".write(to: fx.plist, atomically: true, encoding: .utf8)
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         let holder = try fx.holdLock()
-        defer { XCTAssertEqual(holder.stop(), 0, "the lock holder, reaped once its cat read the end of its input") }
+        defer { XCTAssertEqual(holder.stop(), 0, "the lock holder, reaped once its cat read the end of its input: \(holder.problems)") }
 
         let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
 
@@ -9547,7 +9747,7 @@ private final class ScriptFixture {
     /// of the 1 s and 5 s (`concurrentRow`). A fixture that fails partway
     /// removes what it made before it throws.
     init(productionLimits: Bool = false) throws {
-        root = fm.temporaryDirectory.appendingPathComponent("insomnia-script-tests-\(UUID().uuidString)", isDirectory: true)
+        root = ProcessTestHome.temporaryDirectory.appendingPathComponent("insomnia-script-tests-\(UUID().uuidString)", isDirectory: true)
         home = root.appendingPathComponent("home", isDirectory: true)
         bin = root.appendingPathComponent("bin", isDirectory: true)
         repoScripts = root.appendingPathComponent("repo/scripts", isDirectory: true)
@@ -9573,6 +9773,15 @@ private final class ScriptFixture {
 
     func destroy() {
         releaseCommand()
+        // A holder the test left running is stopped and reaped first. One
+        // that would not exit, or a probe holdLock could not reap, still
+        // uses this tree, so the tree stays.
+        for holder in holders where !holder.isSettled { holder.stop() }
+        let unsettled = holders.filter { !$0.isSettled }.map { "lock holder \($0.child.pid): \($0.problems)" } + unsettledProbes
+        guard unsettled.isEmpty else {
+            XCTFail("keeping \(root.path) for processes that did not exit: \(unsettled)")
+            return
+        }
         // A supervisor still waiting to write its status into a FIFO would
         // wait forever once the FIFO is gone.
         drainStatusFIFOs(within: 1)
@@ -10970,192 +11179,88 @@ private final class ScriptFixture {
         return (p.terminationStatus, String(decoding: data, as: UTF8.self))
     }
 
-    /// A script started in the background by `spawn`. Nothing in the test
-    /// process reaps it but `wait`: Foundation reaps only the Processes it
-    /// started, and nothing else here calls waitpid. Until `wait`, its pid
-    /// stays its own even after it exits (as a zombie), so `signal` reaches
-    /// this child or nothing, never a process that reused the pid.
-    final class Spawned {
-        let pid: pid_t
-        /// Started as the leader of a process group of its own (see spawn).
-        let leadsGroup: Bool
-        private(set) var status: Int32?
-
-        init(pid: pid_t, leadsGroup: Bool) {
-            self.pid = pid
-            self.leadsGroup = leadsGroup
-        }
-
-        /// Whether the child has exited, checked without reaping it.
-        var hasExited: Bool {
-            guard status == nil else { return true }
-            var info = siginfo_t()
-            return waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT) == 0 && info.si_pid == pid
-        }
-
-        /// Sends `sig` to the child. Refuses with -1 once `wait` has reaped
-        /// it, since the pid may then belong to another process.
-        func signal(_ sig: Int32) -> Int32 {
-            guard status == nil else { return -1 }
-            return kill(pid, sig)
-        }
-
-        /// Sends `sig` to every process in the group the child leads, the
-        /// way launchd signals what is left of a job's process group once
-        /// its main process has exited. Only for a child spawned with
-        /// `ownProcessGroup`, so the group holds nothing but the child and
-        /// what it started. Refuses with -1 once `wait` has reaped the
-        /// child: until then its pid, the group's id, cannot name another
-        /// process or group.
-        func signalGroup(_ sig: Int32) -> Int32 {
-            guard leadsGroup, status == nil else { return -1 }
-            return killpg(pid, sig)
-        }
-
-        /// Waits for the child to exit, reaps it, and returns its wait
-        /// status (-1 if waitpid failed).
-        @discardableResult
-        func wait() -> Int32 {
-            if let status { return status }
-            var raw: Int32 = 0
-            var reaped: pid_t
-            repeat { reaped = waitpid(pid, &raw, 0) } while reaped == -1 && errno == EINTR
-            let result = reaped == pid ? raw : -1
-            status = result
-            return result
-        }
-    }
+    /// A script started in the background by `spawn` (OwnedChild).
+    typealias Spawned = OwnedChild
 
     /// Starts `script` under /bin/bash with the same environment (plus
-    /// `extraEnvironment`) and working directory as `run`, standard input and output on /dev/null,
-    /// and returns without waiting for it. Like a Process, the child gets
-    /// no other descriptor of the test process, an empty signal mask and
-    /// default signal actions. With `ownProcessGroup` it leads a new process
-    /// group, as launchd starts a job, instead of joining the test's. Each
-    /// setup call is checked: one that fails throws before anything starts,
-    /// with what was set up so far released.
+    /// `extraEnvironment`) and working directory as `run`, standard input and
+    /// output on /dev/null, and returns without waiting for it. The child is
+    /// set up as spawnOwnedChild describes: each setup call is checked, and
+    /// one that fails throws before anything starts.
     func spawn(_ script: URL, extraEnvironment: [String: String] = [:], ownProcessGroup: Bool = false) throws -> Spawned {
-        func check(_ rc: Int32, _ call: String) throws {
-            guard rc == 0 else { throw FixtureError("\(call) failed (\(rc)) for /bin/bash \(script.path); nothing started") }
-        }
-        var actions: posix_spawn_file_actions_t?
-        try check(posix_spawn_file_actions_init(&actions), "posix_spawn_file_actions_init")
-        defer { posix_spawn_file_actions_destroy(&actions) }
-        try check(posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0), "posix_spawn_file_actions_addopen 0")
-        try check(posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", O_WRONLY, 0), "posix_spawn_file_actions_addopen 1")
-        try check(posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0), "posix_spawn_file_actions_addopen 2")
-        try check(posix_spawn_file_actions_addchdir(&actions, root.path), "posix_spawn_file_actions_addchdir")
-
-        var attr: posix_spawnattr_t?
-        try check(posix_spawnattr_init(&attr), "posix_spawnattr_init")
-        defer { posix_spawnattr_destroy(&attr) }
-        var mask = sigset_t()
-        try check(sigemptyset(&mask), "sigemptyset")
-        var defaults = sigset_t()
-        try check(sigfillset(&defaults), "sigfillset")
-        try check(sigdelset(&defaults, SIGKILL), "sigdelset SIGKILL")
-        try check(sigdelset(&defaults, SIGSTOP), "sigdelset SIGSTOP")
-        try check(posix_spawnattr_setsigmask(&attr, &mask), "posix_spawnattr_setsigmask")
-        try check(posix_spawnattr_setsigdefault(&attr, &defaults), "posix_spawnattr_setsigdefault")
-        var flags = POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF
-        if ownProcessGroup {
-            try check(posix_spawnattr_setpgroup(&attr, 0), "posix_spawnattr_setpgroup")
-            flags |= POSIX_SPAWN_SETPGROUP
-        }
-        try check(posix_spawnattr_setflags(&attr, Int16(flags)), "posix_spawnattr_setflags")
-
-        let arguments = ["/bin/bash", script.path]
-        let argv: [UnsafeMutablePointer<CChar>?] = arguments.map { strdup($0) } + [nil]
-        let environment = childEnvironment.merging(extraEnvironment) { $1 }.map { "\($0.key)=\($0.value)" }
-        let envp: [UnsafeMutablePointer<CChar>?] = environment.map { strdup($0) } + [nil]
-        defer { (argv + envp).forEach { free($0) } }
-        guard argv.dropLast().allSatisfy({ $0 != nil }), envp.dropLast().allSatisfy({ $0 != nil }) else {
-            throw FixtureError("strdup failed for /bin/bash \(script.path); nothing started")
-        }
-
-        var pid: pid_t = 0
-        let spawned = posix_spawn(&pid, "/bin/bash", &actions, &attr, argv, envp)
-        guard spawned == 0, pid > 0 else { throw FixtureError("posix_spawn /bin/bash \(script.path) failed: \(spawned)") }
-        return Spawned(pid: pid, leadsGroup: ownProcessGroup)
+        try spawnOwnedChild(
+            "/bin/bash", ["/bin/bash", script.path], environment: childEnvironment.merging(extraEnvironment) { $1 },
+            directory: root, ownProcessGroup: ownProcessGroup)
     }
 
-    /// A lockf process that holds the recovery lock. Its command is cat,
-    /// reading a pipe only the test writes to: closing that pipe ends cat,
-    /// lockf reaps it and exits with its status, and nothing outlives the
-    /// holder. No signal is sent; a TERM to lockf would leave its child
-    /// running with no parent to reap it.
-    struct LockHolder {
-        let process: Process
-        let exit: ProcessExit
-        let input: FileHandle
-
-        /// Ends the holder and returns its lockf's exit status once it has
-        /// exited and been reaped: 0 once cat has read the end of its input
-        /// and lockf has reaped it. A lockf still waiting for the lock
-        /// (-t 10) gives up on its own, as it does without the lock.
-        @discardableResult
-        func stop() -> Int32 {
-            try? input.close()
-            exit.wait()
-            return process.terminationStatus
-        }
-    }
+    /// Every lock holder `holdLock` started, so `destroy` can stop one a
+    /// test left running.
+    private var holders: [LockfHolder] = []
+    /// Probes `holdLock` could not reap: each still runs, so `destroy`
+    /// keeps the tree they use.
+    private var unsettledProbes: [String] = []
 
     /// Holds the recovery lock from another process, the way a running app
-    /// or a concurrent backstop would, until stopped. `attempts` probes,
-    /// 50 ms apart, look for the holder owning the lock; with none of them
-    /// seeing it, the holder is stopped and reaped and its exit status is
-    /// part of the error.
-    func holdLock(attempts: Int = 50) throws -> LockHolder {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/lockf")
-        // The holder waits (not -t 0): a probe below may briefly own the lock
-        // at the same instant, and the holder must outlast that, not give up.
-        p.arguments = ["-k", "-t", "10", lock.path, "/bin/cat"]
-        let diagURL = root.appendingPathComponent("lock-holder.log")
-        fm.createFile(atPath: diagURL.path, contents: nil)
-        let diag = try FileHandle(forWritingTo: diagURL)
-        defer { try? diag.close() }
-        p.standardOutput = diag
-        p.standardError = diag
-        let pipe = Pipe()
-        // Only the test has the writing end; no child it starts gets it.
-        guard fcntl(pipe.fileHandleForWriting.fileDescriptor, F_SETFD, FD_CLOEXEC) == 0 else {
-            throw FixtureError("could not mark the lock holder's input close-on-exec: \(errno)")
+    /// or a concurrent backstop would, until stopped (LockfHolder). The
+    /// holder waits up to 10 s for the lock (not -t 0): a probe below may
+    /// briefly own the lock at the same instant, and the holder must outlast
+    /// that, not give up. `attempts` probes, 50 ms apart, look for the
+    /// holder owning the lock, and cat printing a line back confirms it.
+    /// Otherwise the holder is stopped and reaped and its exit status is
+    /// part of the error; a holder or probe that could not be reaped is
+    /// named there as unsettled instead.
+    func holdLock(attempts: Int = 50) throws -> LockfHolder {
+        let holder = try LockfHolder(
+            file: lock, wait: 10, errors: root.appendingPathComponent("lock-holder.log"),
+            environment: childEnvironment, directory: root)
+        holders.append(holder)
+        func failure(_ why: String, probes: [Int32]) -> FixtureError {
+            let status = holder.stop()
+            let ended = holder.isSettled ? "holder exited \(status) and was reaped" : "holder did not exit and is unsettled"
+            return FixtureError("\(why); \(ended), probes=\(probes) problems=\(holder.problems) output=\(holder.errorText())")
         }
-        p.standardInput = pipe
-        let holder = LockHolder(process: p, exit: ProcessExit(p), input: pipe.fileHandleForWriting)
-        do {
-            try p.run()
-        } catch {
-            try? pipe.fileHandleForWriting.close()
-            throw error
-        }
-        // Wait until the holder really owns the lock. Every other way out,
-        // a probe that cannot start included, stops the holder and returns
-        // once it has been reaped.
         var probes: [Int32] = []
-        do {
-            for _ in 0..<attempts {
-                let probe = Process()
-                probe.executableURL = URL(fileURLWithPath: "/usr/bin/lockf")
-                probe.arguments = ["-k", "-s", "-t", "0", lock.path, "/usr/bin/true"]
-                probe.standardOutput = diag
-                probe.standardError = diag
-                let probeExit = ProcessExit(probe)
-                try probe.run()
-                probeExit.wait()
-                probes.append(probe.terminationStatus)
-                if probe.terminationStatus == 75 { return holder }
-                Thread.sleep(forTimeInterval: 0.05)
-            }
-        } catch {
-            holder.stop()
-            throw error
+        let probeLog = root.appendingPathComponent("lock-probes.log")
+        let probeOutput = open(probeLog.path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0o600)
+        guard probeOutput >= 0 else {
+            throw failure("could not open \(probeLog.path) for the probes' output: errno \(errno)", probes: probes)
         }
-        let status = holder.stop()
-        let text = (try? String(contentsOf: diagURL, encoding: .utf8)) ?? ""
-        throw FixtureError("could not take the recovery lock for the contention test; holder exited \(status) and was reaped, probes=\(probes) output=\(text)")
+        defer { close(probeOutput) }
+        for _ in 0..<attempts {
+            let probe: OwnedChild
+            do {
+                probe = try spawnOwnedChild(
+                    "/usr/bin/lockf", ["/usr/bin/lockf", "-k", "-s", "-t", "0", lock.path, "/usr/bin/true"],
+                    environment: childEnvironment, directory: root,
+                    standardOutput: probeOutput, standardError: probeOutput, ownProcessGroup: true)
+            } catch {
+                throw failure("a lock probe could not start: \(error)", probes: probes)
+            }
+            // A probe gives up at once (-t 0), so it is overdue after 10 s.
+            // SIGINT then stops lockf before it forks, or true after.
+            var raw = probe.wait(within: 10)
+            if raw == nil {
+                _ = probe.signalGroup(SIGINT)
+                raw = probe.wait(within: 5)
+            }
+            guard let raw, raw != -1 else {
+                unsettledProbes.append("lockf probe \(probe.pid)")
+                throw failure("lock probe \(probe.pid) did not exit and could not be reaped", probes: probes)
+            }
+            guard raw & 0x7f == 0 else {
+                throw failure("lock probe ended by \(OwnedChild.describe(raw))", probes: probes + [128 + (raw & 0x7f)])
+            }
+            let status = (raw >> 8) & 0xff
+            probes.append(status)
+            if status == 75 {
+                guard holder.held(within: 5) else {
+                    throw failure("a probe found the lock taken, but cat did not print its line back", probes: probes)
+                }
+                return holder
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        throw failure("could not take the recovery lock for the contention test", probes: probes)
     }
 }
 

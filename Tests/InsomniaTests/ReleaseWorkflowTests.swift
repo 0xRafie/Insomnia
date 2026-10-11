@@ -307,7 +307,7 @@ final class ReleaseWorkflowTests: XCTestCase {
     /// end. Returns what the step wrote to $GITHUB_OUTPUT and the calls.
     private func runStep(_ script: String, gh body: String, files: [String: String], environment: [String: String]) throws -> StepResult {
         let fm = FileManager.default
-        let root = fm.temporaryDirectory.appendingPathComponent("release-step-\(UUID().uuidString)", isDirectory: true)
+        let root = ProcessTestHome.temporaryDirectory.appendingPathComponent("release-step-\(UUID().uuidString)", isDirectory: true)
         let bin = root.appendingPathComponent("bin", isDirectory: true)
         try fm.createDirectory(at: bin, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: root) }
@@ -338,7 +338,7 @@ final class ReleaseWorkflowTests: XCTestCase {
         p.arguments = ["-e", scriptURL.path]
         p.currentDirectoryURL = root
         p.environment = environment.merging([
-            "PATH": "\(bin.path):/usr/bin:/bin", "TMPDIR": NSTemporaryDirectory(),
+            "PATH": "\(bin.path):/usr/bin:/bin", "TMPDIR": ProcessTestHome.temporaryDirectory.path + "/",
             "GITHUB_REPOSITORY": "krishhgg/Insomnia", "GITHUB_OUTPUT": outputURL.path,
         ]) { _, fixed in fixed }
         // Capture to files rather than pipes: nothing to drain, nothing to deadlock.
@@ -457,7 +457,7 @@ final class ReleaseWorkflowTests: XCTestCase {
         XCTAssertEqual(shipped, ["scripts/install.sh", "scripts/uninstall.sh"])
         let repo = workflowsDir.deletingLastPathComponent().deletingLastPathComponent()
         let fm = FileManager.default
-        let tmp = fm.temporaryDirectory.appendingPathComponent("zip-scripts-\(UUID().uuidString)", isDirectory: true)
+        let tmp = ProcessTestHome.temporaryDirectory.appendingPathComponent("zip-scripts-\(UUID().uuidString)", isDirectory: true)
         defer { try? fm.removeItem(at: tmp) }
         let unpackedIn = tmp.appendingPathComponent("unpacked", isDirectory: true)
         let zip = unpackedIn.appendingPathComponent("Insomnia-1.0", isDirectory: true)

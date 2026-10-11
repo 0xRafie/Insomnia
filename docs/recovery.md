@@ -42,10 +42,10 @@ reads the recorded values from `state.json` itself. On either path, a
 recorded value the app does not write
 counts as none, as the app reads it, and so does a `state.json` that is a
 symlink to nothing, which the app reads as no journal. With `config.json`
-missing or rejected, none gives the app's defaults (10%, on). With
-`config.json` there but read neither by the binary nor by the agent, none gives
-the strictest values, a 95% end floor with the thermal rule on, and a log line
-says why. The values the app enforces are not known to the agent then, though
+missing, not a regular file, not readable by you, or rejected, none gives the
+app's defaults (10%, on). With `config.json` a regular file you can read but
+read neither by the binary nor by the agent, none gives the strictest values,
+a 95% end floor with the thermal rule on, and a log line says why. The values the app enforces are not known to the agent then, though
 they may be on disk: a valid `config.json` over 8 MiB, or one the reader does
 not finish within 30 seconds, still holds the values the app takes from it. A
 file on which Foundation stops the app is not a decode; the app never loads it.
@@ -71,7 +71,9 @@ app crashed or hung, a journal the check refuses keeps the session and its
 sleep hold, past the deadline too, until someone fixes the file. A journal
 the agent edits is published only when the edited copy loads as the app loads
 it, holds every `Float` the app decodes bit for bit as before, and has the
-text of each string that holds `\u0000` back once, where it was; otherwise
+text of each string that holds `\u0000` back once, in the entry and under the
+key it had (when the agent takes entries out of an array, each entry that
+moves up keeps its own strings); otherwise
 the agent keeps the old journal, with what it still has to undo, and exits 1. Each
 early end is logged with its reason, and the saved session is deleted before
 the restore starts. A restore that cannot finish leaves entries in the journal
@@ -110,8 +112,8 @@ error from the agent; a record they cannot lock in time is not written. A
 process that appends without that lock can still join a line to a record that
 already read back, and that record then ends nothing. A record counts only once
 it reads back as a whole line, a saved session over 64 KiB is never recorded
-there, and a log that cannot be read or is over 64 MiB holds no record for the
-app or the agent. The app rotates that log only while it holds the recovery
+there, and the app and the agent do not search a log that cannot be read or is
+over 64 MiB, so a record such a log holds ends nothing for them. The app rotates that log only while it holds the recovery
 lock and copies such a line forward when it does, so the record lasts while the
 saved session stays. The agent reads each
 record back before it restores anything. The app and the agent count a record

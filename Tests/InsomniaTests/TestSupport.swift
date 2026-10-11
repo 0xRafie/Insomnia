@@ -47,6 +47,19 @@ enum ProcessTestHome {
         return URL(fileURLWithPath: String(cString: raw), isDirectory: true)
     }()
 
+    /// The directory the loader made `root` in: TMPDIR when the run set it,
+    /// else Darwin's per-user temp directory, then /tmp. Tests make their
+    /// scratch files here. FileManager's temporaryDirectory and
+    /// NSTemporaryDirectory are Darwin's per-user directory whatever TMPDIR
+    /// says, so a run that points TMPDIR at its own folder would not find
+    /// their files there.
+    static let temporaryDirectory: URL = {
+        guard let raw = insomnia_test_home_temp_dir() else {
+            fatalError("InsomniaTestHome did not run at load; refusing to test against the real ~/Library")
+        }
+        return URL(fileURLWithPath: String(cString: raw), isDirectory: true)
+    }()
+
     /// Where INSOMNIA_HOME points right now, as the app would resolve it.
     static var current: String? {
         guard let value = getenv(Paths.environmentKey) else { return nil }
@@ -62,7 +75,7 @@ final class TempHome {
     let paths: Paths
 
     init() {
-        root = FileManager.default.temporaryDirectory
+        root = ProcessTestHome.temporaryDirectory
             .appendingPathComponent("insomnia-tests-\(UUID().uuidString)", isDirectory: true)
         try! FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         setenv(Paths.environmentKey, root.path, 1)
@@ -72,6 +85,13 @@ final class TempHome {
     func destroy() {
         setenv(Paths.environmentKey, ProcessTestHome.root.path, 1)
         try? FileManager.default.removeItem(at: root)
+    }
+
+    /// Hands the variable back as `destroy` does but leaves `root` in place,
+    /// for a test whose child process may still use it: removing a folder
+    /// under a live child would hide what it does next.
+    func keep() {
+        setenv(Paths.environmentKey, ProcessTestHome.root.path, 1)
     }
 }
 

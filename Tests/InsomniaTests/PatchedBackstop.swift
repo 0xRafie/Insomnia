@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 @testable import Insomnia
@@ -318,148 +319,221 @@ struct PatchedBackstop {
 
     /// Points GREP at a fake that, each time the agent looks for an end
     /// record line while no other writer holds insomnia.log's lock (lockf
-    /// -t 0 gets it), first has another writer started that takes that
-    /// lock, writes `held sh`, waits a second, then writes `ort`, still
-    /// without a newline, and lets go. The fake runs /usr/bin/grep once
-    /// that writer holds the lock, or after 5 s without it. So the agent's
-    /// write after such a check, its record included, waits for that writer
-    /// and finds the log ends in a line cut short. A check while the lock is
-    /// held (the agent's own read-back) starts no writer. The writers are
-    /// children of the returned LogWriters' server, not of the fake, which
-    /// cannot wait for them; settle them before the home goes.
+    /// -t 0 gets it), first asks another writer to take that lock, write
+    /// `held sh`, wait a second, then write `ort`, still without a newline,
+    /// and let go. The writer is a thread in the test process (LogWriters)
+    /// that takes the lock with flock, as lockf does. The fake runs
+    /// /usr/bin/grep once that writer says it holds the lock, or after 5 s
+    /// without it. So the agent's write after such a check, its record
+    /// included, waits for that writer and finds the log ends in a line cut
+    /// short. A check while the lock is held (the agent's own read-back)
+    /// asks for no writer. Settle the writers before the home goes.
     func holdTheLogAtEveryRecordCheck(log: URL) throws -> LogWriters {
         let grep = dir.appendingPathComponent("grep")
-        let server = dir.appendingPathComponent("log-writers")
-        let fifo = dir.appendingPathComponent("log-writers.fifo")
-        let statuses = dir.appendingPathComponent("log-writers.status")
-        let ready = dir.appendingPathComponent("holder.ready").path
+        let writers = try LogWriters(dir: dir.appendingPathComponent("log-writers", isDirectory: true), log: log)
+        let requests = writers.requests.path
+        let acks = writers.acks.path
         try #"""
         #!/bin/bash
-        # Started and reaped by the test (PatchedBackstop.LogWriters). Starts
-        # a writer as a child of its own for each line "start" on the FIFO.
-        # On any other line, or none, it waits for each writer and records
-        # that line, then each writer's exit status in start order.
-        exec 3<'\#(fifo.path)'
-        pids=()
-        request=""
-        while IFS= read -r request <&3 && [[ "$request" == start ]]; do
-          /usr/bin/lockf -k -s -t 5 '\#(log.path)' /bin/bash -c '
-            printf "held sh" >> "$0"; : > "$1"; /bin/sleep 1; printf "ort" >> "$0"
-          ' '\#(log.path)' '\#(ready)' </dev/null >/dev/null 2>&1 3<&- &
-          pids[${#pids[@]}]=$!
-          request=""
-        done
-        exec 3<&-
-        recorded="$request"
-        for pid in ${pids[@]+"${pids[@]}"}; do
-          wait "$pid"
-          recorded="$recorded"$'\n'"$?"
-        done
-        printf '%s\n' "$recorded" > '\#(statuses.path)'
-
-        """#.write(to: server, atomically: true, encoding: .utf8)
-        try #"""
-        #!/bin/bash
+        # A request is a file in the requests folder, made under a dot name
+        # and renamed, so the writer sees it whole. The writer makes the file
+        # of the same name in the acks folder once it holds the lock. The fake
+        # records whether that came in time in the seen or late folder.
         if [[ "${1:-}" == -Fxq && "${2:-}" == -e && "${3:-}" == "insomnia-ended-session-v1 "* && -f '\#(log.path)' ]] \
            && /usr/bin/lockf -k -s -t 0 '\#(log.path)' /usr/bin/true; then
-          /bin/rm -f '\#(ready)'
-          # Read and write, so the open never waits for a reader.
-          { printf 'start\n' >&4; } 4<>'\#(fifo.path)'
-          for _ in $(/usr/bin/jot 500); do
-            [[ -e '\#(ready)' ]] && break
-            /bin/sleep 0.01
-          done
+          if made=$(/usr/bin/mktemp '\#(requests)/.XXXXXX') && id=${made##*/.} && /bin/mv "$made" '\#(requests)/'"$id"; then
+            answered=""
+            for _ in $(/usr/bin/jot 500); do
+              if [[ -e '\#(acks)/'"$id" ]]; then answered=1; break; fi
+              /bin/sleep 0.01
+            done
+            if [[ -n "$answered" ]]; then : > '\#(writers.seen.path)/'"$id"; else : > '\#(writers.late.path)/'"$id"; fi
+          else
+            printf 'the fake grep could not make a request\n' >> '\#(writers.failures.path)'
+          fi
         fi
         exec /usr/bin/grep "$@"
 
         """#.write(to: grep, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: grep.path)
         try patch("GREP=/usr/bin/grep", "GREP='\(grep.path)'")
-        return try LogWriters(server: server, fifo: fifo, statuses: statuses, output: dir.appendingPathComponent("log-writers.out"))
+        return writers
     }
 
-    /// The writers holdTheLogAtEveryRecordCheck's fake has started, all
-    /// children of one server this test starts and reaps. The test holds
-    /// the FIFO open for reading and writing from before the server starts
-    /// until it has exited, so a request never waits for a reader and is
-    /// never lost. `settle` asks the server to stop; it waits for every
-    /// writer, records their exit statuses and exits.
+    /// The writer holdTheLogAtEveryRecordCheck's fake asks for: one thread
+    /// in the test process, so no process outlives the test and none needs
+    /// reaping. For each request, in the order it finds them, it opens the
+    /// log, takes its lock with flock (waiting up to 5 s), writes `held sh`,
+    /// acknowledges the request, waits a second, writes `ort` and closes the
+    /// log, which lets the lock go. Each write and file operation is
+    /// checked. `settle` stops the thread and checks that it served every
+    /// request and that every fake saw its acknowledgment in time.
     final class LogWriters: @unchecked Sendable {
-        private let server: Process
-        private let exit: ProcessExit
-        private let statuses: URL
-        private let output: URL
-        private let lock = NSLock()
-        /// The FIFO, open for reading and writing until the server is reaped.
-        private var requests: Int32 = -1
-        private var settled: [Int32]?
+        /// The thread did not finish in time and may still write to the log.
+        struct Unsettled: Error, CustomStringConvertible {
+            let description: String
+        }
 
-        init(server script: URL, fifo path: URL, statuses: URL, output: URL) throws {
-            self.statuses = statuses
-            self.output = output
-            let process = Process()
-            server = process
-            exit = ProcessExit(process)
-            guard mkfifo(path.path, 0o600) == 0 else {
-                throw RunError(description: "could not make the FIFO \(path.path): errno \(errno)")
+        let requests: URL
+        let acks: URL
+        let seen: URL
+        let late: URL
+        /// What the fake could not do, one line each.
+        let failures: URL
+        private let log: URL
+        private let lock = NSLock()
+        private let finished = DispatchSemaphore(value: 0)
+        private var stopping = false
+        /// Each request served, in order, with the writer's status: 0, 75
+        /// when the lock stayed taken for 5 s, 74 when a write or file
+        /// operation failed.
+        private var served: [(id: String, status: Int32)] = []
+        private var problems: [String] = []
+        private var settling: Task<[Int32], Error>?
+
+        init(dir: URL, log: URL) throws {
+            self.log = log
+            requests = dir.appendingPathComponent("requests", isDirectory: true)
+            acks = dir.appendingPathComponent("acks", isDirectory: true)
+            seen = dir.appendingPathComponent("seen", isDirectory: true)
+            late = dir.appendingPathComponent("late", isDirectory: true)
+            failures = dir.appendingPathComponent("failures")
+            for folder in [requests, acks, seen, late] {
+                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             }
-            requests = open(path.path, O_RDWR | O_CLOEXEC)
-            guard requests >= 0 else { throw RunError(description: "could not open the FIFO \(path.path): errno \(errno)") }
-            guard FileManager.default.createFile(atPath: output.path, contents: nil) else {
-                close(requests)
-                throw RunError(description: "could not create \(output.path) for the writers' server")
-            }
-            do {
-                let handle = try FileHandle(forWritingTo: output)
-                defer { try? handle.close() }
-                server.executableURL = URL(fileURLWithPath: "/bin/bash")
-                server.arguments = [script.path]
-                server.standardInput = FileHandle.nullDevice
-                server.standardOutput = handle
-                server.standardError = handle
-                try server.run()
-            } catch {
-                close(requests)
-                throw error
+            let thread = Thread { [self] in serve() }
+            thread.name = "PatchedBackstop.LogWriters"
+            thread.start()
+        }
+
+        private func note(_ problem: String) { lock.withLock { problems.append(problem) } }
+
+        /// Serves requests every 10 ms until asked to stop. A scan that
+        /// starts after the stop request and finds nothing new ends it, so a
+        /// request made before `settle` is served.
+        private func serve() {
+            defer { finished.signal() }
+            var done = Set<String>()
+            while true {
+                let stop = lock.withLock { stopping }
+                let names: [String]
+                do {
+                    names = try FileManager.default.contentsOfDirectory(atPath: requests.path).filter { !$0.hasPrefix(".") }.sorted()
+                } catch {
+                    note("could not list \(requests.path): \(error)")
+                    return
+                }
+                let new = names.filter { !done.contains($0) }
+                for id in new {
+                    let status = serveRequest(id)
+                    done.insert(id)
+                    lock.withLock { served.append((id, status)) }
+                }
+                if stop && new.isEmpty { return }
+                Thread.sleep(forTimeInterval: 0.01)
             }
         }
 
-        /// Asks the server to stop and returns each writer's exit status,
-        /// in start order, once the server has waited for every writer and
-        /// has exited and been reaped. Throws when the server did not exit
-        /// 0 after the request within 30 s, which is far longer than a
-        /// writer takes (at most 5 s for the lock and one second held). It
-        /// is then terminated and reaped; a writer it started still ends by
-        /// itself.
+        private func serveRequest(_ id: String) -> Int32 {
+            let fd = open(log.path, O_WRONLY | O_APPEND | O_CLOEXEC)
+            guard fd >= 0 else {
+                note("request \(id): could not open \(log.path): errno \(errno)")
+                return 74
+            }
+            var status = hold(fd, for: id)
+            // Closing the log lets its lock go.
+            if close(fd) != 0 {
+                note("request \(id): closing the log: errno \(errno)")
+                status = 74
+            }
+            return status
+        }
+
+        private func hold(_ fd: Int32, for id: String) -> Int32 {
+            let deadline = Date().addingTimeInterval(5)
+            while flock(fd, LOCK_EX | LOCK_NB) != 0 {
+                guard errno == EWOULDBLOCK || errno == EINTR else {
+                    note("request \(id): flock: errno \(errno)")
+                    return 74
+                }
+                if Date() >= deadline { return 75 }
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+            guard append("held sh", to: fd, for: id) else { return 74 }
+            let ack = acks.appendingPathComponent(id).path
+            let made = open(ack, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)
+            guard made >= 0 else {
+                note("request \(id): could not make \(ack): errno \(errno)")
+                return 74
+            }
+            guard close(made) == 0 else {
+                note("request \(id): closing \(ack): errno \(errno)")
+                return 74
+            }
+            Thread.sleep(forTimeInterval: 1)
+            return append("ort", to: fd, for: id) ? 0 : 74
+        }
+
+        private func append(_ text: String, to fd: Int32, for id: String) -> Bool {
+            var bytes = Array(text.utf8)[...]
+            while !bytes.isEmpty {
+                let n = bytes.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, $0.count) }
+                if n > 0 {
+                    bytes = bytes.dropFirst(n)
+                } else if n < 0 && errno == EINTR {
+                    continue
+                } else {
+                    note("request \(id): writing \(text.debugDescription) to the log: \(n), errno \(errno)")
+                    return false
+                }
+            }
+            return true
+        }
+
+        /// Stops the writer and returns each request's status in the order
+        /// it was served, once the thread has finished. Throws `Unsettled`
+        /// when it has not finished within 30 s of the stop request, which
+        /// is far longer than a request takes (at most 5 s for the lock and
+        /// one second held). Throws when a write or file operation failed,
+        /// a request was not served, or a fake did not see its
+        /// acknowledgment in time. Every call, also one made while another
+        /// is waiting, gets the outcome of the first.
         @discardableResult
         func settle() async throws -> [Int32] {
-            let (done, fd) = lock.withLock { () -> ([Int32]?, Int32) in
-                defer { requests = -1 }
-                return (settled, requests)
+            let task = lock.withLock { () -> Task<[Int32], Error> in
+                if let settling { return settling }
+                stopping = true
+                let task = Task.detached { [self] in try await join() }
+                settling = task
+                return task
             }
-            if let done { return done }
-            let stop = Array("stop\n".utf8)
-            var asked = false
-            if fd >= 0 {
-                asked = stop.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) } == stop.count
+            return try await task.value
+        }
+
+        private func join() async throws -> [Int32] {
+            let finished = self.finished
+            let joined = await withCheckedContinuation { (done: CheckedContinuation<Bool, Never>) in
+                DispatchQueue.global().async { done.resume(returning: finished.wait(timeout: .now() + 30) == .success) }
             }
-            let exited = asked ? await exit.exited(within: 30) : false
-            if !exited {
-                server.terminate()
-                await exit.exited()
+            guard joined else {
+                throw Unsettled(description: "the log writer did not finish within 30 s of the stop request and may still write to \(log.path)")
             }
-            if fd >= 0 { close(fd) }
-            let printed = (try? String(contentsOf: output, encoding: .utf8)) ?? ""
-            guard exited, server.terminationReason == .exit, server.terminationStatus == 0 else {
-                throw RunError(description: "the log writers' server did not stop as asked (asked \(asked), exited \(exited), status \(server.terminationStatus)); output: \(printed)")
+            let (served, problems) = lock.withLock { (self.served, self.problems) }
+            func names(_ folder: URL) throws -> Set<String> {
+                Set(try FileManager.default.contentsOfDirectory(atPath: folder.path).filter { !$0.hasPrefix(".") })
             }
-            let lines = try String(contentsOf: statuses, encoding: .utf8).split(separator: "\n", omittingEmptySubsequences: false)
-            let codes = lines.dropFirst().dropLast().compactMap { Int32($0) }
-            guard lines.count >= 2, lines.first == "stop", lines.last == "", codes.count == lines.count - 2 else {
-                throw RunError(description: "the log writers' server recorded \(lines); output: \(printed)")
+            let requested = try names(requests)
+            let seenNames = try names(seen)
+            let lateNames = try names(late)
+            var failed = ""
+            if FileManager.default.fileExists(atPath: failures.path) {
+                failed = try String(contentsOf: failures, encoding: .utf8)
             }
-            lock.withLock { settled = codes }
-            return codes
+            let ids = served.map(\.id)
+            guard problems.isEmpty, failed.isEmpty, lateNames.isEmpty, Set(ids) == requested, ids.count == requested.count, seenNames == requested else {
+                throw RunError(description: "the log writer served \(served) of requests \(requested.sorted()); acknowledged in time \(seenNames.sorted()), late \(lateNames.sorted()); problems \(problems); the fake's failures \(failed.debugDescription)")
+            }
+            return served.map(\.status)
         }
     }
 

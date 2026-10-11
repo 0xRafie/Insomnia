@@ -235,7 +235,7 @@ final class AgentCutoffsCommandTests: XCTestCase {
         }
         let home = TempHome()
         defer { home.destroy() }
-        let io = FileManager.default.temporaryDirectory.appendingPathComponent("insomnia-tests-io-\(UUID().uuidString)", isDirectory: true)
+        let io = ProcessTestHome.temporaryDirectory.appendingPathComponent("insomnia-tests-io-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: io, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: io) }
         let inURL = io.appendingPathComponent("stdin")

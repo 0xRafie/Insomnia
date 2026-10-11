@@ -29,9 +29,19 @@ final class LogEndRecordTests: XCTestCase {
         agent = try PatchedBackstop(home: h.home.root, dir: h.home.root.appendingPathComponent("agent", isDirectory: true))
     }
 
+    /// A log writer that has not finished may still write to the log, so
+    /// its home stays.
     override func tearDown() async throws {
+        var keepHome = false
         if let logWriters {
-            do { try await logWriters.settle() } catch { XCTFail("\(error)") }
+            do {
+                try await logWriters.settle()
+            } catch let error as PatchedBackstop.LogWriters.Unsettled {
+                XCTFail("\(error); keeping \(h.home.root.path)")
+                keepHome = true
+            } catch {
+                XCTFail("\(error)")
+            }
         }
         Store.lockRecordWriteLimitForTesting = nil
         acls.removeGiven()
@@ -40,7 +50,7 @@ final class LogEndRecordTests: XCTestCase {
             try? setImmutable(url, false)
             try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
         }
-        h.home.destroy()
+        if keepHome { h.home.keep() } else { h.home.destroy() }
     }
 
     private var logFile: URL { h.home.paths.logFile }

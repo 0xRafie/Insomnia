@@ -31,15 +31,19 @@ not finish within 30 s, or one on which Foundation stops the app), and
 otherwise the values recorded in `state.json`, once the journal passes its
 check. A recorded value the app does not write counts
 as none, as the app reads it. With no record, it enforces the app's defaults
-(a 10% end floor, thermal rules on) while `config.json` is missing or
-rejected, and the strictest values (95%, on) while the file is there but
-cannot be read either way; both are open stopgaps (spec section 6). A
-journal the app would not load, or one whose meaning to the app the check
-cannot tell (an Int64 on which Foundation stops the app, text it does not
-finish reading within 30 s, the two `\u0000` cases in spec section 6), stops
-the run with the session and the journal kept. An edited journal replaces
-`state.json` only when it loads as the app loads it and keeps every `Float`
-the app decodes bit for bit. The app is not
+(a 10% end floor, thermal rules on) while `config.json` is missing, not a
+regular file, not readable by this user, or rejected, and the strictest values
+(95%, on) while it is a regular file this user can read and neither the
+binary nor the backstop's reader can tell what the app makes of it; both are
+open stopgaps (spec section 6). A journal the app would not load, or one whose meaning to the app
+the check cannot tell (an Int64 on which Foundation stops the app, text it
+does not finish reading within 30 s, a string the app reads that holds
+`\u0000` when the system's `grep` fails, so that no placeholder for it can be
+had), stops the run with the session and the journal kept. An edited journal
+replaces `state.json` only when it loads as the app loads it, keeps every
+`Float` the app decodes bit for bit, and has each string that holds `\u0000`
+back once, in its own entry under its own key; otherwise the run keeps the
+old journal, with what it still has to undo, and exits 1. The app is not
 sandboxed; local logs can contain SSIDs, process metadata, and tmux target names.
 The lines the app writes to `insomnia.log` also reach the unified log with the
 body marked private, so programs reading `log show` see `<private>` instead of

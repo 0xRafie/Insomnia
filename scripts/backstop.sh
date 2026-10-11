@@ -44,15 +44,17 @@
 #                     with the app's own decoder, or, when it cannot answer,
 #                     this script reads the file where it can tell exactly
 #                     what that decoder makes of it (read_cutoffs). When the
-#                     file is missing, cannot be read, or the app rejects
-#                     it, the cutoffs the app recorded for the session in
-#                     state.json (sessionCutoffs) apply, read by the same
-#                     binary, or here when it cannot answer; the defaults,
-#                     10% and on, when the journal records none; and the
-#                     strictest, 95% and on, when config.json is there but
-#                     cannot be read either way and the journal records
-#                     none. A journal the app would not
-#                     load stops the run first, the session kept (below).
+#                     file is missing, not a regular file this user can
+#                     read, or one the app rejects, the cutoffs the app
+#                     recorded for the session in state.json
+#                     (sessionCutoffs) apply, read by the same binary, or
+#                     here when it cannot answer; the defaults, 10% and on,
+#                     when the journal records none; and the strictest, 95%
+#                     and on, when config.json is a regular file this user
+#                     can read, neither the binary nor this script can tell
+#                     what the app makes of it, and the journal records
+#                     none. A journal the app would not load stops the run
+#                     first, the session kept (below).
 #                     A battery present but unreadable,
 #                     or a failing pmset, ends too (fail closed). No battery
 #                     in pmset: ioreg shows whether an AppleSmartBattery
@@ -1417,6 +1419,49 @@ json_held_token() { # text between the quotes
   return 0
 }
 
+# For journal_candidate_ok in backstop.sh, before record_text_problems
+# reads a copy of the view with restore: held_where, where each placeholder
+# (held_shown, such as savedAudioOutputs[1].saveID) must be in the copy,
+# and held_gone for each that must not be there. $1 names the arrays the
+# edit wrote again and where each entry went, one word for each:
+# name=t,t,..., a t for each entry of the view's array in order, the
+# entry's index in the copy or - for one the edit took out. A placeholder in
+# an entry taken out must be gone; one in an entry kept goes under the same
+# key of that entry at its index in the copy; any other stays where it was.
+# So no string can go to another entry, under the same key or another. One
+# in an entry that $1 has no t for has no place where it may be, and the
+# copy is refused.
+json_held_where() { # moves
+  local n move name at rest tokens i
+  held_where=()
+  for (( n = 0; n < held_count; n++ )); do
+    held_where[n]="${held_shown[n]}"
+    for move in $1; do
+      name="${move%%=*}"
+      [[ "${held_shown[n]}" == "${name}["* ]] || continue
+      at="${held_shown[n]#"${name}["}"
+      rest="${at#*]}"
+      at="${at%%]*}"
+      held_where[n]="?"
+      [[ "$at" =~ ^(0|[1-9][0-9]{0,8})$ ]] || continue
+      tokens="${move#*=},"
+      i=0
+      while [[ -n "$tokens" ]] && (( i < at )); do
+        tokens="${tokens#*,}"
+        i=$((i + 1))
+      done
+      [[ -n "$tokens" ]] || continue
+      if [[ "${tokens%%,*}" == - ]]; then
+        held_where[n]=""
+        held_gone[n]=1
+      elif [[ "${tokens%%,*}" =~ ^(0|[1-9][0-9]{0,8})$ ]]; then
+        held_where[n]="${name}[${tokens%%,*}]$rest"
+      fi
+    done
+  done
+  return 0
+}
+
 # For record_text_problems: adds the view's text $1 for the value just read
 # at depth d to where that value goes (puts[d]): the object or array at
 # depth d (keep), the frozen process's startedAtMicros or bootSession,
@@ -1502,10 +1547,11 @@ json_window_trim() {
 #     backstop.sh compares with those of the journal it edited.
 #   - with restore as $5, the text being a copy of the view that plutil
 #     edited: any line about a placeholder of the journal's (HELD_PREFIX,
-#     the arrays held_paths, held_shown and held_raws for each, held_gone
-#     for those the edit took out) that is not, once, where its string was
-#     in the journal's terms, or that the edit took out, or about one the
-#     edit did not take out that is not there.
+#     the arrays held_paths, held_shown and held_raws for each, held_where
+#     and held_gone from json_held_where) that is not, once, where its
+#     string is in the copy (under the same key of the same entry), or that
+#     the edit took out, or about one the edit did not take out that is not
+#     there.
 #   - "record: " (state.json): sessionCutoffs is a value the app reads as no
 #     record (RuntimeState.decodeSessionCutoffs): an object, an array, a
 #     number, a bool, or a string its decoder does not read. The journal
@@ -1946,13 +1992,15 @@ record_text_problems() { # file [state|config] [view] [floats] [restore]
         json_window_trim
         raw="${raw:1:${#raw}-2}"
         # With restore, a string that holds HELD_PREFIX is a placeholder of
-        # the journal's: exactly one, as a value where its string was in
-        # the app's terms, the first time, and not one the edit took out.
+        # the journal's: exactly one, as a value the app reads where its
+        # string is in the copy (held_where: under the same key of the same
+        # entry, json_held_where), the first time, and not one the edit took
+        # out.
         held_n=""
         if [[ -n "$restore" && "$raw" =~ $held_rx ]]; then
           held_n="${raw#"$HELD_PREFIX"}"
           if [[ "$want" == value && "$rel" == 1 && "$raw" == "$HELD_PREFIX"* && "$held_n" =~ ^(0|[1-9][0-9]{0,8})$ ]] &&
-            (( held_n < held_count )) && [[ "${held_paths[held_n]}" == "$vpath" && -z "${held_used[held_n]:-}" && -z "${held_gone[held_n]:-}" ]]; then
+            (( held_n < held_count )) && [[ "${held_paths[held_n]}" == "$vpath" && "${held_where[held_n]:-}" == "$vshown" && -z "${held_used[held_n]:-}" && -z "${held_gone[held_n]:-}" ]]; then
             held_used[held_n]=1
           else
             echo "${vshown:-a key in ${shown[d]:-the top level of $doc}} holds a placeholder for a string that holds \\u0000 (json_held_token) where none of the journal's goes, so what the app reads is not known here"
@@ -2487,17 +2535,20 @@ trap '"$RM" -f "$JOURNAL_VIEW" "$JOURNAL_VIEW.candidate" 2>/dev/null || true' EX
 # hold \u0000 (held_count, check_journal) is first written again with each
 # put back as its string's own text: record_text_problems reads the copy
 # with restore and writes it as the app reads it, each placeholder as the
-# text it stands for. Each must be once in the copy, where its string was
-# in the app's terms (frozenProcesses[].bootSession), and every one must be
-# there but those the edit took out: $3 and on, each the value the edit
-# took out as read from the view, such as the bootSession of a frozen entry
-# it cleared. Anything else, such as one the edit took out that is still
-# there, keeps the journal as it is. The copy is then that text, checked
-# as above.
-journal_candidate_ok() { # file floats [values the edit took out...]
-  local line n ok=1 floats="" view="$JOURNAL_VIEW.candidate" file="$1" given="$2"
-  local -a held_gone
-  shift 2
+# text it stands for. Each must be once in the copy, under the same key of
+# the same entry as in the journal (json_held_where): where it was, or, in
+# an array the edit wrote again with some entries taken out ($3, moves,
+# such as frozenProcesses=-,0,1), at the index its entry has in the copy.
+# So a string cannot go to another entry, under the same key or another.
+# Every one must be there but those the edit took out: those in the entries
+# $3 takes out, and $4 and on, each a value the edit took out as read from
+# the view, such as the endedSession it replaced. Anything else, such as
+# one the edit took out that is still there, or two that changed places,
+# keeps the journal as it is. The copy is then that text, checked as above.
+journal_candidate_ok() { # file floats moves [values the edit took out...]
+  local line n ok=1 floats="" view="$JOURNAL_VIEW.candidate" file="$1" given="$2" moves="$3"
+  local -a held_gone held_where
+  shift 3
   [[ "$("$PLUTIL" -convert json -o - "$file" 2>/dev/null | "$HEAD" -c 1)" == "{" ]] || return 1
   [[ "$("$HEAD" -c 1 "$file")" == "{" ]] || return 1
   "$RM" -f "$view" 2>/dev/null || true
@@ -2509,6 +2560,7 @@ journal_candidate_ok() { # file floats [values the edit took out...]
         held_gone[n]=1
       fi
     done
+    json_held_where "$moves"
     while IFS= read -r line; do
       case "$line" in
         ""|"view: "*|"record: "*) ;;
@@ -2516,7 +2568,7 @@ journal_candidate_ok() { # file floats [values the edit took out...]
       esac
     done < <(record_text_problems "$file" state "$view" "" restore)
     if (( ok == 0 )) || [[ ! -f "$view" ]] || ! "$MV" -f "$view" "$file" 2>/dev/null; then
-      (( ok == 1 )) || log error "the edited copy of $STATE is not a journal the app loads with each string that holds \\u0000 once, where it was in the journal; not published"
+      (( ok == 1 )) || log error "the edited copy of $STATE is not a journal the app loads with each string that holds \\u0000 once, in the entry and under the key it had in the journal; not published"
       "$RM" -f "$view" 2>/dev/null || true
       return 1
     fi
@@ -3598,7 +3650,7 @@ record_end_in_journal() {
     "$RM" -f "$tmp" 2>/dev/null || true
     return 1
   fi
-  if ! journal_candidate_ok "$tmp" "$floats" "$old" || ! "$MV" -f "$tmp" "$STATE" 2>/dev/null; then
+  if ! journal_candidate_ok "$tmp" "$floats" "" "$old" || ! "$MV" -f "$tmp" "$STATE" 2>/dev/null; then
     "$RM" -f "$tmp" 2>/dev/null || true
     return 1
   fi
@@ -3907,7 +3959,7 @@ prepare_low_power_off() {
     "$PLUTIL" -replace keptDisplayUnderLowPowerBoot -string "$boot" "$tmp" >/dev/null 2>&1 || ok=0
   fi
   if (( ok == 1 )); then
-    journal_candidate_ok "$tmp" "$journal_floats" "$recorded" || ok=0
+    journal_candidate_ok "$tmp" "$journal_floats" "" "$recorded" || ok=0
   fi
   if (( ok == 1 )); then
     "$MV" -f "$tmp" "$STATE" || ok=0
@@ -4195,11 +4247,14 @@ fi
 # included) unless its restore succeeded.
 kept_app_nap=""
 kept_app_nap_count=0
+# kept_app_nap_at[i] marks entry i as kept, for journal_candidate_ok.
+kept_app_nap_at=()
 keep_app_nap_entry() { # index
   local entry
   entry="$(extract_json "$JOURNAL" "appNapOverrides.$1")"
   if [[ -n "$kept_app_nap" ]]; then kept_app_nap="$kept_app_nap,$entry"; else kept_app_nap="$entry"; fi
   kept_app_nap_count=$((kept_app_nap_count + 1))
+  kept_app_nap_at[$1]=1
 }
 if (( app_nap_count > 0 )); then
   i=0
@@ -4328,10 +4383,29 @@ if (( changed == 1 )); then
   for (( i = 0; i < frozen_count; i++ )); do
     [[ -n "${kept[i]:-}" ]] || frozen_gone+=("${frozen_boot[i]:-}")
   done
+  # Where each entry of the two arrays written again went: its index among
+  # the kept entries, or - for one taken out (journal_candidate_ok), so
+  # each string that holds \u0000 stays with its own entry.
+  moves=""
+  for array in frozenProcesses appNapOverrides; do
+    if [[ "$array" == frozenProcesses ]]; then n=$frozen_count; else n=$app_nap_count; fi
+    (( n > 0 )) || continue
+    move_map=""
+    move_at=0
+    for (( i = 0; i < n; i++ )); do
+      if [[ "$array" == frozenProcesses && -n "${kept[i]:-}" ]] || [[ "$array" == appNapOverrides && -n "${kept_app_nap_at[i]:-}" ]]; then
+        move_map+=",$move_at"
+        move_at=$((move_at + 1))
+      else
+        move_map+=",-"
+      fi
+    done
+    moves+=" $array=${move_map#,}"
+  done
   if (( publish_ok == 1 )); then
     # plutil keeps JSON files as JSON; make sure the result is still one,
     # and one the app loads as plutil reads it.
-    journal_candidate_ok "$tmp" "$journal_floats" ${frozen_gone[@]+"${frozen_gone[@]}"} || publish_ok=0
+    journal_candidate_ok "$tmp" "$journal_floats" "$moves" ${frozen_gone[@]+"${frozen_gone[@]}"} || publish_ok=0
   fi
   if (( publish_ok == 1 )); then
     "$MV" -f "$tmp" "$STATE" || publish_ok=0

@@ -921,6 +921,49 @@ json_held_token() { # text between the quotes
   return 0
 }
 
+# For journal_candidate_ok in backstop.sh, before record_text_problems
+# reads a copy of the view with restore: held_where, where each placeholder
+# (held_shown, such as savedAudioOutputs[1].saveID) must be in the copy,
+# and held_gone for each that must not be there. $1 names the arrays the
+# edit wrote again and where each entry went, one word for each:
+# name=t,t,..., a t for each entry of the view's array in order, the
+# entry's index in the copy or - for one the edit took out. A placeholder in
+# an entry taken out must be gone; one in an entry kept goes under the same
+# key of that entry at its index in the copy; any other stays where it was.
+# So no string can go to another entry, under the same key or another. One
+# in an entry that $1 has no t for has no place where it may be, and the
+# copy is refused.
+json_held_where() { # moves
+  local n move name at rest tokens i
+  held_where=()
+  for (( n = 0; n < held_count; n++ )); do
+    held_where[n]="${held_shown[n]}"
+    for move in $1; do
+      name="${move%%=*}"
+      [[ "${held_shown[n]}" == "${name}["* ]] || continue
+      at="${held_shown[n]#"${name}["}"
+      rest="${at#*]}"
+      at="${at%%]*}"
+      held_where[n]="?"
+      [[ "$at" =~ ^(0|[1-9][0-9]{0,8})$ ]] || continue
+      tokens="${move#*=},"
+      i=0
+      while [[ -n "$tokens" ]] && (( i < at )); do
+        tokens="${tokens#*,}"
+        i=$((i + 1))
+      done
+      [[ -n "$tokens" ]] || continue
+      if [[ "${tokens%%,*}" == - ]]; then
+        held_where[n]=""
+        held_gone[n]=1
+      elif [[ "${tokens%%,*}" =~ ^(0|[1-9][0-9]{0,8})$ ]]; then
+        held_where[n]="${name}[${tokens%%,*}]$rest"
+      fi
+    done
+  done
+  return 0
+}
+
 # For record_text_problems: adds the view's text $1 for the value just read
 # at depth d to where that value goes (puts[d]): the object or array at
 # depth d (keep), the frozen process's startedAtMicros or bootSession,
@@ -1006,10 +1049,11 @@ json_window_trim() {
 #     backstop.sh compares with those of the journal it edited.
 #   - with restore as $5, the text being a copy of the view that plutil
 #     edited: any line about a placeholder of the journal's (HELD_PREFIX,
-#     the arrays held_paths, held_shown and held_raws for each, held_gone
-#     for those the edit took out) that is not, once, where its string was
-#     in the journal's terms, or that the edit took out, or about one the
-#     edit did not take out that is not there.
+#     the arrays held_paths, held_shown and held_raws for each, held_where
+#     and held_gone from json_held_where) that is not, once, where its
+#     string is in the copy (under the same key of the same entry), or that
+#     the edit took out, or about one the edit did not take out that is not
+#     there.
 #   - "record: " (state.json): sessionCutoffs is a value the app reads as no
 #     record (RuntimeState.decodeSessionCutoffs): an object, an array, a
 #     number, a bool, or a string its decoder does not read. The journal
@@ -1450,13 +1494,15 @@ record_text_problems() { # file [state|config] [view] [floats] [restore]
         json_window_trim
         raw="${raw:1:${#raw}-2}"
         # With restore, a string that holds HELD_PREFIX is a placeholder of
-        # the journal's: exactly one, as a value where its string was in
-        # the app's terms, the first time, and not one the edit took out.
+        # the journal's: exactly one, as a value the app reads where its
+        # string is in the copy (held_where: under the same key of the same
+        # entry, json_held_where), the first time, and not one the edit took
+        # out.
         held_n=""
         if [[ -n "$restore" && "$raw" =~ $held_rx ]]; then
           held_n="${raw#"$HELD_PREFIX"}"
           if [[ "$want" == value && "$rel" == 1 && "$raw" == "$HELD_PREFIX"* && "$held_n" =~ ^(0|[1-9][0-9]{0,8})$ ]] &&
-            (( held_n < held_count )) && [[ "${held_paths[held_n]}" == "$vpath" && -z "${held_used[held_n]:-}" && -z "${held_gone[held_n]:-}" ]]; then
+            (( held_n < held_count )) && [[ "${held_paths[held_n]}" == "$vpath" && "${held_where[held_n]:-}" == "$vshown" && -z "${held_used[held_n]:-}" && -z "${held_gone[held_n]:-}" ]]; then
             held_used[held_n]=1
           else
             echo "${vshown:-a key in ${shown[d]:-the top level of $doc}} holds a placeholder for a string that holds \\u0000 (json_held_token) where none of the journal's goes, so what the app reads is not known here"

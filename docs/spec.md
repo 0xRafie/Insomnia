@@ -732,9 +732,9 @@ write as none and records its own over it.
 
 Before it reads the cutoffs for a valid session, or ends one, the backstop
 checks that `state.json` loads as the app loads it: JSON whose top level
-is an object, the keys the app reads of the types and ranges it decodes,
-and no key of letters twice in one object (`journal_shape_problems`,
-`record_text_problems`, section 8). A journal that fails, a `state.json`
+is an object, and the keys the app reads of the types and ranges it
+decodes, each by its first copy where an object holds a key twice, as the
+app reads it (`journal_shape_problems`, `record_text_problems`, section 8). A journal that fails, a `state.json`
 that is not a regular file or cannot be read, and a journal the binary
 answers `rejected` for stop the run (exit 1), logged, with `session.json`,
 the journal and every undo entry as they were: the app neither ends nor
@@ -803,12 +803,15 @@ Before an edited copy is renamed over `state.json`
 must load as the app loads it, hold every `Float` the app decodes, where it
 is and bit for bit, as the journal it was copied from, and, where the view
 holds placeholders, have each written back as its string's own text: once,
-as a value where its string was in the app's terms
-(`frozenProcesses[].bootSession`), and never for a string the edit took out
-with its entry or value. A placeholder is matched by its number, not its
-index, so an entry keeps its strings when the entries before it go; an edit
-that moved a placeholder to another entry of the same array would pass, and
-no edit the backstop makes does that. Strings, whole numbers and bools
+as a value in the entry and under the key its string had in the journal
+(`savedAudioOutputs[1].saveID`), and never for a string the edit took out
+with its entry or value. In an array the edit wrote again with entries
+taken out (`frozenProcesses`, `appNapOverrides`), the entry is the one at
+the index the kept entry has in the copy (`json_held_where`), so an entry
+keeps its strings when the entries before it go. A placeholder moved to
+another entry fails the check, under the same key or another, also between
+entries alike in every other field, such as two saved outputs whose
+saveIDs change places. Strings, whole numbers and bools
 `plutil` writes back as they were. A copy that
 fails is not published: the run keeps the old journal, with every entry it
 still has to undo, and exits 1. While a refused journal stays, a valid
@@ -856,27 +859,29 @@ as none, as the app reads it (`RuntimeState.decodeSessionCutoffs`), and so
 does a `state.json` that is a symlink to nothing, which the app reads as no
 journal (`Store.readData`) and replaces at its next write. An existing
 `state.json` that cannot be read stops the run as above. While
-`config.json` is missing or rejected, none gives the app's defaults, a 10%
-end floor with thermal rules on (`Config.agentDefaultCutoffs`), which the
-app enforces while the file is missing and it has recorded nothing
-(section 10). While `config.json` is there but neither the binary nor the
-backstop can read it, none gives the strictest values, a 95% end floor with
-thermal rules on, and a log line naming the cause. The cutoffs the app
+`config.json` is missing, fails the backstop's first check (not a regular
+file, or not readable by this user), or is rejected, none gives the app's
+defaults, a 10% end floor with thermal rules on
+(`Config.agentDefaultCutoffs`), which the app enforces while the file is
+missing and it has recorded nothing (section 10). While `config.json` is a
+regular file this user can read but neither the binary nor the backstop
+can tell what the app makes of it, none gives the strictest values, a 95%
+end floor with thermal rules on, and a log line naming the cause. The cutoffs the app
 enforces are not known to the backstop then, though they may be on disk:
 a valid `config.json` over 8 MiB, or one the reader does not finish within
 30 s, still holds the cutoffs the app takes from it, which no reader here
 gets. A file on which Foundation stops the app is not decoded at all (the
-app never loads it), and a missing file and one the app rejects are the
-cases above, not this one. That fallback ends a session on
+app never loads it), and a missing file, one that fails the first check
+and one the app rejects are the cases above, not this one. That fallback ends a session on
 battery power below 95% and ends one at critical heat even with the
 thermal rule off, where the app may keep it, and the defaults can keep a
 session the app, holding stricter settings in memory, would end. The app
 writes its record within a second while it answers
 (`publishSessionCutoffs`), so each case needs an app that has stopped
 answering. Both are stopgaps, not a decided policy, and remain open: the
-defaults where `config.json` is missing or rejected and nothing is
-recorded, and the 95% values where the file cannot be read either way and
-nothing is recorded. The alternatives (the deadline and liveness only, an
+defaults where `config.json` is missing, fails the first check or is
+rejected and nothing is recorded, and the 95% values where a file that
+passes it is decoded neither way and nothing is recorded. The alternatives (the deadline and liveness only, an
 immediate end, refusing such a session) are open too; none has been
 approved. A config.json removed between the check and the open counts as a
 file neither can read for that run. The app takes those two values only
@@ -1305,9 +1310,10 @@ Backstop, independent of the app:
   `record_end_in_log`) in the same write, the agent program's line when
   the code check fails in a write before it. Each holds `flock(2)` on
   `insomnia.log` itself from that read until its line is written (taken
-  last, after the recovery lock), checks once it holds it that its
-  descriptor is still on the file the path names, and opens the path again
-  when it is not (four opens at most in the app, three in the agent); a
+  last, after the recovery lock when the writer holds it), checks once
+  it holds it that its descriptor is still on the file the path names,
+  and opens the path again when it is not (four opens at most in the
+  app, three in the agent); a
   rotation renames the file under the same lock. The app waits up to 2 s
   for the lock: an ordinary line not locked in time waits in memory
   (64 KiB, the oldest whole lines dropped first) and goes out before the
@@ -1326,9 +1332,10 @@ Backstop, independent of the app:
   in reconcile, on its 1 Hz tick and in every transaction, each agent run
   and `uninstall.sh` look for a line equal to the one the current bytes of
   `session.json` give, in `insomnia.log` and `insomnia.log.1`, so a line
-  cut short or one of other bytes ends nothing. A log that cannot be read,
-  or one over 64 MiB, holds no record for them, and a run whose read-back
-  fails appends another line at the next run. The app rotates `insomnia.log`
+  cut short or one of other bytes ends nothing. They do not search a log
+  that cannot be read, or one over 64 MiB, so a record such a log holds
+  ends nothing for them, and a run whose read-back fails appends another
+  line at the next run. The app rotates `insomnia.log`
   only while it holds the recovery lock (`OwnerOnly.LogRotation`), so a
   rotation never runs between a write and its read-back. Before the rename
   discards the old `insomnia.log.1`, it copies a record there of the
