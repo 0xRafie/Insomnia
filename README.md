@@ -103,7 +103,8 @@ file and explains how upgrades replace them.
 4. **Settings and status.** Right-click the eye. Quit asks Insomnia to undo
    the session first, and it refuses while a change is still waiting to be
    undone. Saved audio for an output that isn't connected doesn't hold it up.
-   That output is restored when it reconnects.
+   Insomnia restores that output if it reconnects while the app runs, or at
+   the next launch.
 
 You don't have to close the lid, and opening it doesn't end the session.
 
