@@ -1564,11 +1564,17 @@ keep_lock() { # [group]
 # the binary's exit status, 124 when it did not finish in time, or 125 when
 # the process for its input could not start or there is no file for its
 # answer (it was not run).
-# The function's stderr is /dev/null because bash reports a job that a
-# signal ended ("Terminated: 15") on its own stderr; the log says what
-# happened instead.
+# Bash reports a job that a signal ended ("Terminated: 15") on its own
+# stderr, so the wait and the signals run with stderr at /dev/null, and the
+# log says what happened instead, once they are over. Only that part: while
+# a redirection of a function call or a group is in effect, bash 3.2 keeps
+# the shell's own standard error on a descriptor of its own, and the
+# processes started then (the log line's process, the process for the
+# input, the reader) would inherit it and keep the pipe of whatever reads
+# this run's standard error open for as long as they run. The binary's own
+# standard error goes to /dev/null, as its answer is read from the file.
 run_app_bounded() { # command args...
-  local cpid rc=0
+  local cpid rc=0 how=answered
   BOUNDED_READ=2
   READ_TEXT=""
   READ_HEAD=""
@@ -1582,28 +1588,39 @@ run_app_bounded() { # command args...
     exec 6<&- 7>&-
     return 125
   fi
-  "$@" <&8 >&7 3<&- 4>&- 6<&- 7<&- 8<&- &
+  "$@" <&8 >&7 2>/dev/null 3<&- 4>&- 6<&- 7<&- 8<&- &
   cpid=$!
   exec 7>&- 8<&-
-  if wait_for_job "$cpid" "$COMMAND_TIMEOUT_SECONDS"; then
-    wait "$cpid" || rc=$?
-  else
-    signal_job TERM "$cpid" || true
-    if wait_for_job "$cpid" "$KILL_GRACE_SECONDS"; then
+  {
+    if wait_for_job "$cpid" "$COMMAND_TIMEOUT_SECONDS"; then
       wait "$cpid" || rc=$?
-      log error "'$1 --resume-frozen' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s; sent SIGTERM, and it ended (wait status $rc)"
     else
-      signal_job KILL "$cpid" || true
-      if ! wait_for_job "$cpid" "$KILL_GRACE_SECONDS"; then
-        log error "'$1 --resume-frozen' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s and has not exited ${KILL_GRACE_SECONDS}s after SIGKILL; it runs no further code, and it keeps the recovery lock until the kernel ends it"
-        exec 6<&-
-        return 124
+      how=term
+      signal_job TERM "$cpid" || true
+      if wait_for_job "$cpid" "$KILL_GRACE_SECONDS"; then
+        wait "$cpid" || rc=$?
+      else
+        how=kill
+        signal_job KILL "$cpid" || true
+        if wait_for_job "$cpid" "$KILL_GRACE_SECONDS"; then
+          wait "$cpid" || rc=$?
+        else
+          how=running
+        fi
       fi
-      wait "$cpid" || rc=$?
-      log error "'$1 --resume-frozen' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s and was still running ${KILL_GRACE_SECONDS}s after SIGTERM; sent SIGKILL, and it ended (wait status $rc)"
     fi
-    rc=124
-  fi
+  } 2>/dev/null
+  case "$how" in
+    term)
+      log error "'$1 --resume-frozen' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s; sent SIGTERM, and it ended (wait status $rc)" ;;
+    kill)
+      log error "'$1 --resume-frozen' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s and was still running ${KILL_GRACE_SECONDS}s after SIGTERM; sent SIGKILL, and it ended (wait status $rc)" ;;
+    running)
+      log error "'$1 --resume-frozen' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s and has not exited ${KILL_GRACE_SECONDS}s after SIGKILL; it runs no further code, and it keeps the recovery lock until the kernel ends it"
+      exec 6<&-
+      return 124 ;;
+  esac
+  [[ "$how" == answered ]] || rc=124
   exec 5< <(exec 3<&6 6<&- </dev/null 2>/dev/null; send_output & settle "$!")
   exec 6<&-
   BOUNDED_READ=0
@@ -1611,7 +1628,7 @@ run_app_bounded() { # command args...
   exec 5<&-
   (( BOUNDED_READ != 3 )) || BOUNDED_READ=2
   return "$rc"
-} 2>/dev/null
+}
 # End this run right after a timed-out undo command that is still alive:
 # nothing else is undone, the journal and session stay exactly as read, and
 # the lock stays with the live command's supervisor.

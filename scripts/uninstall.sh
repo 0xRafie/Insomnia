@@ -1538,7 +1538,12 @@ journal_problems() {
     return 0
   fi
   rc=0
-  plutil_read -convert json -o /dev/null "$STATE_COPY" >/dev/null || rc=$?
+  # Taken into a variable rather than sent to /dev/null: while a
+  # redirection of a function call is in effect, bash 3.2 keeps the shell's
+  # own standard output, here the pipe its caller reads to the end, on a
+  # descriptor of its own, which the read's supervisor would inherit and
+  # keep open for as long as it runs (see change).
+  value="$(plutil_read -convert json -o /dev/null "$STATE_COPY")" || rc=$?
   if (( rc == 1 )); then
     echo "state.json is unreadable or malformed"
     return 0

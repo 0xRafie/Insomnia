@@ -967,12 +967,14 @@ final class BlockingKeychain: KeychainStoring, @unchecked Sendable {
 /// something does, open(2) blocks until a writer appears; the watchdog opens
 /// the FIFO for writing once a second, which lets a blocked reader through
 /// (it reads EOF) and records that a reader was there. A regression then
-/// fails its test instead of hanging the suite.
+/// fails its test instead of hanging the suite. stop() returns once the
+/// watchdog's thread has ended, so no open of the FIFO happens after it.
 final class FIFOWatch: @unchecked Sendable {
     let url: URL
     private let lock = NSLock()
     private var stopped = false
     private var seen = false
+    private let ended = DispatchSemaphore(value: 0)
 
     init(at url: URL) throws {
         self.url = url
@@ -981,8 +983,14 @@ final class FIFOWatch: @unchecked Sendable {
         }
         let path = url.path
         Thread.detachNewThread { [self] in
+            defer { self.ended.signal() }
+            // 120 rounds of 1 s, the watchdog's limit, looking for stop() 20
+            // times a second.
             for _ in 0..<120 {
-                Thread.sleep(forTimeInterval: 1)
+                for _ in 0..<20 {
+                    if self.isStopped { return }
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
                 if self.isStopped { return }
                 // Succeeds only while a reader has the FIFO open.
                 let fd = open(path, O_WRONLY | O_NONBLOCK)
@@ -1003,7 +1011,13 @@ final class FIFOWatch: @unchecked Sendable {
         return lstat(url.path, &info) == 0 && info.st_mode & S_IFMT == S_IFIFO
     }
 
-    func stop() { lock.lock(); stopped = true; lock.unlock() }
+    /// Stops the watchdog and waits for its thread to end. Called once.
+    func stop() {
+        lock.lock(); stopped = true; lock.unlock()
+        if ended.wait(timeout: .now() + 5) == .timedOut {
+            XCTFail("the watchdog of the FIFO at \(url.path) did not end within 5s of stop()")
+        }
+    }
 
     private var isStopped: Bool { lock.lock(); defer { lock.unlock() }; return stopped }
     private func markSeen() { lock.lock(); seen = true; lock.unlock() }
