@@ -42,7 +42,9 @@ Greptile comments and passing CI provide review evidence, not a safety
 certification. Real-machine validation requires a supervised, separately
 approved run on a ventilated surface with recoverable work. Record the exact
 revision, macOS/hardware versions, observed result, and remaining limitations
-in the release validation record. Never stress or heat a machine in a bag.
+in the release validation record. New behavior that needs a real-Mac check
+adds an item to the "Real-Mac checks before a release" list in
+docs/releasing.md. Never stress or heat a machine in a bag.
 
 The app icon is the menu bar's open eye on a charcoal tile.
 [AppIconArtwork](Sources/Insomnia/UI/AppIconArtwork.swift) draws it from the
