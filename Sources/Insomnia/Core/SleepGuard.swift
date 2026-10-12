@@ -149,13 +149,14 @@ struct PmsetSleepGuard: SleepGuarding {
     }
 
     /// Why `parseLowPowerMode` returned nil for `output`, for the log: no
-    /// line, High Power, or a value other than `0` or `1`.
+    /// line, High Power, or a value other than `0` or `1`. It describes only
+    /// the reading, since each caller decides what to do about it.
     static func lowPowerModeUnreadable(_ output: String) -> String {
         guard let line = lowPowerModeLine(output) else {
             return "no lowpowermode or powermode line under Battery Power"
         }
         if line.key == "powermode", line.value == "2" {
-            return "powermode 2 (High Power) under Battery Power, a setting Insomnia leaves alone"
+            return "powermode 2 under Battery Power is High Power, not Low Power Mode on or off"
         }
         let value = line.value.isEmpty ? "no value" : "value \(line.value)"
         return "\(line.key) under Battery Power has \(value), not 0 or 1"

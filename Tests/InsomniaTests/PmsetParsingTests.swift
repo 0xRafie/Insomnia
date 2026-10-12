@@ -152,11 +152,11 @@ final class PmsetParsingTests: XCTestCase {
         XCTAssertEqual(PmsetSleepGuard.parseLowPowerMode(custom2671), false, "read the AC section's High Power instead of the battery value")
     }
 
-    /// The log says why Low Power Mode was left alone: no line, High Power,
-    /// or a value that is not 0 or 1.
+    /// The log says why Low Power Mode could not be read: no line, High
+    /// Power, or a value that is not 0 or 1.
     func testUnreadableLowPowerModeReasonNamesTheLine() {
         XCTAssertEqual(PmsetSleepGuard.lowPowerModeUnreadable("AC Power:\n lowpowermode 1\n"), "no lowpowermode or powermode line under Battery Power")
-        XCTAssertEqual(PmsetSleepGuard.lowPowerModeUnreadable("Battery Power:\n powermode 2\n"), "powermode 2 (High Power) under Battery Power, a setting Insomnia leaves alone")
+        XCTAssertEqual(PmsetSleepGuard.lowPowerModeUnreadable("Battery Power:\n powermode 2\n"), "powermode 2 under Battery Power is High Power, not Low Power Mode on or off")
         XCTAssertEqual(PmsetSleepGuard.lowPowerModeUnreadable("Battery Power:\n powermode 3\n"), "powermode under Battery Power has value 3, not 0 or 1")
         XCTAssertEqual(PmsetSleepGuard.lowPowerModeUnreadable("Battery Power:\n lowpowermode 2\n powermode 2\n"), "lowpowermode under Battery Power has value 2, not 0 or 1")
         XCTAssertEqual(PmsetSleepGuard.lowPowerModeUnreadable("Battery Power:\n lowpowermode\n powermode 0\n"), "lowpowermode under Battery Power has no value, not 0 or 1")
@@ -176,7 +176,7 @@ final class PmsetParsingTests: XCTestCase {
             let on = try await sleepGuard.isLowPowerModeOn()
             XCTFail("High Power read as \(on)")
         } catch let error as SleepGuardError {
-            XCTAssertEqual(error.errorDescription, "`pmset -g custom` failed with status 0: powermode 2 (High Power) under Battery Power, a setting Insomnia leaves alone")
+            XCTAssertEqual(error.errorDescription, "`pmset -g custom` failed with status 0: powermode 2 under Battery Power is High Power, not Low Power Mode on or off")
         }
     }
 }
