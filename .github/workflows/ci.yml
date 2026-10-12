@@ -25,22 +25,20 @@ jobs:
     # default Xcode (no xcode-select). GitHub picks the point release and
     # moves it forward, so the first step records the one each run used.
     #   macos-26 (arm64): Xcode 26.6 default, 26.4.1 also installed.
-    #   xcode-27 (arm64, public preview): Xcode 27 on macOS 27. Its failures
-    #   are reported but do not fail the run until the macOS 27 fixes land.
+    #   xcode-27 (arm64, public preview): Xcode 27 on macOS 27.
+    # On 2026-10-11 these were macOS 26.6.2 (25G83) and 27.0.1 (26A434).
     strategy:
       fail-fast: false
       matrix:
         include:
           - image: macos-26
             label: macOS 26
-            experimental: false
           - image: xcode-27
             label: macOS 27
-            experimental: true
     runs-on: ${{ matrix.image }}
-    continue-on-error: ${{ matrix.experimental }}
-    # The test watchdog below allows 50 minutes; the rest covers the build
-    # before it and the release build and lid simulation check after it.
+    # The test watchdog below allows 50 minutes for swift test, which builds
+    # the tests and then runs them; the other 10 cover setup, the release
+    # build and the lid simulation check.
     timeout-minutes: 60
     steps:
       - name: Check out
@@ -127,13 +125,13 @@ jobs:
         # NSUnbufferedIO makes XCTest write each line as it happens. With
         # the default 16 KB stdout buffer the log of a hung run stops up to
         # 16 KB before the test that hung, which has already misled one
-        # investigation. If the run is still going after 50 minutes (a
-        # normal run takes about 3), the watchdog samples every xctest
-        # process so the log shows what the hung test is waiting on, then
-        # fails the step instead of waiting for the job timeout. The tests
-        # copy every shell script they write (fakes of sudo, pmset,
-        # launchctl and the rest) into INSOMNIA_TEST_SCRIPT_DUMP for the
-        # ShellCheck step below.
+        # investigation. If swift test is still going after 50 minutes (on
+        # main in October 2026 it took 11 to 16, build included), the
+        # watchdog samples every xctest process so the log shows what the
+        # hung test is waiting on, then fails the step instead of waiting
+        # for the job timeout. The tests copy every shell script they write
+        # (fakes of sudo, pmset, launchctl and the rest) into
+        # INSOMNIA_TEST_SCRIPT_DUMP for the ShellCheck step below.
         env:
           NSUnbufferedIO: "YES"
         run: |
