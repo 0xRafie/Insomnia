@@ -246,6 +246,16 @@ final class SessionCommandTests: XCTestCase {
         XCTAssertNil(SessionCommandLine.run([], paths: h.home.paths))
     }
 
+    /// Scripts read the bundle's key before they run the binary.
+    func testTheBundleDeclaresTheSessionCommandVersion() throws {
+        // .../Tests/InsomniaTests/SessionCommandTests.swift -> .../Resources/Info.plist
+        let info = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Resources/Info.plist")
+        let plist = try XCTUnwrap(try PropertyListSerialization.propertyList(from: Data(contentsOf: info), format: nil) as? [String: Any])
+        XCTAssertEqual(plist["InsomniaSessionCommandVersion"] as? Int, SessionCommandLine.version)
+    }
+
     // MARK: Helpers
 
     private func commandLine(_ words: [String], app: FakeRunningApp = FakeRunningApp(), appRunning: Bool = false) -> SessionCommandLine.Output? {

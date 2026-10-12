@@ -223,6 +223,10 @@ final class SessionCommandWatcher {
 /// answer within `replyTimeout`, and 64 on a usage error.
 enum SessionCommandLine {
     static let flag = "--session"
+    /// `InsomniaSessionCommandVersion` in Resources/Info.plist. A script
+    /// that may meet an older build reads it before running the binary,
+    /// because a build without this mode opens the menu bar app instead.
+    static let version = 1
     /// EX_USAGE from sysexits(3).
     static let usageStatus: Int32 = 64
     /// How long a running app has to take the request before the command

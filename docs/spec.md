@@ -124,7 +124,9 @@ recovery; newly written journals use `frozenProcesses`.
   and a request older than 5 s when the app reads it is dropped, so one left
   behind never starts a session later. `status` only reads session.json. The
   file is the same trust boundary as config.json: only this user can write
-  the directory, and anyone who can write it already controls the app.
+  the directory, and anyone who can write it already controls the app. The
+  bundle declares the interface as `InsomniaSessionCommandVersion` in its
+  Info.plist, because an older build opens the menu bar app instead.
 
 ### 2. Sleep guard and root access
 

@@ -118,6 +118,9 @@ file and explains how upgrades replace them.
    It starts, extends and ends the same session the menu bar counts down,
    with the same battery and heat rules, and prints one line. It changes
    nothing itself, so when the app isn't running it says so and exits 1.
+   A build without this mode opens the menu bar app instead, so a script
+   that may meet one checks `InsomniaSessionCommandVersion` in the bundle's
+   `Info.plist` first.
 
 You don't have to close the lid, and opening it doesn't end the session.
 
