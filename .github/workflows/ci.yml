@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+    # ready_for_review on top of the default three: `merge-gate.sh rerun`
+    # marks a pull request draft and then ready, so CI tests it against the
+    # current main without a push. A re-run would not: it keeps the merge
+    # with main its first run made.
+    types: [opened, synchronize, reopened, ready_for_review]
 
 # Least privilege: nothing in this workflow writes to the repo, checks, or packages.
 permissions:
@@ -231,7 +236,7 @@ jobs:
       - name: Lint shell scripts
         run: |
           shellcheck --version
-          shellcheck scripts/*.sh
+          shellcheck scripts/*.sh .github/scripts/*.sh
 
   lint-workflows:
     name: Lint workflows

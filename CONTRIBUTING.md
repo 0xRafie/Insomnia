@@ -11,8 +11,8 @@ for bash 4 builtins and expansions (`mapfile`, `declare -A`, `${x,,}`),
 because the LaunchAgent, install.sh and uninstall.sh run under 3.2 and
 ShellCheck on Linux does not catch those. It then runs `swift test` and
 builds the release with `-Xswiftc -warnings-as-errors`, so a compiler
-warning fails the build. Two Linux jobs run ShellCheck over the scripts and
-actionlint plus zizmor over `.github/workflows`. Greptile reviews every
+warning fails the build. Two Linux jobs run ShellCheck over `scripts/` and
+`.github/scripts/` and actionlint plus zizmor over `.github/workflows`. Greptile reviews every
 push to a pull request with the rules in `.greptile/`; it reads that folder
 from the pull request's branch.
 
@@ -44,7 +44,9 @@ approved run on a ventilated surface with recoverable work. Record the exact
 revision, macOS/hardware versions, observed result, and remaining limitations
 in the release validation record. New behavior that needs a real-Mac check
 adds an item to the "Real-Mac checks before a release" list in
-docs/releasing.md. Never stress or heat a machine in a bag.
+docs/releasing.md. Never stress or heat a machine in a bag. A pull request
+also needs its own real-Mac report before it merges; see "Real-Mac evidence"
+below.
 
 The app icon is the menu bar's open eye on a charcoal tile.
 [AppIconArtwork](Sources/Insomnia/UI/AppIconArtwork.swift) draws it from the
@@ -53,3 +55,68 @@ bar's closed eye, which opens while a session runs. After changing the
 artwork, run `./scripts/generate-app-icon.sh`. It regenerates the packaged PNG
 and ICNS assets and the README's SVG offline, with Xcode's swiftc and
 iconutil.
+
+## How a pull request merges
+
+A pull request merges into main only when every check below passes at its
+head commit, the newest commit on its branch. GitHub enforces this, for the
+owner too. A check belongs to one commit, so any push to the branch,
+including a maintainer's fix or a merge of main, starts every check over.
+
+| Check | Passes when |
+|---|---|
+| Swift test and release build (macOS 26) and (macOS 27) | `swift test` and the release build pass on both hosted macOS versions |
+| ShellCheck scripts, Lint workflows | ShellCheck, actionlint and zizmor find nothing |
+| merge-gate/greptile | Greptile reviewed the head and scored it 5/5 |
+| merge-gate/accepted | the owner added the `accepted` label |
+| merge-gate/evidence | the maintainer checked a real-Mac report for the head, or the pull request only changes paths listed under "Real-Mac evidence" |
+| merge-gate/config | the pull request leaves `.github/`, `.greptile/` and `Package.swift` alone, or the owner OK'd those changes at the head |
+| merge-gate/codex | the maintainer's Codex review of the head has nothing open |
+
+Every review conversation must be resolved too, and the branch must merge
+into main without conflicts. The
+[merge gate workflow](.github/workflows/merge-gate.yml) posts the
+merge-gate statuses it can decide from GitHub's data and marks the rest
+pending with the reason; [merge-gate.sh](.github/scripts/merge-gate.sh)
+describes each one.
+
+`accepted` is the owner's decision that Insomnia should have the change at
+all. Before you build a new feature or change a default, open an issue so
+that is settled first.
+
+`config` exists because those paths can switch off a check: a pull request
+from a fork runs the workflow files on its own branch, and Greptile reads
+`.greptile/` from the branch it reviews.
+
+### Real-Mac evidence
+
+A pull request that changes anything outside `docs/`, `Tests/`, `.github/`,
+`.greptile/`, README.md, CONTRIBUTING.md, SECURITY.md, LICENSE and
+.gitignore needs a report from your own Mac for its head commit. Post it as
+a comment after your last push. If you push again, post a new one. For the
+owner's own pull requests, the owner posts it.
+
+- **Build.** A clean checkout of the head commit, with no other pull
+  requests applied, installed with `./scripts/install.sh`. Post
+  `git rev-parse HEAD` and `git status --short`, which should print nothing.
+- **Mac.** Post `sw_vers`, `sysctl -n hw.model` and
+  `sysctl -n machdep.cpu.brand_string`.
+- **Checks.** Every item in "Real-Mac checks before a release" in
+  [docs/releasing.md](docs/releasing.md) that your change can affect,
+  including any item it adds. For each one, post the steps you ran with
+  times, pass or fail, and the raw output that shows it:
+  - the lines of `~/Library/Logs/Insomnia/insomnia.log` for that run;
+  - pmset samples from a sampler you start before the check and leave
+    running:
+    ```sh
+    while :; do date '+%T'; pmset -g | grep SleepDisabled; pmset -g custom | sed -n '/Battery Power/,/AC Power/p' | grep -E 'powermode|lowpowermode'; sleep 5; done | tee -a ~/insomnia-samples.txt
+    ```
+  - `pmset -g log | grep -E ' (Sleep|Wake|DarkWake) '` for that time
+    window, which shows whether the Mac slept;
+  - any other reading the item names.
+- **Not run.** List anything you could not run, and why.
+
+Put long logs in a gist and link it. Run the checks while you are with the
+Mac, on a stable, ventilated surface, never in a bag, and with no unsaved
+work open. The maintainer checks that the report covers the head and every
+affected item, then marks merge-gate/evidence.
