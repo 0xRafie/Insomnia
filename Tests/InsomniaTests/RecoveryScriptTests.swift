@@ -3694,16 +3694,15 @@ final class RecoveryScriptTests: XCTestCase {
         let shadow = fx.root.appendingPathComponent("shadow", isDirectory: true)
         try FileManager.default.createDirectory(at: shadow, withIntermediateDirectories: true)
         let stub = shadow.appendingPathComponent("stat")
-        try "#!/bin/bash\nprintf 'PATH stat %s\\n' \"$*\" >> \"\(fx.callsLog.path)\"\nprintf '  File: \"%s\"\\n' \"$*\"\n".write(to: stub, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stub.path)
+        try TestScripts.write("#!/bin/bash\nprintf 'PATH stat %s\\n' \"$*\" >> \"\(fx.callsLog.path)\"\nprintf '  File: \"%s\"\\n' \"$*\"\n", to: stub)
         let wrapper = fx.root.appendingPathComponent("holder-then-backstop.sh")
-        try """
+        try TestScripts.write("""
         #!/bin/bash
         set -eu
         exec 9<>"\(fx.lock.path)"
         /usr/bin/lockf -t 0 9
         /bin/bash "\(fx.backstop.path)"
-        """.write(to: wrapper, atomically: true, encoding: .utf8)
+        """, to: wrapper, executable: false)
 
         let r = try fx.run(wrapper, extraEnvironment: ["PATH": "\(shadow.path):/usr/bin:/bin:/usr/sbin:/sbin"])
 
