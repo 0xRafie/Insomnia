@@ -409,10 +409,15 @@ check_pr() {
   return 1
 }
 
+# --admin uses the owner's bypass of the "only krishhgg may merge" ruleset,
+# which blocks every update to main that does not use it. It does not get
+# past the ruleset that requires the checks above: that one has no bypass
+# list, and on 2026-10-12 a copy of it refused --admin merges of #107 for a
+# missing status and for an open conversation.
 merge_cmd() {
   [ $# -eq 1 ] || usage
   check_pr "$1" || die "not merging #$1"
-  gh pr merge "$1" -R "$REPO" --merge --match-head-commit "$CHECKED_HEAD"
+  gh pr merge "$1" -R "$REPO" --merge --admin --match-head-commit "$CHECKED_HEAD"
 }
 
 rerun_cmd() {
