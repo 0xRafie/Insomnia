@@ -125,7 +125,7 @@ struct PmsetSleepGuard: SleepGuarding {
             throw SleepGuardError(command: "pmset -g custom", status: r.status, stderr: r.stderr)
         }
         guard let on = Self.parseLowPowerMode(r.stdout) else {
-            throw SleepGuardError(command: "pmset -g custom", status: 0, stderr: "no lowpowermode line under Battery Power")
+            throw SleepGuardError(command: "pmset -g custom", status: 0, stderr: Self.lowPowerModeUnreadable(r.stdout))
         }
         return on
     }
@@ -156,12 +156,33 @@ struct PmsetSleepGuard: SleepGuarding {
     }
 
     /// `lowpowermode` in the `Battery Power:` section of `pmset -g custom`
-    /// (the one `pmset -b` writes). nil when the section or key is absent,
-    /// as on a desktop, or when the value is anything but an explicit `0`
-    /// or `1`: an unreadable value is not proof that the mode is off, and
-    /// treating it as off would take over a preference the user may have set.
+    /// (the one `pmset -b` writes). macOS 27 no longer prints that key and
+    /// reports the mode as `powermode` instead (`0` automatic, `1` Low Power,
+    /// `2` High Power), while `pmset -b lowpowermode 0|1` still sets it, so
+    /// `powermode` is read when `lowpowermode` is absent. A `lowpowermode`
+    /// line always wins over `powermode`, even one with no value. nil when
+    /// the section or both keys are absent, as on a desktop, or when the
+    /// value is anything but an explicit `0` or `1`: an unreadable value is
+    /// not proof that the mode is off, and treating it as off would take
+    /// over a preference the user may have set. High Power (`powermode 2`)
+    /// is such a preference.
     static func parseLowPowerMode(_ output: String) -> Bool? {
+        switch lowPowerModeLine(output)?.value {
+        case "1"?: return true
+        case "0"?: return false
+        default: return nil
+        }
+    }
+
+    /// The line `parseLowPowerMode` reads: the first `lowpowermode` line in
+    /// the `Battery Power:` section, else the first `powermode` line there.
+    /// A `lowpowermode` line with no value still wins, so its value reads as
+    /// unknown rather than falling back to `powermode`. The value is "" when
+    /// the line has none.
+    static func lowPowerModeLine(_ output: String) -> (key: String, value: String)? {
         var inBattery = false
+        var lowPowerValue: String?
+        var powerModeValue: String?
         for rawLine in output.split(whereSeparator: \.isNewline) {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
             if line.hasSuffix(":") {
@@ -170,14 +191,28 @@ struct PmsetSleepGuard: SleepGuarding {
             }
             guard inBattery else { continue }
             let parts = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
-            guard parts.count >= 2, parts[0] == "lowpowermode" else { continue }
-            switch parts[1] {
-            case "1": return true
-            case "0": return false
-            default: return nil
-            }
+            guard let key = parts.first else { continue }
+            let value = parts.count >= 2 ? String(parts[1]) : ""
+            if key == "lowpowermode", lowPowerValue == nil { lowPowerValue = value }
+            if key == "powermode", powerModeValue == nil { powerModeValue = value }
         }
+        if let lowPowerValue { return ("lowpowermode", lowPowerValue) }
+        if let powerModeValue { return ("powermode", powerModeValue) }
         return nil
+    }
+
+    /// Why `parseLowPowerMode` returned nil for `output`, for the log: no
+    /// line, High Power, or a value other than `0` or `1`. It describes only
+    /// the reading, since each caller decides what to do about it.
+    static func lowPowerModeUnreadable(_ output: String) -> String {
+        guard let line = lowPowerModeLine(output) else {
+            return "no lowpowermode or powermode line under Battery Power"
+        }
+        if line.key == "powermode", line.value == "2" {
+            return "powermode 2 under Battery Power is High Power, not Low Power Mode on or off"
+        }
+        let value = line.value.isEmpty ? "no value" : "value \(line.value)"
+        return "\(line.key) under Battery Power has \(value), not 0 or 1"
     }
 
     /// The one path for every `sudo pmset` the app runs, including a check

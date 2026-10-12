@@ -156,7 +156,7 @@ The display and keyboard rows go through private frameworks with no ABI
 contract: the DisplayServices C functions and CoreBrightness's
 `KeyboardBrightnessClient`. Two guards run once per launch, before the
 first call. The DisplayServices functions are called only on a macOS major
-version they were measured on (26, `DisplayPower.measuredDisplayServicesMajors`);
+version they were measured on (26 and 27, `DisplayPower.measuredDisplayServicesMajors`);
 a C symbol carries no type information, so on any other major the display
 is left alone until someone measures again. The `KeyboardBrightnessClient`
 methods are read through the Objective-C runtime and compared with the type
