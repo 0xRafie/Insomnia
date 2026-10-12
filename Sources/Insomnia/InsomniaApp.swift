@@ -85,13 +85,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = StatusItemController(manager: manager, status: status) { [weak settings] in
             settings?.show()
         }
-        Task { await manager.reconcile() }
-        // `Insomnia --session` from a script or an agent: queued behind
-        // reconcile like any menu action.
         sessionCommands.onRequest = { [manager] request in
             Task { await manager.serve(request) }
         }
-        sessionCommands.start(directory: manager.paths.appSupport, file: manager.paths.sessionCommandFile)
+        Task {
+            await manager.reconcile()
+            // `Insomnia --session` from a script or an agent, once reconcile
+            // has adopted or cleared what it found, so no request is
+            // answered against a session that is about to resume.
+            sessionCommands.start(directory: manager.paths.appSupport, file: manager.paths.sessionCommandFile)
+        }
     }
 
     /// Quitting always ends the session (spec 1). Terminate is deferred until

@@ -10,6 +10,8 @@ enum SessionCommand: Equatable, Sendable {
     case start(seconds: Int)
     case extend(seconds: Int)
     case end
+
+    static let alreadyRunning = "a session is already running; use extend"
 }
 
 /// One command as it travels through `Paths.sessionCommandFile`: a single
@@ -80,23 +82,44 @@ struct SessionCommandReply: Codable, Equatable, Sendable {
 }
 
 extension SessionManager {
-    /// Runs `command` like its menu counterpart. nil when it took effect,
-    /// otherwise why not.
+    /// Runs `command` like its menu counterpart. nil when this call took
+    /// effect, otherwise why not. Only a failure recorded during this call
+    /// is given as the reason; an older `lastError` is about something else.
     func run(_ command: SessionCommand) async -> String? {
+        let fails = failCount
+        var reason: String? { failCount == fails ? nil : lastError }
         switch command {
         case let .start(seconds):
-            if session != nil { return "a session is already running; use extend" }
-            await start(duration: TimeInterval(seconds))
-            return isActive ? nil : (lastError ?? "the session did not start")
+            if session != nil { return SessionCommand.alreadyRunning }
+            if await tryStart(duration: TimeInterval(seconds)) { return nil }
+            if session != nil { return SessionCommand.alreadyRunning }
+            return reason ?? "the session did not start; see the log"
         case let .extend(seconds):
-            guard let before = session else { return "no session is running" }
-            await extend(by: TimeInterval(seconds))
-            if let after = session, after.endsAt > before.endsAt { return nil }
-            return lastError ?? "the session was not extended"
+            // A start still queued or in flight has no session yet.
+            if session == nil { await waitForQueuedWork() }
+            guard session != nil else { return "no session is running" }
+            if await tryExtend(by: TimeInterval(seconds)) { return nil }
+            if session == nil { return "the session ended first" }
+            return reason ?? "the session was not extended; it may already be as long as a session can be"
         case .end:
-            guard isActive else { return nil }
-            let outcome = await end(reason: .user)
-            return isActive ? "the session has not ended yet (\(outcome))" : nil
+            // A start still queued or in flight would run on after this
+            // answer; wait for it and end what it started.
+            if session == nil { await waitForQueuedWork() }
+            guard session != nil else { return nil }
+            switch await end(reason: .user) {
+            case .restored:
+                return nil
+            case .incomplete:
+                return reason ?? "the session ended, but not every change is undone yet; see the log"
+            case .locked:
+                return "the recovery lock is held by another process, so nothing changed; Insomnia retries the end"
+            case .sessionRetained:
+                return "session.json could not be removed; Insomnia retries the end"
+            case .journalUnreadable:
+                return "state.json cannot be read, so nothing was undone; see the log"
+            case let .privilegedCommandRunning(pid):
+                return "a sudo pmset (pid \(pid)) is still running; the end finishes when it exits"
+            }
         }
     }
 
@@ -114,18 +137,20 @@ extension SessionManager {
 }
 
 /// Watches the support directory for `Paths.sessionCommandFile` and hands
-/// each request to `onRequest` on the main actor. Runs for as long as the
-/// app does, with or without a session. The file is the same trust
-/// boundary as config.json and the simulate-lid trigger: only this user can
-/// write the directory. A request is served only while it is fresh: one
-/// written more than `SessionCommandLine.staleAfter` seconds before the app
-/// reads it is claimed, logged and dropped, never run, because the command
-/// line that wrote it has given up by then.
+/// each request to `onRequest` on the main actor. AppDelegate starts it once
+/// the launch reconcile has run, and it runs for as long as the app does,
+/// with or without a session. The file is the same trust boundary as
+/// config.json and the simulate-lid trigger: only this user can write the
+/// directory. A request is served only while it is fresh: one written more
+/// than `SessionCommandLine.staleAfter` seconds before the app reads it is
+/// claimed, logged and dropped, never run, because the command line that
+/// wrote it has given up by then.
 @MainActor
 final class SessionCommandWatcher {
     var onRequest: ((SessionRequest) -> Void)?
 
     private var source: (any DispatchSourceFileSystemObject)?
+    private var directory: URL?
     private var file: URL?
     private let now: () -> Date
 
@@ -135,14 +160,11 @@ final class SessionCommandWatcher {
 
     func start(directory: URL, file: URL) {
         guard source == nil else { return }
+        self.directory = directory
         self.file = file
-        // Answers left from before this launch have nobody waiting: a
-        // command line waits only while the app that took its request runs.
-        let prefix = file.lastPathComponent + ".reply."
-        let names = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
-        for name in names where name.hasPrefix(prefix) {
-            try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))
-        }
+        // Nobody waits for an answer from before this launch: a command
+        // line waits only while the app that took its request runs.
+        removeAnswers(olderThan: 0)
         let fd = open(directory.path, O_EVTONLY)
         guard fd >= 0 else {
             Log.error("session command: cannot watch \(directory.path): \(String(cString: strerror(errno)))")
@@ -155,14 +177,14 @@ final class SessionCommandWatcher {
         s.setCancelHandler { close(fd) }
         source = s
         s.resume()
-        // A request written while the app was launching has no directory
-        // event of its own.
+        // A request written before the watch began has no event of its own.
         consume()
     }
 
     func stop() {
         source?.cancel()
         source = nil
+        directory = nil
         file = nil
     }
 
@@ -180,6 +202,9 @@ final class SessionCommandWatcher {
                 Log.error("session command: ignoring \"\(text)\" (expected start <seconds>, extend <seconds> or end, then a reply name)")
                 continue
             }
+            // Answers whose command line stopped waiting go with each new
+            // request, so a long-running app does not collect them.
+            removeAnswers(olderThan: SessionCommandLine.replyTimeout)
             onRequest?(request)
         }
     }
@@ -206,6 +231,19 @@ final class SessionCommandWatcher {
         let text = (try? String(contentsOf: claimed, encoding: .utf8)) ?? ""
         return (text.trimmingCharacters(in: .whitespacesAndNewlines), written)
     }
+
+    private func removeAnswers(olderThan age: TimeInterval) {
+        guard let directory, let file else { return }
+        let prefix = file.lastPathComponent + ".reply."
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
+        for name in names where name.hasPrefix(prefix) {
+            let url = directory.appendingPathComponent(name)
+            let written = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+            if now().timeIntervalSince(written ?? .distantPast) >= age {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+    }
 }
 
 /// `Insomnia --session start <seconds> | extend <seconds> | end | status`.
@@ -219,8 +257,8 @@ final class SessionCommandWatcher {
 ///
 /// Prints one line. Exits 0 when the command took effect (and for `status`
 /// whenever session.json can be read), 1 when the app refused the command,
-/// did not take it within `claimTimeout` (it is not running), or did not
-/// answer within `replyTimeout`, and 64 on a usage error.
+/// did not take it within `claimTimeout`, or did not answer within
+/// `replyTimeout`, and 64 on a usage error.
 enum SessionCommandLine {
     static let flag = "--session"
     /// `InsomniaSessionCommandVersion` in Resources/Info.plist. A script
@@ -232,8 +270,9 @@ enum SessionCommandLine {
     /// How long a running app has to take the request before the command
     /// line takes it back.
     static let claimTimeout: TimeInterval = 2
-    /// A request older than this when the app reads it is dropped. Longer
-    /// than `claimTimeout` plus a busy main thread.
+    /// A request older than this when the app reads it is dropped, and a
+    /// command line removes one this old that a killed command line left.
+    /// Longer than `claimTimeout` plus a busy main thread.
     static let staleAfter: TimeInterval = 5
     /// How long the app has to answer. A start arms the backstop and runs
     /// pmset, which has its own 20 s limit, then reads it back.
@@ -245,17 +284,24 @@ enum SessionCommandLine {
         let status: Int32
     }
 
+    /// What runs under this bundle id besides this command line.
+    enum RunningApp: Sendable {
+        case none
+        /// A build whose Info.plist lacks this interface.
+        case older
+        case current
+    }
+
     /// nil when `arguments` (the command line without the executable) do
-    /// not ask for this mode. `appRunning` tells a menu bar app that left
-    /// the request alone (an older build) from no app. `wait` sleeps between
-    /// reads of the files.
+    /// not ask for this mode. `runningApp` explains a request nothing took.
+    /// `wait` sleeps between reads of the files.
     static func run(
         _ arguments: [String],
         paths: Paths = .fromEnvironment(),
         now: () -> Date = Date.init,
         timeZone: TimeZone = .current,
         replyName: String = "\(getpid())-\(UInt32.random(in: .min ... .max))",
-        appRunning: () -> Bool = appIsRunning,
+        runningApp: () -> RunningApp = runningApp,
         wait: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) }
     ) -> Output? {
         guard arguments.first == flag else { return nil }
@@ -274,9 +320,19 @@ enum SessionCommandLine {
 
         let file = paths.sessionCommandFile
         var waited: TimeInterval = 0
+        var mine: ino_t
         do {
-            // Another command line's request still waiting is never replaced.
-            while try !publish(request.text + "\n", at: file) {
+            // Another command line's request still waiting is never
+            // replaced; one a killed command line left goes.
+            while true {
+                if let published = try publish(request.text + "\n", at: file) {
+                    mine = published
+                    break
+                }
+                if let there = stat(file), Date().timeIntervalSince(there.modified) > staleAfter {
+                    _ = takeBack(file, inode: there.inode)
+                    continue
+                }
                 guard waited < claimTimeout else {
                     return failure("another command is still waiting for Insomnia; try again")
                 }
@@ -287,15 +343,20 @@ enum SessionCommandLine {
             return failure("cannot write \(file.path): \(error.localizedDescription)")
         }
 
+        // Only this command line's own file counts: once the app has taken
+        // it, another request may be at the path already.
         waited = 0
-        while FileManager.default.fileExists(atPath: file.path) {
+        while stat(file)?.inode == mine {
             if waited >= claimTimeout {
-                if takeBack(file) {
-                    return failure(appRunning()
-                        ? "the Insomnia that is running did not take the command; it is a version without --session, so quit it and open this one"
-                        : "Insomnia is not running, so nothing took the command; open the app and try again")
+                guard takeBack(file, inode: mine) else { break }  // the app claimed it just now
+                switch runningApp() {
+                case .none:
+                    return failure("Insomnia is not running, so nothing took the command; open the app and try again")
+                case .older:
+                    return failure("the Insomnia that is running is a version without --session; quit it and open the new one")
+                case .current:
+                    return failure("Insomnia did not take the command within \(Int(claimTimeout)) s; it may still be starting, so try again")
                 }
-                break  // the app claimed it just now
             }
             wait(pollInterval)
             waited += pollInterval
@@ -319,20 +380,28 @@ enum SessionCommandLine {
     }
 
     /// `running until <ISO 8601 time> (<remaining> left)` or
-    /// `no session is running`.
+    /// `no session is running`. The remaining time is rounded up to the
+    /// minute, so a session just started for 2m reads 2m, not 1m.
     static func describe(_ session: Session?, now: Date, timeZone: TimeZone) -> String {
         guard let session, !session.isExpired(at: now) else { return "no session is running" }
         let format = ISO8601DateFormatter()
         format.timeZone = timeZone
-        return "running until \(format.string(from: session.endsAt)) (\(SessionMath.formatRemaining(session.remaining(at: now))) left)"
+        let left = (session.remaining(at: now) / 60).rounded(.up) * 60
+        return "running until \(format.string(from: session.endsAt)) (\(SessionMath.formatRemaining(left)) left)"
     }
 
-    /// Whether another process of this bundle runs, that is the menu bar
-    /// app. This command line is not a registered application, and its own
-    /// pid is left out in case it ever is.
-    static func appIsRunning() -> Bool {
-        NSRunningApplication.runningApplications(withBundleIdentifier: Paths.bundleIdentifier)
-            .contains { $0.processIdentifier != getpid() }
+    /// Another process of this bundle id, that is the menu bar app, and
+    /// whether its bundle declares this interface. This command line is not
+    /// a registered application, and its own pid is left out in case it is.
+    static func runningApp() -> RunningApp {
+        let apps = NSRunningApplication.runningApplications(withBundleIdentifier: Paths.bundleIdentifier)
+            .filter { $0.processIdentifier != getpid() }
+        guard let app = apps.first else { return .none }
+        guard let info = app.bundleURL?.appendingPathComponent("Contents/Info.plist"),
+              let plist = NSDictionary(contentsOf: info),
+              plist["InsomniaSessionCommandVersion"] as? Int == version
+        else { return .older }
+        return .current
     }
 
     // MARK: Private
@@ -343,23 +412,34 @@ enum SessionCommandLine {
 
     /// Puts `text` at `file` only when nothing is there, through `link(2)`
     /// from a private file, so two command lines never replace each other's
-    /// request. false when a request is already there.
-    private static func publish(_ text: String, at file: URL) throws -> Bool {
+    /// request. The published file's inode, or nil when a request is there.
+    private static func publish(_ text: String, at file: URL) throws -> ino_t? {
         let tmp = file.appendingPathExtension("tmp.\(getpid())")
         try Data(text.utf8).write(to: tmp)
         defer { unlink(tmp.path) }
-        if link(tmp.path, file.path) == 0 { return true }
+        guard let inode = stat(tmp)?.inode else { throw POSIXError(.EIO) }
+        if link(tmp.path, file.path) == 0 { return inode }
         let code = errno
-        if code == EEXIST { return false }
+        if code == EEXIST { return nil }
         throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
     }
 
-    /// Takes an unclaimed request back so that it cannot run later. false
-    /// when the app claimed it first.
-    private static func takeBack(_ file: URL) -> Bool {
-        let mine = file.appendingPathExtension("taken.\(getpid())")
-        guard rename(file.path, mine.path) == 0 else { return false }
-        unlink(mine.path)
-        return true
+    /// Takes the request at `file` away so that it cannot run later, if it
+    /// is the one with `inode`. A different one taken in a race goes back.
+    /// false when nothing with that inode was taken.
+    private static func takeBack(_ file: URL, inode: ino_t) -> Bool {
+        let taken = file.appendingPathExtension("taken.\(getpid())")
+        guard rename(file.path, taken.path) == 0 else { return false }
+        defer { unlink(taken.path) }
+        if stat(taken)?.inode == inode { return true }
+        _ = link(taken.path, file.path)
+        return false
+    }
+
+    private static func stat(_ url: URL) -> (inode: ino_t, modified: Date)? {
+        var st = Darwin.stat()
+        guard lstat(url.path, &st) == 0 else { return nil }
+        let modified = Date(timeIntervalSince1970: TimeInterval(st.st_mtimespec.tv_sec) + TimeInterval(st.st_mtimespec.tv_nsec) / 1e9)
+        return (st.st_ino, modified)
     }
 }
