@@ -4,16 +4,23 @@
 #
 #   gh api <path>  answers from $FAKE_GH_DIR/<key>.json, where the key is the
 #                  path without the repository prefix and query string, with
-#                  "/" turned into "_" (commits_<sha>_statuses). A list that
-#                  spans pages is <key>.1.json, <key>.2.json and so on;
+#                  "/" turned into "_" (commits_<sha>_statuses). A REST list
+#                  that spans pages is <key>.1.json, <key>.2.json and so on;
 #                  --paginate reads them all, otherwise only the first.
-#                  GraphQL queries read graphql-edits or graphql-threads.
-#                  A <key>.fail file makes the read fail.
+#                  GraphQL queries read graphql-edits or graphql-threads. As
+#                  real gh does, --paginate fetches another GraphQL page only
+#                  while the last one says hasNextPage, and only if the query
+#                  asks for pageInfo and takes $endCursor.
+#                  After each read, a <key>.then.json replaces <key>.json and
+#                  a <key>.then.then.json moves up behind it, so a test can
+#                  change an answer between reads. A <key>.fail file makes
+#                  the read fail.
 #   --jq           runs through jq -r once per page, as gh does.
 #   -X POST statuses/<sha>
 #                  logs the post to $FAKE_GH_DIR/posts and adds the status,
 #                  as $FAKE_GH_LOGIN, to the front of that commit's statuses.
-#   gh pr ...      logs the arguments to $FAKE_GH_DIR/pr-calls.
+#   gh pr ..., gh workflow ...
+#                  log their arguments to $FAKE_GH_DIR/calls.
 #
 # Runs under macOS /bin/bash 3.2; needs jq.
 
@@ -27,13 +34,14 @@ fail() {
   exit 1
 }
 
-if [ "${1:-}" = pr ]; then
-  shift
-  printf '%s\n' "$*" >>"$dir/pr-calls"
-  exit 0
-fi
-[ "${1:-}" = api ] || fail "unexpected command: $*"
-shift
+case ${1:-} in
+  pr | workflow)
+    printf '%s\n' "$*" >>"$dir/calls"
+    exit 0
+    ;;
+  api) shift ;;
+  *) fail "unexpected command: $*" ;;
+esac
 
 paginate=no method=GET filter='' path='' query='' state='' context='' description='' target_url=''
 while [ $# -gt 0 ]; do
@@ -70,10 +78,12 @@ done
 
 path=${path%%\?*}
 path=${path#repos/"${GH_REPO:?}"/}
+graphql=no
 if [ "$path" = graphql ]; then
+  graphql=yes
   case $query in
-    *userContentEdits*) key=graphql-edits ;;
-    *reviewThreads*) key=graphql-threads ;;
+    *userContentEdits*) key='graphql-edits' ;;
+    *reviewThreads*) key='graphql-threads' ;;
     *) fail "unexpected GraphQL query: $query" ;;
   esac
 else
@@ -122,6 +132,15 @@ files=$(pages "$key")
 [ -n "$files" ] || fail "no fixture for $key"
 if [ "$paginate" = no ]; then
   files=$(printf '%s\n' "$files" | sed -n 1p)
+elif [ "$graphql" = yes ]; then
+  case $query in
+    *"\$endCursor"*) ;;
+    *) fail "a paginated GraphQL query needs \$endCursor" ;;
+  esac
+  case $query in
+    *pageInfo*) ;;
+    *) files=$(printf '%s\n' "$files" | sed -n 1p) ;;
+  esac
 fi
 while IFS= read -r p; do
   if [ -n "$filter" ]; then
@@ -129,6 +148,16 @@ while IFS= read -r p; do
   else
     cat "$p"
   fi
-done <<EOF
+  if [ "$graphql" = yes ] &&
+    [ "$(jq '[.. | objects | select(has("hasNextPage")) | .hasNextPage][0] // false' "$p")" != true ]; then
+    break
+  fi
+done <<EOF2
 $files
-EOF
+EOF2
+
+cur=$dir/$key
+while [ -f "$cur.then.json" ]; do
+  mv "$cur.then.json" "$cur.json"
+  cur=$cur.then
+done

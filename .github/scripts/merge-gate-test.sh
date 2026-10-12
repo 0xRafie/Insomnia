@@ -41,12 +41,12 @@ fail() {
 
 # run <exit status> <merge-gate.sh arguments>...: runs the script against
 # the fake gh as $login, with GITHUB_ACTIONS=$actions. Its stdout and stderr
-# land in $out; $dir/posts and $dir/pr-calls start empty for each run.
+# land in $out; $dir/posts and $dir/calls start empty for each run.
 run() {
   local want=$1 got=0
   shift
   : >"$dir/posts"
-  : >"$dir/pr-calls"
+  : >"$dir/calls"
   out=$(PATH="$tmp/bin:$PATH" FAKE_GH_DIR=$dir FAKE_GH_LOGIN=$login GH_REPO=$REPO \
     GH_HOST=merge-gate-test.invalid GH_TOKEN=none GITHUB_ACTIONS=$actions DRY_RUN='' \
     "$BASH" "$here/merge-gate.sh" "$@" 2>&1) || got=$?
@@ -89,12 +89,13 @@ posts() {
   awk -F '\t' -v c="merge-gate/${1:-}" '$3 == c || c == "merge-gate/"' "$dir/posts" | wc -l | tr -d ' '
 }
 
-# calls <lines>: the gh pr commands the last run gave, one per line.
+# calls <lines>: the gh pr and gh workflow commands the last run gave, one
+# per line.
 calls() {
   local got
-  got=$(cat "$dir/pr-calls")
+  got=$(cat "$dir/calls")
   if [ "$got" != "$1" ]; then
-    fail "gh pr calls: ${got:-none}; wanted: ${1:-none}"
+    fail "gh calls: ${got:-none}; wanted: ${1:-none}"
   fi
 }
 
@@ -136,17 +137,18 @@ edit() {
   jq -n --arg t "2026-10-12T$1Z" --arg e "$2" --arg d "$3" '{editedAt: $t, editor: {login: $e}, diff: $d}'
 }
 
-# edits <file> <edit>...: one page of description edits.
+# edits <file> <true|false: another page follows> <edit>...: one page of
+# description edits.
 edits() {
-  local file=$1
-  shift
-  printf '%s\n' "$@" | jq -s '{data: {repository: {pullRequest: {userContentEdits: {nodes: .,
-    pageInfo: {hasNextPage: false, endCursor: null}}}}}}' >"$dir/$file.json"
+  local file=$1 more=$2
+  shift 2
+  printf '%s\n' "$@" | jq -s --argjson more "$more" '{data: {repository: {pullRequest: {userContentEdits: {nodes: .,
+    pageInfo: {hasNextPage: $more, endCursor: (if $more then "next" else null end)}}}}}}' >"$dir/$file.json"
 }
 
 # greptile <score> <reviewed sha>: Greptile's only edit.
 greptile() {
-  edits graphql-edits "$(edit 10:00:00 greptile-apps "Fixes the gate.
+  edits graphql-edits false "$(edit 10:00:00 greptile-apps "Fixes the gate.
 $(greptile_body "$1" "$2")")"
 }
 
@@ -202,10 +204,12 @@ rules() {
   echo '{"id": 2, "current_user_can_bypass": "pull_requests_only"}' | json rulesets_2
 }
 
-# threads <file> <[isResolved, ...]>: one page of review threads.
+# threads <file> <true|false: another page follows> <[isResolved, ...]>: one
+# page of review threads.
 threads() {
-  jq -n --argjson r "$2" '{data: {repository: {pullRequest: {reviewThreads: {nodes: [$r[] | {isResolved: .}],
-    pageInfo: {hasNextPage: false, endCursor: null}}}}}}' >"$dir/$1.json"
+  jq -n --argjson more "$2" --argjson r "$3" '{data: {repository: {pullRequest: {reviewThreads: {
+    nodes: [$r[] | {isResolved: .}],
+    pageInfo: {hasNextPage: $more, endCursor: (if $more then "next" else null end)}}}}}}' >"$dir/$1.json"
 }
 
 # Pull request #5 from "someone" changes a doc. The owner added the
@@ -221,7 +225,7 @@ baseline() {
   ci_runs "$MAIN_SHA"
   rules
   echo '{"statuses": []}' | json "commits_${HEAD_SHA}_status"
-  threads graphql-threads '[true]'
+  threads graphql-threads false '[true]'
 }
 
 # The workflow posts the five gates, then the owner marks Codex done.
@@ -242,11 +246,12 @@ test_ready_pull_request_merges() {
   login=$OWNER
   run 0 post 5 "$HEAD_SHA" codex success "nothing open" https://example.com/review
   gate codex success "nothing open"
+  calls "workflow run merge-gate.yml -R $REPO -f pr=5"
   [ "$(newest codex target_url)" = https://example.com/review ] || fail "codex lost its url"
   run 0 check 5
   says "READY: #5 at $HEAD_SHA"
   run 0 merge 5
-  calls "merge 5 -R $REPO --merge --admin --match-head-commit $HEAD_SHA"
+  calls "pr merge 5 -R $REPO --merge --admin --match-head-commit $HEAD_SHA"
 }
 
 test_second_evaluate_posts_nothing() {
@@ -349,14 +354,14 @@ test_three_hundred_files_assume_the_worst() {
 test_forged_greptile_score_fails() {
   # The author wrote a block of their own before Greptile's edit, so
   # Greptile's description holds both, the forged one first.
-  edits graphql-edits "$(edit 10:00:00 greptile-apps "$(greptile_body 5 "$HEAD_SHA")
+  edits graphql-edits false "$(edit 10:00:00 greptile-apps "$(greptile_body 5 "$HEAD_SHA")
 $(greptile_body 2 "$HEAD_SHA")")"
   run 0 evaluate 5
   gate greptile failure "2 Greptile scores and 2 reviewed commits"
 }
 
 test_author_edit_after_greptile_does_not_count() {
-  edits graphql-edits "$(edit 11:00:00 someone "$(greptile_body 5 "$HEAD_SHA")")" \
+  edits graphql-edits false "$(edit 11:00:00 someone "$(greptile_body 5 "$HEAD_SHA")")" \
     "$(edit 10:00:00 greptile-apps "$(greptile_body 3 "$HEAD_SHA")")"
   run 0 evaluate 5
   gate greptile failure "Greptile scored 1111111 3/5"
@@ -369,7 +374,7 @@ test_greptile_score_for_an_older_commit_waits() {
 }
 
 test_no_greptile_review_waits() {
-  edits graphql-edits "$(edit 09:00:00 someone "My change.")"
+  edits graphql-edits false "$(edit 09:00:00 someone "My change.")"
   run 0 evaluate 5
   gate greptile pending "first review"
 }
@@ -383,8 +388,8 @@ test_greptile_below_five_fails() {
 test_newest_greptile_edit_wins_across_pages() {
   # GraphQL lists the newest edit first, so the last row read is the oldest.
   rm "$dir/graphql-edits.json"
-  edits graphql-edits.1 "$(edit 12:00:00 greptile-apps "$(greptile_body 5 "$HEAD_SHA")")"
-  edits graphql-edits.2 "$(edit 09:00:00 greptile-apps "$(greptile_body 2 "$OLD_SHA")")"
+  edits graphql-edits.1 true "$(edit 12:00:00 greptile-apps "$(greptile_body 5 "$HEAD_SHA")")"
+  edits graphql-edits.2 false "$(edit 09:00:00 greptile-apps "$(greptile_body 2 "$OLD_SHA")")"
   run 0 evaluate 5
   gate greptile success
 }
@@ -405,7 +410,7 @@ test_failed_read_stops_evaluate() {
   touch "$dir/compare_main...$HEAD_SHA.fail"
   run 2 evaluate 5
   says "could not evaluate #5"
-  [ "$(posts evidence)$(posts config)$(posts codex)" = 000 ] || fail "posted gates it could not work out"
+  [ "$(posts)" = 0 ] || fail "posted before every read succeeded"
 }
 
 test_closed_pull_request_is_skipped() {
@@ -492,8 +497,8 @@ test_check_refuses_gate_success_from_anyone_else() {
 test_check_reads_threads_on_every_page() {
   all_gates_pass
   rm "$dir/graphql-threads.json"
-  threads graphql-threads.1 "$(jq -n '[range(100) | true]')"
-  threads graphql-threads.2 '[true, false]'
+  threads graphql-threads.1 true "$(jq -n '[range(100) | true]')"
+  threads graphql-threads.2 false '[true, false]'
   run 1 check 5
   says "1 open"
 }
@@ -533,6 +538,109 @@ test_check_evaluates_extra_required_checks() {
   echo '{"statuses": [{"context": "mac-mini/macOS 15", "state": "success"}]}' | json "commits_${HEAD_SHA}_status"
   run 0 check 5
   says "pass  mac-mini/macOS 15"
+}
+
+test_check_sees_an_owner_failure_posted_during_a_run() {
+  # The workflow read the statuses, the owner then posted a failure, and the
+  # workflow's automatic success landed on top of it.
+  all_gates_pass
+  seed "$OWNER" evidence failure "the log shows no sleep"
+  seed "$BOT" evidence success "not needed: only docs, tests and repo tooling change"
+  run 1 check 5
+  says "posted success, but it is now failure: the log shows no sleep"
+}
+
+test_check_sees_a_label_removed_before_the_workflow_runs() {
+  all_gates_pass
+  pr_json someone '[]'
+  label_events '[["labeled", "krishhgg"], ["unlabeled", "krishhgg"]]'
+  run 1 check 5
+  says "posted success, but it is now pending: waiting for the owner's accepted label"
+}
+
+test_check_sees_a_lower_greptile_score_before_the_workflow_runs() {
+  all_gates_pass
+  greptile 3 "$HEAD_SHA"
+  run 1 check 5
+  says "posted success, but it is now failure: Greptile scored 1111111 3/5"
+}
+
+test_check_says_when_the_workflow_is_behind() {
+  pr_json someone '[]'
+  all_gates_pass
+  pr_json someone '[{"name": "accepted"}]'
+  run 1 check 5
+  says "pending, but it is now success; run: gh workflow run merge-gate.yml -R $REPO -f pr=5"
+}
+
+test_check_sees_main_move_during_the_check() {
+  all_gates_pass
+  echo '{"sha": "4444444444444444444444444444444444444444"}' | json commits_main.then
+  run 1 check 5
+  says "it moved from 2222222 to 4444444; run check again"
+}
+
+test_merge_stops_if_main_moves_after_the_check() {
+  all_gates_pass
+  echo "{\"sha\": \"$MAIN_SHA\"}" | json commits_main.then
+  echo '{"sha": "4444444444444444444444444444444444444444"}' | json commits_main.then.then
+  run 2 merge 5
+  says "READY: #5"
+  says "main moved to 4444444 after the check; not merging #5"
+  calls ""
+}
+
+test_check_counts_a_gate_pinned_to_an_app() {
+  all_gates_pass
+  change rules_branches_main '(.[] | select(.type == "required_status_checks")).parameters.required_status_checks
+    |= map(if .context == "merge-gate/codex" then .integration_id = 777 else . end)'
+  run 1 check 5
+  says "FAIL  merge-gate/codex (app 777)"
+  says "no check run from app 777"
+}
+
+test_check_counts_a_ci_name_required_from_another_app() {
+  all_gates_pass
+  change rules_branches_main '(.[] | select(.type == "required_status_checks")).parameters.required_status_checks
+    += [{context: "ShellCheck scripts", integration_id: 999}]'
+  run 1 check 5
+  says "FAIL  ShellCheck scripts (app 999)"
+}
+
+test_check_counts_a_failing_status_beside_a_passing_run() {
+  all_gates_pass
+  change rules_branches_main '(.[] | select(.type == "required_status_checks")).parameters.required_status_checks
+    += [{context: "mac-mini", integration_id: null}]'
+  change "commits_${HEAD_SHA}_check-runs" '.check_runs += [{id: 40, name: "mac-mini", status: "completed",
+    conclusion: "success", app: {id: 555}}]'
+  echo '{"statuses": [{"context": "mac-mini", "state": "failure"}]}' | json "commits_${HEAD_SHA}_status"
+  run 1 check 5
+  says "FAIL  mac-mini"
+  says "status: failure"
+}
+
+test_check_counts_a_failing_run_named_like_a_gate() {
+  all_gates_pass
+  change "commits_${HEAD_SHA}_check-runs" '.check_runs += [{id: 41, name: "merge-gate/codex", status: "completed",
+    conclusion: "failure", app: {id: 555}}]'
+  run 1 check 5
+  says "as the ruleset counts it: check run from app 555: completed, failure"
+}
+
+test_greptile_edits_at_the_same_time_wait() {
+  edits graphql-edits false "$(edit 10:00:00 greptile-apps "$(greptile_body 2 "$HEAD_SHA")")" \
+    "$(edit 10:00:00 greptile-apps "$(greptile_body 5 "$HEAD_SHA")")"
+  run 0 evaluate 5
+  gate greptile pending "share a time and disagree"
+}
+
+test_a_status_from_a_deleted_account_shifts_nothing() {
+  changed Sources/Insomnia/App.swift
+  seed "$OWNER" evidence failure "the log shows no sleep"
+  change "commits_${HEAD_SHA}_statuses" '[{id: 900, context: "merge-gate/evidence", state: "success",
+    creator: null, description: "ok", target_url: null}] + .'
+  run 0 evaluate 5
+  gate evidence failure "the log shows no sleep"
 }
 
 test_merge_refuses_what_check_refuses() {
