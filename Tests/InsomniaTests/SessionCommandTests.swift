@@ -195,6 +195,17 @@ final class SessionCommandTests: XCTestCase {
         XCTAssertEqual(Double(app.waits) * SessionCommandLine.pollInterval, SessionCommandLine.claimTimeout, accuracy: 0.5)
     }
 
+    func testARunningAppThatTakesNothingIsNamedAsAnOlderVersion() throws {
+        let app = FakeRunningApp()
+        app.takes = false
+
+        let output = try XCTUnwrap(commandLine(["end"], app: app, appRunning: true))
+
+        XCTAssertEqual(output.status, 1)
+        XCTAssertTrue(output.lines.first?.contains("version without --session") == true, "\(output.lines)")
+        XCTAssertFalse(exists(h.home.paths.sessionCommandFile))
+    }
+
     func testATakenRequestWithNoAnswerTimesOut() throws {
         let app = FakeRunningApp()
         app.answer = nil
@@ -237,10 +248,12 @@ final class SessionCommandTests: XCTestCase {
 
     // MARK: Helpers
 
-    private func commandLine(_ words: [String], app: FakeRunningApp = FakeRunningApp()) -> SessionCommandLine.Output? {
+    private func commandLine(_ words: [String], app: FakeRunningApp = FakeRunningApp(), appRunning: Bool = false) -> SessionCommandLine.Output? {
         let paths = h.home.paths
         let now = h.clock.now
-        return SessionCommandLine.run(["--session"] + words, paths: paths, now: { now }, timeZone: utc, replyName: "9-9") { _ in
+        return SessionCommandLine.run(
+            ["--session"] + words, paths: paths, now: { now }, timeZone: utc, replyName: "9-9", appRunning: { appRunning }
+        ) { _ in
             app.wait(paths: paths)
         }
     }

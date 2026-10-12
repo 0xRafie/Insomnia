@@ -1,3 +1,4 @@
+import AppKit
 import Darwin
 import Foundation
 
@@ -241,13 +242,16 @@ enum SessionCommandLine {
     }
 
     /// nil when `arguments` (the command line without the executable) do
-    /// not ask for this mode. `wait` sleeps between reads of the files.
+    /// not ask for this mode. `appRunning` tells a menu bar app that left
+    /// the request alone (an older build) from no app. `wait` sleeps between
+    /// reads of the files.
     static func run(
         _ arguments: [String],
         paths: Paths = .fromEnvironment(),
         now: () -> Date = Date.init,
         timeZone: TimeZone = .current,
         replyName: String = "\(getpid())-\(UInt32.random(in: .min ... .max))",
+        appRunning: () -> Bool = appIsRunning,
         wait: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) }
     ) -> Output? {
         guard arguments.first == flag else { return nil }
@@ -283,7 +287,9 @@ enum SessionCommandLine {
         while FileManager.default.fileExists(atPath: file.path) {
             if waited >= claimTimeout {
                 if takeBack(file) {
-                    return failure("Insomnia is not running, so nothing took the command; open the app and try again")
+                    return failure(appRunning()
+                        ? "the Insomnia that is running did not take the command; it is a version without --session, so quit it and open this one"
+                        : "Insomnia is not running, so nothing took the command; open the app and try again")
                 }
                 break  // the app claimed it just now
             }
@@ -315,6 +321,14 @@ enum SessionCommandLine {
         let format = ISO8601DateFormatter()
         format.timeZone = timeZone
         return "running until \(format.string(from: session.endsAt)) (\(SessionMath.formatRemaining(session.remaining(at: now))) left)"
+    }
+
+    /// Whether another process of this bundle runs, that is the menu bar
+    /// app. This command line is not a registered application, and its own
+    /// pid is left out in case it ever is.
+    static func appIsRunning() -> Bool {
+        NSRunningApplication.runningApplications(withBundleIdentifier: Paths.bundleIdentifier)
+            .contains { $0.processIdentifier != getpid() }
     }
 
     // MARK: Private
