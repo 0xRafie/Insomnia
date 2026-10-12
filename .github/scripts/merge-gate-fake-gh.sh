@@ -7,6 +7,8 @@
 #                  "/" turned into "_" (commits_<sha>_statuses). A REST list
 #                  that spans pages is <key>.1.json, <key>.2.json and so on;
 #                  --paginate reads them all, otherwise only the first.
+#                  A commit's combined status (commits_<sha>_status) comes
+#                  from its statuses, not from a file.
 #                  GraphQL queries read graphql-edits or graphql-threads. As
 #                  real gh does, --paginate fetches another GraphQL page only
 #                  while the last one says hasNextPage, and only if the query
@@ -128,6 +130,16 @@ fi
 
 [ "$method" = GET ] || fail "unexpected method $method"
 [ ! -f "$dir/$key.fail" ] || fail "reading $key failed"
+# A commit's combined status holds the newest status for each context
+# among the commit's statuses, as GitHub works it out.
+case $key in
+  commits_*_status)
+    statuses=$(pages "${key}es")
+    printf '%s\n' "$statuses" | while IFS= read -r p; do
+      [ -z "$p" ] || cat "$p"
+    done | jq -s '{statuses: ([.[][]] | group_by(.context) | map(max_by(.id)))}' >"$dir/$key.json"
+    ;;
+esac
 files=$(pages "$key")
 [ -n "$files" ] || fail "no fixture for $key"
 if [ "$paginate" = no ]; then

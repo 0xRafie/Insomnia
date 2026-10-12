@@ -113,8 +113,25 @@ change() {
 # seed <login> <gate> <state> <description> [url]: a status someone posted on
 # the head before the run under test.
 seed() {
+  other_status "$1" "merge-gate/$2" "$3" "$4" "${5:-}"
+}
+
+# other_status <login> <context> <state> [description] [url]: a status with
+# any name someone posted on the head.
+other_status() {
   FAKE_GH_DIR=$dir FAKE_GH_LOGIN=$1 GH_REPO=$REPO "$tmp/bin/gh" api -X POST "repos/$REPO/statuses/$HEAD_SHA" \
-    -f state="$3" -f context="merge-gate/$2" -f description="$4" -f target_url="${5:-}" >/dev/null
+    -f state="$3" -f context="$2" -f description="${4:-}" -f target_url="${5:-}" >/dev/null
+}
+
+# later <key> <command>...: what the command makes of <key>'s response
+# answers from the second read on; the first read gets the current one.
+later() {
+  local key=$1
+  shift
+  cp "$dir/$key.json" "$dir/$key.now"
+  "$@"
+  mv "$dir/$key.json" "$dir/$key.then.json"
+  mv "$dir/$key.now" "$dir/$key.json"
 }
 
 # pr_json <author> <labels> [draft] [mergeable] [state]
@@ -224,7 +241,6 @@ baseline() {
   echo "{\"sha\": \"$MAIN_SHA\"}" | json commits_main
   ci_runs "$MAIN_SHA"
   rules
-  echo '{"statuses": []}' | json "commits_${HEAD_SHA}_status"
   threads graphql-threads false '[true]'
 }
 
@@ -532,10 +548,10 @@ test_check_evaluates_extra_required_checks() {
   all_gates_pass
   change rules_branches_main '(.[] | select(.type == "required_status_checks")).parameters.required_status_checks
     += [{context: "mac-mini/macOS 15", integration_id: null}]'
-  echo '{"statuses": [{"context": "mac-mini/macOS 15", "state": "failure"}]}' | json "commits_${HEAD_SHA}_status"
+  other_status "$OWNER" "mac-mini/macOS 15" failure
   run 1 check 5
   says "FAIL  mac-mini/macOS 15"
-  echo '{"statuses": [{"context": "mac-mini/macOS 15", "state": "success"}]}' | json "commits_${HEAD_SHA}_status"
+  other_status "$OWNER" "mac-mini/macOS 15" success
   run 0 check 5
   says "pass  mac-mini/macOS 15"
 }
@@ -573,20 +589,53 @@ test_check_says_when_the_workflow_is_behind() {
   says "pending, but it is now success; run: gh workflow run merge-gate.yml -R $REPO -f pr=5"
 }
 
+test_check_reports_a_failing_gate_once() {
+  # Codex stays pending. The last read only runs if every row passed, so
+  # the gate does not fail a second time as a change.
+  run 0 evaluate 5
+  run 1 check 5
+  says "FAIL  merge-gate/codex"
+  says "NOT READY: #5 at 1111111, 1 failing"
+}
+
 test_check_sees_main_move_during_the_check() {
   all_gates_pass
   echo '{"sha": "4444444444444444444444444444444444444444"}' | json commits_main.then
   run 1 check 5
-  says "it moved from 2222222 to 4444444; run check again"
+  says "FAIL  nothing changed during this check"
+  says "main moved from 2222222 to 4444444; run check again"
+  says "1 failing"
 }
 
-test_merge_stops_if_main_moves_after_the_check() {
+test_check_sees_an_owner_failure_posted_during_the_check() {
   all_gates_pass
-  echo "{\"sha\": \"$MAIN_SHA\"}" | json commits_main.then
-  echo '{"sha": "4444444444444444444444444444444444444444"}' | json commits_main.then.then
+  later "commits_${HEAD_SHA}_statuses" seed "$OWNER" evidence failure "the log shows no sleep"
+  run 1 check 5
+  says "merge-gate/evidence is now failure; run check again"
+  says "1 failing"
+}
+
+test_check_sees_a_stranger_post_during_the_check() {
+  all_gates_pass
+  later "commits_${HEAD_SHA}_statuses" seed stranger codex success "looks fine"
+  run 1 check 5
+  says "merge-gate/codex is now a success from stranger; run check again"
+}
+
+test_check_sees_the_head_move_during_the_check() {
+  all_gates_pass
+  later pulls_5 change pulls_5 '.head.sha = "5555555555555555555555555555555555555555"'
+  run 1 check 5
+  says "the head moved to 5555555; run check again"
+}
+
+test_merge_stops_if_the_label_goes_during_the_check() {
+  all_gates_pass
+  later pulls_5 pr_json someone '[]'
+  later issues_5_events label_events '[["labeled", "krishhgg"], ["unlabeled", "krishhgg"]]'
   run 2 merge 5
-  says "READY: #5"
-  says "main moved to 4444444 after the check; not merging #5"
+  says "merge-gate/accepted now works out to pending: waiting for the owner's accepted label; run check again"
+  says "NOT READY: #5 at 1111111, 1 failing"
   calls ""
 }
 
@@ -613,10 +662,40 @@ test_check_counts_a_failing_status_beside_a_passing_run() {
     += [{context: "mac-mini", integration_id: null}]'
   change "commits_${HEAD_SHA}_check-runs" '.check_runs += [{id: 40, name: "mac-mini", status: "completed",
     conclusion: "success", app: {id: 555}}]'
-  echo '{"statuses": [{"context": "mac-mini", "state": "failure"}]}' | json "commits_${HEAD_SHA}_status"
+  other_status "$OWNER" mac-mini failure
   run 1 check 5
   says "FAIL  mac-mini"
   says "status: failure"
+}
+
+test_check_counts_a_failing_status_named_like_a_pinned_check() {
+  all_gates_pass
+  other_status "$BOT" "ShellCheck scripts" failure
+  run 1 check 5
+  says "FAIL  ShellCheck scripts (app 15368)"
+  says "as the ruleset counts it: status: failure"
+  says "1 failing"
+  change rules_branches_main '(.[] | select(.type == "required_status_checks")).parameters.required_status_checks
+    += [{context: "mac-mini", integration_id: 555}]'
+  change "commits_${HEAD_SHA}_check-runs" '.check_runs += [{id: 40, name: "mac-mini", status: "completed",
+    conclusion: "success", app: {id: 555}}]'
+  other_status "$OWNER" mac-mini failure
+  run 1 check 5
+  says "FAIL  mac-mini (app 555)"
+  says "2 failing"
+}
+
+test_an_owner_description_is_restored_once() {
+  # A backslash and a tab used to come back escaped, so every run posted
+  # the owner's decision again.
+  changed Sources/Insomnia/App.swift
+  seed "$OWNER" evidence success 'report\checked	on 26.1'
+  seed "$BOT" evidence pending "waiting for a real-Mac report"
+  run 0 evaluate 5
+  gate evidence success 'report\checked on 26.1'
+  [ "$(posts evidence)" = 1 ] || fail "restored the owner's decision $(posts evidence) times, not once"
+  run 0 evaluate 5
+  [ "$(posts)" = 0 ] || fail "the second run posted $(posts) statuses, not 0"
 }
 
 test_check_counts_a_failing_run_named_like_a_gate() {
