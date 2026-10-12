@@ -103,8 +103,10 @@ recovery; newly written journals use `frozenProcesses`.
   Right-click opens the status, browser actions, Settings, and Quit menu.
 - Session start: write session + state to disk, arm the launchd backstop, and
   only then run `sudo pmset -a disablesleep 1`. A session never starts unless
-  the backstop is armed. If pmset fails, delete the session file and surface
-  the error. The journal and backstop always exist before sleep is disabled.
+  the backstop is armed. If pmset fails, or `pmset -g` no longer reads
+  SleepDisabled 1 five seconds after pmset exits 0 (macOS 26.6.2 sets it back
+  to 0 after about 2 s), delete the session file and surface the error. The
+  journal and backstop always exist before sleep is disabled.
 - Session end (timer, End now, Quit, battery floor, thermal critical):
   `sudo pmset -a disablesleep 0`, undo every RuntimeState entry, delete
   session, notify.
@@ -154,7 +156,7 @@ The display and keyboard rows go through private frameworks with no ABI
 contract: the DisplayServices C functions and CoreBrightness's
 `KeyboardBrightnessClient`. Two guards run once per launch, before the
 first call. The DisplayServices functions are called only on a macOS major
-version they were measured on (26, `DisplayPower.measuredDisplayServicesMajors`);
+version they were measured on (26 and 27, `DisplayPower.measuredDisplayServicesMajors`);
 a C symbol carries no type information, so on any other major the display
 is left alone until someone measures again. The `KeyboardBrightnessClient`
 methods are read through the Objective-C runtime and compared with the type

@@ -19,7 +19,7 @@ The display step exists because the sleep guard stops macOS from doing it:
 with sleep disabled, closing the lid no longer turns the panel or the keys off
 by itself. Insomnia sets both to zero and restores them when the lid opens.
 Both go through private macOS frameworks. The display calls run only on a
-macOS major version they were measured on (26). The keyboard calls run only
+macOS major version they were measured on (26 and 27). The keyboard calls run only
 while the private keyboard class has the method signatures measured on 26,
 on whatever version. If either check refuses a device, Insomnia leaves it
 alone and Settings says why under the toggle. A level saved before an update
