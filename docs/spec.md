@@ -111,6 +111,20 @@ recovery; newly written journals use `frozenProcesses`.
   `sudo pmset -a disablesleep 0`, undo every RuntimeState entry, delete
   session, notify.
 - Quitting Insomnia always ends the session. There is no "keep awake after quit".
+- `Insomnia --session start <seconds> | extend <seconds> | end | status` runs
+  the same actions from a script or an agent (`SessionCommand.swift`). The
+  command line writes one request, `start <seconds> <reply>`,
+  `extend <seconds> <reply>` or `end <reply>`, to `session-command` in the
+  support directory. It links the file in, so it never replaces another
+  request that is still waiting. The running app watches the directory,
+  claims the file by renaming it, runs the request like the matching menu
+  action, and answers in `session-command.reply.<reply>`. The command line
+  prints the session or the app's reason and exits 0 or 1. A request that
+  nothing claims within 2 s is taken back, because the app is not running,
+  and a request older than 5 s when the app reads it is dropped, so one left
+  behind never starts a session later. `status` only reads session.json. The
+  file is the same trust boundary as config.json: only this user can write
+  the directory, and anyone who can write it already controls the app.
 
 ### 2. Sleep guard and root access
 
@@ -1233,6 +1247,7 @@ Insomnia/
       LidActions.swift
       Log.swift
       ProcessControl.swift
+      SessionCommand.swift
       SessionManager.swift
       SessionMath.swift
       Shell.swift

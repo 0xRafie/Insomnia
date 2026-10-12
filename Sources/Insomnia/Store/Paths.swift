@@ -88,6 +88,12 @@ struct Paths: Sendable, Equatable {
     /// Written by scripts/simulate-lid.sh ("closed" or "open") to drive the
     /// lid-close action path without touching the hinge. See LidSimulation.
     var simulateLidFile: URL { appSupport.appendingPathComponent("simulate-lid") }
+    /// Where `Insomnia --session` puts one request for the running app
+    /// (`SessionCommandWatcher`), and where the app answers it.
+    var sessionCommandFile: URL { appSupport.appendingPathComponent("session-command") }
+    func sessionCommandReply(_ name: String) -> URL {
+        appSupport.appendingPathComponent("session-command.reply.\(name)")
+    }
 
     /// Both logs are owner-only and rotate to `<name>.1` past
     /// `OwnerOnly.maxLogBytes`; uninstall.sh --purge removes the `.1` too.

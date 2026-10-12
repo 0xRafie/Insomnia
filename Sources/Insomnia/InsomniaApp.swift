@@ -25,6 +25,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let loginItem = LoginItem()
     private var statusItem: StatusItemController?
     private var settingsWindow: SettingsWindow?
+    private let sessionCommands = SessionCommandWatcher()
     private var terminating = false
 
     override init() {
@@ -85,6 +86,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             settings?.show()
         }
         Task { await manager.reconcile() }
+        // `Insomnia --session` from a script or an agent: queued behind
+        // reconcile like any menu action.
+        sessionCommands.onRequest = { [manager] request in
+            Task { await manager.serve(request) }
+        }
+        sessionCommands.start(directory: manager.paths.appSupport, file: manager.paths.sessionCommandFile)
     }
 
     /// Quitting always ends the session (spec 1). Terminate is deferred until
