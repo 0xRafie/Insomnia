@@ -15,6 +15,7 @@
 </p>
 
 <p align="center">
+  <a href="https://getinsomnia.app"><strong>Website</strong></a> ·
   <a href="#install"><strong>Install</strong></a> ·
   <a href="#using-it"><strong>Using it</strong></a> ·
   <a href="#what-happens-when-the-lid-closes"><strong>Lid close</strong></a> ·
