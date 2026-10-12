@@ -1648,7 +1648,7 @@ final class RecoveryScriptTests: XCTestCase {
                 try ScriptFixture.infoPlist(resumeFrozenVersion: version).write(to: f.appInfo, atomically: true, encoding: .utf8)
                 let copy = sealed ? f.installedBackstop : f.legacyBackstop
                 if !sealed { try FileManager.default.removeItem(at: f.installedBackstop) }
-                try "printf 'installed backstop %s\\n' \"$*\" >> '\(f.callsLog.path)'\n".write(to: copy, atomically: true, encoding: .utf8)
+                try TestScripts.write("printf 'installed backstop %s\\n' \"$*\" >> '\(f.callsLog.path)'\n", to: copy, executable: false)
                 try f.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
 
                 let r = try f.run(f.uninstall)
@@ -1673,7 +1673,7 @@ final class RecoveryScriptTests: XCTestCase {
             try f.installMachinery()
             if installedCopy {
                 for copy in [f.installedBackstop, f.legacyBackstop] {
-                    try "printf 'installed backstop %s\\n' \"$*\" >> '\(f.callsLog.path)'\n".write(to: copy, atomically: true, encoding: .utf8)
+                    try TestScripts.write("printf 'installed backstop %s\\n' \"$*\" >> '\(f.callsLog.path)'\n", to: copy, executable: false)
                 }
             } else {
                 try FileManager.default.removeItem(at: f.installedBackstop)
@@ -3915,7 +3915,7 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":true,"frozenProcesses":[],"dockerFrozen":false}"#)
         let sentinelScript = fx.root.appendingPathComponent("sentinel.sh")
-        try "exec /bin/sleep 120\n".write(to: sentinelScript, atomically: true, encoding: .utf8)
+        try TestScripts.write("exec /bin/sleep 120\n", to: sentinelScript, executable: false)
         let sentinel = try fx.spawn(sentinelScript)
         defer {
             _ = sentinel.signal(SIGTERM)
@@ -4628,7 +4628,7 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         fx.setMode("launchctl", "loaded")
         let wrapper = fx.root.appendingPathComponent("umask-002.sh")
-        try "umask 0002\nexec /bin/bash \"\(fx.installRedirected.path)\" \"$@\"\n".write(to: wrapper, atomically: true, encoding: .utf8)
+        try TestScripts.write("umask 0002\nexec /bin/bash \"\(fx.installRedirected.path)\" \"$@\"\n", to: wrapper, executable: false)
 
         let r = try fx.run(wrapper, extraEnvironment: ["USER": "tester"])
 

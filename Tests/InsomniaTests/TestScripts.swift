@@ -11,10 +11,13 @@ import Foundation
 /// there, once per distinct text. UUIDs (the per-test temp folders) are
 /// replaced with zeros first, so a fake that every fixture writes lands
 /// once. A copy is named after the script and a hash of that text, and
-/// index.tsv gives the source line that first wrote it.
+/// index.tsv gives the source line that first wrote it. A script with no
+/// `#!` line is one a test runs with /bin/bash, so its copy starts with a
+/// `# shellcheck shell=bash` line.
 ///
-/// Patched copies of the real scripts in scripts/ do not go through here;
-/// the ShellCheck job lints the originals.
+/// Patched copies of the real scripts in scripts/, and harnesses built
+/// from functions cut out of them, do not go through here; the ShellCheck
+/// job lints the originals.
 enum TestScripts {
     static let dumpKey = "INSOMNIA_TEST_SCRIPT_DUMP"
 
@@ -41,7 +44,8 @@ enum TestScripts {
         let normalized = uuid.stringByReplacingMatches(
             in: text, range: NSRange(text.startIndex..., in: text),
             withTemplate: "00000000-0000-0000-0000-000000000000")
-        let hash = SHA256.hash(data: Data(normalized.utf8)).prefix(6).map { String(format: "%02x", $0) }.joined()
+        let lintable = normalized.hasPrefix("#!") ? normalized : "# shellcheck shell=bash\n" + normalized
+        let hash = SHA256.hash(data: Data(lintable.utf8)).prefix(6).map { String(format: "%02x", $0) }.joined()
         let copy = dir.appendingPathComponent("\(name)-\(hash)")
 
         lock.lock()
@@ -49,7 +53,8 @@ enum TestScripts {
         let fm = FileManager.default
         guard !fm.fileExists(atPath: copy.path) else { return }
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        try normalized.write(to: copy, atomically: true, encoding: .utf8)
+        // The index line goes first: a copy the index does not name would
+        // never be linted, while an index line with no copy fails the lint.
         let index = dir.appendingPathComponent("index.tsv")
         if !fm.fileExists(atPath: index.path) {
             try Data().write(to: index)
@@ -58,5 +63,6 @@ enum TestScripts {
         defer { try? handle.close() }
         try handle.seekToEnd()
         try handle.write(contentsOf: Data("\(copy.lastPathComponent)\t\(source)\n".utf8))
+        try lintable.write(to: copy, atomically: true, encoding: .utf8)
     }
 }

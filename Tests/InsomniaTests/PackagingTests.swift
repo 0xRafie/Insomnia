@@ -748,13 +748,10 @@ private struct IconScriptFixture {
         try text.write(to: script, atomically: true, encoding: .utf8)
         try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
 
-        try writeFake("swiftc", #"""
-        out=""
-        while [ $# -gt 0 ]; do
-          if [ "$1" = "-o" ]; then out="$2"; shift; fi
-          shift
-        done
-        cat > "$out" <<'GENERATOR'
+        // The generator the fake swiftc "compiles": its own file, so it is
+        // linted like the fakes, copied to swiftc's -o path.
+        let generator = root.appendingPathComponent("icon-generator")
+        try TestScripts.write(#"""
         #!/bin/bash
         set -e
         while [ $# -gt 0 ]; do
@@ -766,9 +763,17 @@ private struct IconScriptFixture {
           esac
           shift 2
         done
-        GENERATOR
+
+        """#, to: generator, executable: false)
+        try writeFake("swiftc", """
+        out=""
+        while [ $# -gt 0 ]; do
+          if [ "$1" = "-o" ]; then out="$2"; shift; fi
+          shift
+        done
+        cat '\(generator.path)' > "$out"
         chmod +x "$out"
-        """#)
+        """)
         try writeFake("iconutil", """
         [ -e '\(root.appendingPathComponent("iconutil-fails").path)' ] && exit 1
         [ "$1" = -c ] && [ "$2" = icns ] && [ -d "$3" ] && [ "$4" = -o ] || exit 2
