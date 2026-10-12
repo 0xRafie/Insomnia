@@ -629,6 +629,72 @@ test_check_sees_the_head_move_during_the_check() {
   says "the head moved to 5555555; run check again"
 }
 
+test_check_sees_the_pull_request_change_during_the_check() {
+  all_gates_pass
+  later pulls_5 change pulls_5 '.draft = true'
+  run 1 check 5
+  says "the pull request is now a draft; run check again"
+  pr_json someone '[{"name": "accepted"}]'
+  later pulls_5 change pulls_5 '.base.ref = "release"'
+  run 1 check 5
+  says "the pull request is now open into release; run check again"
+  pr_json someone '[{"name": "accepted"}]'
+  later pulls_5 change pulls_5 '.mergeable = null'
+  run 1 check 5
+  says "GitHub now gives mergeable as null; run check again"
+}
+
+test_an_owner_failure_in_capitals_counts() {
+  # GitHub treats MERGE-GATE/Evidence as merge-gate/evidence.
+  changed Sources/Insomnia/App.swift
+  seed "$OWNER" evidence success "report checked"
+  seed "$BOT" evidence pending "waiting for a real-Mac report"
+  other_status "$OWNER" MERGE-GATE/Evidence failure "the log shows no sleep"
+  run 0 evaluate 5
+  [ "$(posts evidence)" = 0 ] || fail "posted evidence $(posts evidence) times over the owner's failure"
+  run 1 check 5
+  says "FAIL  merge-gate/evidence                      failure: the log shows no sleep [krishhgg]"
+}
+
+test_check_counts_a_ci_status_in_lower_case() {
+  all_gates_pass
+  other_status "$BOT" "shellcheck scripts" failure
+  run 1 check 5
+  says "FAIL  ShellCheck scripts (app 15368)"
+  says "as the ruleset counts it: status: failure"
+}
+
+test_check_runs_match_in_any_case_but_count_only_by_name() {
+  all_gates_pass
+  change rules_branches_main '(.[] | select(.type == "required_status_checks")).parameters.required_status_checks
+    += [{context: "mac-mini", integration_id: null}]'
+  change "commits_${HEAD_SHA}_check-runs" '.check_runs += [
+    {id: 40, name: "mac-mini", status: "completed", conclusion: "success", app: {id: 555}},
+    {id: 41, name: "Mac-Mini", status: "completed", conclusion: "failure", app: {id: 555}}]'
+  run 1 check 5
+  says "FAIL  mac-mini                                 check run from app 555: completed, failure"
+  change "commits_${HEAD_SHA}_check-runs" '.check_runs |= map(select(.id != 40)) | .check_runs[-1].conclusion = "success"'
+  run 1 check 5
+  says "FAIL  mac-mini                                 no check run or status"
+  change "commits_${HEAD_SHA}_check-runs" '.check_runs = [.check_runs[] | select(.name != "Mac-Mini")] + [
+    {id: 42, name: "mac-mini", status: "completed", conclusion: "success", app: {id: 555}},
+    {id: 43, name: "MAC-MINI", status: "completed", conclusion: "failure", app: {id: 556}}]'
+  run 1 check 5
+  says "FAIL  mac-mini                                 check run from app 556: completed, failure"
+}
+
+test_check_fails_if_any_status_with_the_name_fails() {
+  # GitHub's combined status should list a context once in any case; if it
+  # lists two, a failure in either counts.
+  all_gates_pass
+  change rules_branches_main '(.[] | select(.type == "required_status_checks")).parameters.required_status_checks
+    += [{context: "mac-mini", integration_id: null}]'
+  echo '{"statuses": [{"context": "Mac-Mini", "state": "failure"}, {"context": "mac-mini", "state": "success"}]}' |
+    json "commits_${HEAD_SHA}_status"
+  run 1 check 5
+  says "FAIL  mac-mini                                 status: failure"
+}
+
 test_merge_stops_if_the_label_goes_during_the_check() {
   all_gates_pass
   later pulls_5 pr_json someone '[]'

@@ -56,9 +56,10 @@
 #       merge with the current main without changing the head.
 #   merge-gate.sh merge <pr>
 #       Runs check, then merges with a merge commit. GitHub refuses the merge
-#       if the head moved after the check; a change to main, a label or a
-#       gate in the second between the check's last read and the merge does
-#       not stop it.
+#       if the head moved after the check, or if a required check fails by
+#       then. A label removed, a lower Greptile score or a main that moved
+#       in the few seconds of the check's last reads and the merge does not
+#       stop it.
 #
 # Environment: GH_REPO (default krishhgg/Insomnia). DRY_RUN=1 prints the
 # statuses evaluate and post would send instead of sending them.
@@ -137,7 +138,8 @@ post() { # <sha> <context> <state> <description> [url]
   printf '  posted %s %s on %s: %s\n' "$context" "$state" "${sha:0:7}" "$description"
 }
 
-# One line per merge-gate context at a commit, tab-separated: context; the
+# One line per merge-gate context at a commit, tab-separated: context, in
+# lower case since GitHub treats MERGE-GATE/codex as merge-gate/codex; the
 # newest status's state, creator, description and url; then the state,
 # description and url of the newest one the owner posted ("none" if none).
 # An empty creator (a deleted account), description or url reads "-": read
@@ -151,8 +153,8 @@ gate_statuses() {
   local rows
   rows=$(gh api --paginate "repos/$REPO/commits/$1/statuses?per_page=100" --jq '
     def f: if . == null or . == "" then "-" else . end;
-    .[] | select(.context | startswith("merge-gate/"))
-    | [.id, .context, .state, (.creator.login | f), (.description | f), (.target_url | f)]
+    .[] | select(.context | ascii_downcase | startswith("merge-gate/"))
+    | [.id, (.context | ascii_downcase), .state, (.creator.login | f), (.description | f), (.target_url | f)]
     | map(tostring | gsub("[\t\r\n]"; " ")) | join("\t")') || return 1
   printf '%s\n' "$rows" | sort -n | awk -v owner="$OWNER" '
     BEGIN { FS = OFS = "\t" }
@@ -465,9 +467,11 @@ expected_pair() {
 # (only the named app, if the rule names one) must be a success. So must
 # the newest status with the name, whatever app the rule names: GitHub
 # needs both when a check run and a status share a name, and a status does
-# not say which app posted it, so this fails closed. With "all", at least
-# one check run from the named app, or for a rule that names no app one
-# check run or status, must exist. "runs" looks only at check runs and
+# not say which app posted it, so this fails closed. Names match in any
+# case, as GitHub matches status contexts, but only a check run with the
+# exact name counts as there. With "all", at least one check run from the
+# named app, or for a rule that names no app one check run or status, must
+# exist. "runs" looks only at check runs and
 # "status" only at the status, and neither needs anything to exist; they
 # are for pairs whose rows check_pr prints already cover the rest. Reads
 # $runs and $latest from check_pr.
@@ -475,25 +479,30 @@ required_check() {
   local context=$1 app=$2 mode=${3:-all} apps='' a line status conclusion state seen=no
   if [ "$mode" != status ]; then
     if [ "$app" = - ]; then
-      apps=$(printf '%s\n' "$runs" | awk -F '\t' -v n="$context" '$2 == n { print $5 }' | sort -u)
+      apps=$(printf '%s\n' "$runs" | awk -F '\t' -v n="$context" 'tolower($2) == tolower(n) { print $5 }' | sort -u)
     else
       apps=$app
     fi
   fi
   for a in $apps; do
-    line=$(printf '%s\n' "$runs" | awk -F '\t' -v n="$context" -v a="$a" '$2 == n && $5 == a' | sort -n | tail -n 1)
+    line=$(printf '%s\n' "$runs" | awk -F '\t' -v n="$context" -v a="$a" 'tolower($2) == tolower(n) && $5 == a' |
+      sort -n | tail -n 1)
     [ -n "$line" ] || continue
-    seen=yes
     IFS=$'\t' read -r _ _ status conclusion _ <<<"$line"
     if [ "$conclusion" != success ]; then
       echo "check run from app $a: $status, $conclusion"
       return 0
     fi
+    if printf '%s\n' "$runs" | awk -F '\t' -v n="$context" -v a="$a" '$2 == n && $5 == a { f = 1 } END { exit !f }'; then
+      seen=yes
+    fi
   done
   if [ "$mode" = runs ]; then
     return 0
   fi
-  state=$(printf '%s\n' "$latest" | awk -F '\t' -v c="$context" '$1 == c { print $2 }' | tail -n 1)
+  state=$(printf '%s\n' "$latest" | awk -F '\t' -v c="$context" '
+    $1 == tolower(c) && (s == "" || $2 != "success") { s = $2 }
+    END { print s }')
   if [ -n "$state" ]; then
     if [ "$state" != success ]; then
       echo "status: $state"
@@ -526,15 +535,25 @@ CHECKED_HEAD='' CHECKED_MAIN=''
 
 # still_ready <pr>: reads the pull request, its gates and main again and
 # prints what changed since check_pr read them ("; " between), or nothing:
-# the head or main moved, or a gate's newest status or what it works out to
-# now is no longer a success from the workflow or the owner. Returns 1 if
-# a read fails.
+# the head or main moved, the pull request is no longer open into main,
+# ready and free of conflicts, or a gate's newest status or what it works
+# out to now is no longer a success from the workflow or the owner.
+# Returns 1 if a read fails.
 still_ready() {
   local i gate line gstate creator now problems=''
   read_pr "$1" || return 1
   if [ "$PR_HEAD" != "$CHECKED_HEAD" ]; then
     echo "the head moved to ${PR_HEAD:0:7}"
     return 0
+  fi
+  if [ "$PR_STATE" != open ] || [ "$PR_BASE" != "$BASE" ]; then
+    problems="the pull request is now $PR_STATE into $PR_BASE"
+  fi
+  if [ "$PR_DRAFT" != false ]; then
+    problems="$problems${problems:+; }the pull request is now a draft"
+  fi
+  if [ "$PR_MERGEABLE" != true ]; then
+    problems="$problems${problems:+; }GitHub now gives mergeable as $PR_MERGEABLE"
   fi
   decide_gates "$1" || return 1
   for i in "${!GATES[@]}"; do
@@ -662,7 +681,8 @@ check_pr() {
       else empty end
     | map(tostring) | @tsv') || die "could not read the $BASE rules"
   required=$(printf '%s\n' "$rules" | awk 'BEGIN { FS = OFS = "\t" } $1 == "check" { print $3, $4 }' | sort -u)
-  latest=$(gh api --paginate "repos/$REPO/commits/$head/status?per_page=100" --jq '.statuses[] | [.context, .state] | @tsv') ||
+  latest=$(gh api --paginate "repos/$REPO/commits/$head/status?per_page=100" \
+    --jq '.statuses[] | [(.context | ascii_downcase), .state] | @tsv') ||
     die "could not read statuses"
   # Every required check as GitHub counts it. The rows above already cover
   # a CI job's check run from GitHub Actions and a gate's statuses (the end
@@ -777,10 +797,13 @@ check_pr() {
 # past the ruleset that requires the checks above: that one has no bypass
 # list, and on 2026-10-12 a copy of it refused --admin merges of #107 for a
 # missing status and for an open conversation. GitHub refuses the merge if
-# the head moved after the check. check_pr's last step reads the gates and
-# main once more, so only the second or so until GitHub merges is left
-# uncovered: a change to main, a label or a gate in that second does not
-# stop the merge.
+# the head moved after the check, and checks every required status, check
+# run and conversation as they are then. What it cannot check is a change
+# the workflow has not posted yet: a label removed, a lower Greptile score
+# or a main that moved. check_pr's last step reads those once more, so only
+# a change during those few reads (a few seconds) or before GitHub merges
+# goes unseen. The workflow posts a label or score change within about a
+# minute; a main that moved stays untested until CI runs on the merge.
 merge_cmd() {
   [ $# -eq 1 ] || usage
   check_pr "$1" || die "not merging #$1"
