@@ -20,21 +20,51 @@ concurrency:
 
 jobs:
   swift:
-    name: Swift test and release build (macOS 26)
-    # macos-26 (arm64) hosted image: Xcode 26.6 is the image default; 26.4.1 is
-    # also installed. The image default is used as-is (no xcode-select).
-    runs-on: macos-26
-    timeout-minutes: 30
+    name: Swift test and release build (${{ matrix.label }})
+    # One job per macOS major release GitHub hosts, each on its image's
+    # default Xcode (no xcode-select). GitHub picks the point release and
+    # moves it forward, so the first step records the one each run used.
+    #   macos-26 (arm64): Xcode 26.6 default, 26.4.1 also installed.
+    #   xcode-27 (arm64, public preview): Xcode 27 on macOS 27.
+    # On 2026-10-11 these were macOS 26.6.2 (25G83) and 27.0.1 (26A434).
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: macos-26
+            label: macOS 26
+          - image: xcode-27
+            label: macOS 27
+    runs-on: ${{ matrix.image }}
+    # The test watchdog below allows 50 minutes for swift test, which builds
+    # the tests and then runs them; the other 10 cover setup, the release
+    # build and the lid simulation check.
+    timeout-minutes: 60
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Print toolchain versions
+      - name: Print macOS and toolchain versions
+        # Also written to the job summary, so each run names the macOS
+        # build it tested without opening the log.
+        env:
+          LABEL: ${{ matrix.label }}
         run: |
+          sw_vers
           xcodebuild -version
           swift --version
+          {
+            echo "### $LABEL runner"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| macOS | $(sw_vers -productVersion) ($(sw_vers -buildVersion)) |"
+            echo "| Xcode | $(xcodebuild -version | paste -sd ' ' -) |"
+            echo "| Swift | $(swift --version 2>&1 | grep -m1 'Swift version') |"
+            echo "| Runner image | ${ImageOS:-unknown} ${ImageVersion:-unknown} |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Syntax-check scripts with /bin/bash 3.2
         # The LaunchAgent runs backstop.sh with macOS /bin/bash 3.2, and
@@ -91,24 +121,28 @@ jobs:
           "$tmux_bin" -V
 
       - name: Run tests
+        id: tests
         # NSUnbufferedIO makes XCTest write each line as it happens. With
         # the default 16 KB stdout buffer the log of a hung run stops up to
         # 16 KB before the test that hung, which has already misled one
-        # investigation. If the run is still going after 20 minutes (a
-        # normal run takes about 3), the watchdog samples every xctest
-        # process so the log shows what the hung test is waiting on, then
-        # fails the step instead of waiting for the job timeout.
+        # investigation. If swift test is still going after 50 minutes (on
+        # main in October 2026 it took 11 to 16, build included), the
+        # watchdog samples every xctest process so the log shows what the
+        # hung test is waiting on, then fails the step instead of waiting
+        # for the job timeout. The tests copy every shell script they write
+        # (fakes of sudo, pmset, launchctl and the rest) into
+        # INSOMNIA_TEST_SCRIPT_DUMP for the ShellCheck step below.
         env:
           NSUnbufferedIO: "YES"
         run: |
-          swift test &
+          INSOMNIA_TEST_SCRIPT_DUMP="$RUNNER_TEMP/test-scripts" swift test &
           test_pid=$!
-          for ((i = 0; i < 1200; i++)); do
+          for ((i = 0; i < 3000; i++)); do
             kill -0 "$test_pid" 2>/dev/null || break
             sleep 1
           done
           if kill -0 "$test_pid" 2>/dev/null; then
-            echo "::error::swift test still running after 20 minutes; sampling xctest"
+            echo "::error::swift test still running after 50 minutes; sampling xctest"
             echo "::group::processes"
             ps -axo pid,ppid,stat,etime,command
             echo "::endgroup::"
@@ -147,6 +181,41 @@ jobs:
         # build with -DINSOMNIA_LID_SIMULATION (what build-app.sh adds
         # for INSOMNIA_LID_SIMULATION=1) must have it.
         run: scripts/check-lid-simulation-gate.sh
+
+      - name: ShellCheck the scripts the tests wrote
+        # A broken fake makes a test pass or fail for the wrong reason: a
+        # fake gh that used $10, which bash reads as ${1}0, faked 16
+        # failures on #51. The image has no ShellCheck, so this fetches a
+        # pinned release and checks its digest before running it. An empty
+        # folder fails, so a renamed variable cannot pass by checking
+        # nothing. index.tsv names the test line that wrote each script.
+        # It runs last, and whenever the tests passed, so a lint failure
+        # does not hide the release build's result.
+        if: ${{ !cancelled() && steps.tests.outcome == 'success' }}
+        env:
+          SHELLCHECK_VERSION: "0.11.0"
+          # sha256 of shellcheck-v0.11.0.darwin.aarch64.tar.gz, as GitHub
+          # lists it for the release asset.
+          SHELLCHECK_SHA256: 339b930feb1ea764467013cc1f72d09cd6b869ebf1013296ba9055ab2ffbd26f
+        run: |
+          tools="$RUNNER_TEMP/shellcheck"
+          dump="$RUNNER_TEMP/test-scripts"
+          mkdir -p "$tools"
+          curl -sSfL --retry 3 -o "$tools/shellcheck.tar.gz" \
+            "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.darwin.aarch64.tar.gz"
+          echo "${SHELLCHECK_SHA256}  $tools/shellcheck.tar.gz" | shasum -a 256 -c -
+          tar -xzf "$tools/shellcheck.tar.gz" -C "$tools" --strip-components 1 "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
+          "$tools/shellcheck" --version
+          if [ ! -s "$dump/index.tsv" ]; then
+            echo "::error::the tests wrote no scripts to $dump; INSOMNIA_TEST_SCRIPT_DUMP did not reach them"
+            exit 1
+          fi
+          echo "$(wc -l < "$dump/index.tsv" | tr -d ' ') distinct scripts"
+          echo "::group::index.tsv"
+          cat "$dump/index.tsv"
+          echo "::endgroup::"
+          cd "$dump" || exit 1
+          cut -f1 index.tsv | tr '\n' '\0' | xargs -0 "$tools/shellcheck"
 
   shellcheck:
     name: ShellCheck scripts
