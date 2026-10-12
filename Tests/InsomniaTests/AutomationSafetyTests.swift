@@ -791,8 +791,7 @@ final class DockerRuleEndpointTests: XCTestCase {
         printf '%s' '\(stdout)'
         exit \(exit)
         """
-        try script.write(toFile: exe, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: exe)
+        try TestScripts.write(script, to: URL(fileURLWithPath: exe))
         return (exe, argv)
     }
 
