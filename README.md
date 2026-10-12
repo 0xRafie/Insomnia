@@ -9,9 +9,10 @@
 </p>
 
 <p align="center">
-  A macOS menu bar app for timed awake sessions. Set how long your Mac stays
-  awake, choose what happens when the lid closes, and see when something could
-  not be undone.
+  A macOS menu bar app for timed awake sessions. Insomnia is an eye icon that
+  lives in your MacBook menu bar. It has no Dock icon and no main window. Set
+  how long your Mac stays awake, choose what happens when the lid closes, and
+  see when something could not be undone.
 </p>
 
 <p align="center">
