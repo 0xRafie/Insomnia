@@ -93,7 +93,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // `Insomnia --session` from a script or an agent, once reconcile
             // has adopted or cleared what it found, so no request is
             // answered against a session that is about to resume.
-            sessionCommands.start(directory: manager.paths.appSupport, file: manager.paths.sessionCommandFile)
+            sessionCommands.start(paths: manager.paths)
         }
     }
 

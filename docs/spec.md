@@ -112,17 +112,18 @@ recovery; newly written journals use `frozenProcesses`.
   session, notify.
 - Quitting Insomnia always ends the session. There is no "keep awake after quit".
 - `Insomnia --session start <seconds> | extend <seconds> | end | status` runs
-  the same actions from a script or an agent (`SessionCommand.swift`). The
-  command line writes one request, `start <seconds> <reply>`,
-  `extend <seconds> <reply>` or `end <reply>`, to `session-command` in the
-  support directory. It links the file in, so it never replaces another
-  request that is still waiting. The running app watches the directory,
-  claims the file by renaming it, runs the request like the matching menu
-  action, and answers in `session-command.reply.<reply>`. The command line
-  prints the session or the app's reason and exits 0 or 1. A request that
-  nothing claims within 2 s is taken back, because the app is not running,
-  and a request older than 5 s when the app reads it is dropped, so one left
-  behind never starts a session later. `status` only reads session.json. The
+  the same actions from a script or an agent (`SessionCommand.swift`). Each
+  command line writes its own request file, `session-command.<id>.request`
+  in the support directory, holding `start <seconds>`, `extend <seconds>`
+  or `end`, so no two command lines share a path. The running app watches
+  the directory, claims each file by renaming it, runs the requests oldest
+  first like the matching menu action (`end` is always a full end, which
+  also abandons a start in flight), and answers in
+  `session-command.<id>.reply`. The command line prints the session or the
+  app's reason and exits 0 or 1. A request that nothing claims within 2 s
+  is taken back, because the app is not running, and a request older than
+  5 s when the app reads it is dropped, so one left behind never starts a
+  session later. `status` only reads session.json. The
   file is the same trust boundary as config.json: only this user can write
   the directory, and anyone who can write it already controls the app. The
   bundle declares the interface as `InsomniaSessionCommandVersion` in its

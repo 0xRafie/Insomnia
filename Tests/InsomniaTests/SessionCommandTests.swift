@@ -2,28 +2,29 @@ import XCTest
 @testable import Insomnia
 
 /// Stands in for the running app at every wait of `SessionCommandLine`:
-/// takes the request, records it, writes `session` when set, and answers.
+/// takes the request of `id`, records it, writes `session` when set, and
+/// answers.
 final class FakeRunningApp {
     var takes = true
     var answer: SessionCommandReply? = SessionCommandReply(error: nil)
     var session: Session?
-    /// Runs right after the request is taken, as another command line would.
-    var afterTake: ((Paths) -> Void)?
+    let id: String
     private(set) var requests: [String] = []
     private(set) var waits = 0
 
+    init(id: String = "9-9") {
+        self.id = id
+    }
+
     func wait(paths: Paths) {
         waits += 1
-        guard takes, let text = try? String(contentsOf: paths.sessionCommandFile, encoding: .utf8) else { return }
-        try? FileManager.default.removeItem(at: paths.sessionCommandFile)
-        let line = text.trimmingCharacters(in: .newlines)
-        requests.append(line)
-        afterTake?(paths)
+        let file = paths.sessionCommandRequest(id)
+        guard takes, let text = try? String(contentsOf: file, encoding: .utf8) else { return }
+        try? FileManager.default.removeItem(at: file)
+        requests.append(text.trimmingCharacters(in: .newlines))
         let store = Store(paths: paths)
         if let session { try? store.saveSession(session) }
-        if let answer, let reply = SessionRequest(text: line)?.reply {
-            try? store.write(answer, to: paths.sessionCommandReply(reply))
-        }
+        if let answer { try? store.write(answer, to: paths.sessionCommandReply(id)) }
     }
 }
 
@@ -46,26 +47,33 @@ final class SessionCommandTests: XCTestCase {
 
     // MARK: Request format
 
-    func testRequestsRoundTripThroughTheirText() {
-        let requests = [
-            SessionRequest(command: .start(seconds: 7200), reply: "4242-17"),
-            SessionRequest(command: .extend(seconds: 600), reply: "1-2"),
-            SessionRequest(command: .end, reply: "99"),
-        ]
-        for request in requests {
-            XCTAssertEqual(SessionRequest(text: request.text), request, request.text)
+    func testCommandsRoundTripThroughTheirText() {
+        let commands: [SessionCommand] = [.start(seconds: 7200), .extend(seconds: 600), .end]
+        for command in commands {
+            XCTAssertEqual(SessionCommand(text: command.text), command, command.text)
         }
-        XCTAssertEqual(requests.map(\.text), ["start 7200 4242-17", "extend 600 1-2", "end 99"])
+        XCTAssertEqual(commands.map(\.text), ["start 7200", "extend 600", "end"])
     }
 
-    func testMalformedRequestsAreRefused() {
+    func testMalformedCommandsAreRefused() {
         let texts = [
-            "", "end", "start 7200", "start 0 1-2", "start -5 1-2", "start 1.5 1-2", "start +5 1-2",
-            "start 2147483648 1-2", "extend abc 1-2", "stop 1-2", "start 7200 1-2 3", "end ../x",
-            "end 1/2", "end a-b", "start  7200 1-2", "END 1-2", "end " + String(repeating: "1", count: 33),
+            "", "start", "start 0", "start -5", "start 1.5", "start +5", "start 2147483648", "extend abc",
+            "stop", "start 7200 3", "end now", "start  7200", "END", "start 1h",
         ]
         for text in texts {
-            XCTAssertNil(SessionRequest(text: text), text)
+            XCTAssertNil(SessionCommand(text: text), text)
+        }
+    }
+
+    func testOnlyDigitAndDashIDsNameFiles() {
+        XCTAssertTrue(SessionCommand.isRequestID("4242-17"))
+        for id in ["", "a-b", "../x", "1/2", "1.2", String(repeating: "1", count: 33)] {
+            XCTAssertFalse(SessionCommand.isRequestID(id), id)
+        }
+        XCTAssertEqual(Paths.sessionCommandRequestID("session-command.4242-17.request"), "4242-17")
+        XCTAssertEqual(Paths.sessionCommandReplyID("session-command.4242-17.reply"), "4242-17")
+        for name in ["session-command.4242-17.request.tmp", "session-command..request", "session-command.x.request", "state.json"] {
+            XCTAssertNil(Paths.sessionCommandRequestID(name), name)
         }
     }
 
@@ -107,16 +115,6 @@ final class SessionCommandTests: XCTestCase {
         XCTAssertNil(m.session)
     }
 
-    func testServeAnswersInTheRequestsReplyFile() async throws {
-        let m = h.makeManager()
-        await m.serve(SessionRequest(command: .start(seconds: 60), reply: "7-7"))
-        XCTAssertNotNil(m.session)
-        XCTAssertEqual(try reply("7-7"), SessionCommandReply(error: nil))
-
-        await m.serve(SessionRequest(command: .start(seconds: 60), reply: "7-8"))
-        XCTAssertEqual(try reply("7-8"), SessionCommandReply(error: SessionCommand.alreadyRunning))
-    }
-
     // A second start queued behind one still in flight is not this call's
     // session: the second caller hears so instead of a false success.
     func testAStartQueuedBehindAnotherIsToldTheSessionIsAlreadyRunning() async throws {
@@ -136,9 +134,9 @@ final class SessionCommandTests: XCTestCase {
         XCTAssertEqual(m.session?.endsAt, h.clock.now.addingTimeInterval(3600))
     }
 
-    // An end that arrives while a start is still in flight ends the session
-    // that start makes, instead of answering before it exists.
-    func testAnEndDuringAnInFlightStartEndsWhatTheStartMade() async throws {
+    // An end is always a full end: one that arrives while a start is still
+    // in flight abandons that start, and nothing is left running.
+    func testAnEndDuringAnInFlightStartAbandonsIt() async throws {
         let gate = AsyncGate()
         h.guardFake.sleepGate = gate
         let m = h.makeManager()
@@ -150,11 +148,24 @@ final class SessionCommandTests: XCTestCase {
 
         let startAnswer = await start.value
         let endAnswer = await end.value
-        XCTAssertNil(startAnswer)
+        XCTAssertNotNil(startAnswer, "the start did not make the session; it must not answer done")
         XCTAssertNil(endAnswer)
         XCTAssertNil(m.session)
         XCTAssertNil(try h.store.loadSession())
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+    }
+
+    // A session.json that the app has not adopted (a launch recovery that is
+    // still waiting, for example) is ended too, not answered as done.
+    func testAnEndFinishesASessionTheManagerHasNotAdopted() async throws {
+        let m = h.makeManager()
+        try h.store.saveSession(Session(startedAt: h.clock.now, endsAt: h.clock.now.addingTimeInterval(3600)))
+        XCTAssertNil(m.session)
+
+        let answer = await m.run(.end)
+
+        XCTAssertNil(answer)
+        XCTAssertNil(try h.store.loadSession(), "a deadline left on disk would resume at the next launch")
     }
 
     func testAnEndWhoseRestoreFailsAnswersWithAReason() async throws {
@@ -169,51 +180,63 @@ final class SessionCommandTests: XCTestCase {
         XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true, "the entry stays journaled for the retry")
     }
 
+    func testServeAnswersInTheRequestsReplyFile() async throws {
+        let m = h.makeManager()
+        await m.serve(SessionRequest(command: .start(seconds: 60), id: "7-7"))
+        XCTAssertNotNil(m.session)
+        XCTAssertEqual(try reply("7-7"), SessionCommandReply(error: nil))
+
+        await m.serve(SessionRequest(command: .start(seconds: 60), id: "7-8"))
+        XCTAssertEqual(try reply("7-8"), SessionCommandReply(error: SessionCommand.alreadyRunning))
+    }
+
     // MARK: The watcher
 
-    func testTheWatcherServesAFreshRequestAndRemovesIt() throws {
+    func testTheWatcherServesFreshRequestsOldestFirstAndRemovesThem() throws {
         let watcher = SessionCommandWatcher()
         var got: [SessionRequest] = []
         watcher.onRequest = { got.append($0) }
-        watcher.start(directory: h.home.paths.appSupport, file: h.home.paths.sessionCommandFile)
+        watcher.start(paths: h.home.paths)
         defer { watcher.stop() }
 
-        try drop("start 60 1-1")
+        try drop("end", id: "2-2", age: 1)
+        try drop("start 60", id: "1-1", age: 2)
         watcher.consume()
 
-        XCTAssertEqual(got, [SessionRequest(command: .start(seconds: 60), reply: "1-1")])
-        XCTAssertFalse(exists(h.home.paths.sessionCommandFile))
+        XCTAssertEqual(got, [SessionRequest(command: .start(seconds: 60), id: "1-1"), SessionRequest(command: .end, id: "2-2")])
+        XCTAssertFalse(exists(h.home.paths.sessionCommandRequest("1-1")))
+        XCTAssertFalse(exists(h.home.paths.sessionCommandRequest("2-2")))
     }
 
     func testTheWatcherDropsStaleAndMalformedRequestsWithoutServingThem() throws {
         let watcher = SessionCommandWatcher()
         var got: [SessionRequest] = []
         watcher.onRequest = { got.append($0) }
-        watcher.start(directory: h.home.paths.appSupport, file: h.home.paths.sessionCommandFile)
+        watcher.start(paths: h.home.paths)
         defer { watcher.stop() }
 
         // The command line that wrote it gave up long ago.
-        try drop("start 60 1-1", age: SessionCommandLine.staleAfter + 1)
-        watcher.consume()
-        try drop("start sixty 1-1")
+        try drop("start 60", id: "1-1", age: SessionCommandLine.staleAfter + 1)
+        try drop("start sixty", id: "2-2")
         watcher.consume()
 
         XCTAssertEqual(got, [])
-        XCTAssertFalse(exists(h.home.paths.sessionCommandFile))
+        XCTAssertFalse(exists(h.home.paths.sessionCommandRequest("1-1")))
+        XCTAssertFalse(exists(h.home.paths.sessionCommandRequest("2-2")))
     }
 
     func testARequestWrittenBeforeTheWatchStartsIsServedAndOldAnswersAreCleared() throws {
         let leftover = h.home.paths.sessionCommandReply("3-3")
         try h.store.write(SessionCommandReply(error: nil), to: leftover)
-        try drop("end 5-5")
+        try drop("end", id: "5-5")
         let watcher = SessionCommandWatcher()
         var got: [SessionRequest] = []
         watcher.onRequest = { got.append($0) }
 
-        watcher.start(directory: h.home.paths.appSupport, file: h.home.paths.sessionCommandFile)
+        watcher.start(paths: h.home.paths)
         defer { watcher.stop() }
 
-        XCTAssertEqual(got, [SessionRequest(command: .end, reply: "5-5")])
+        XCTAssertEqual(got, [SessionRequest(command: .end, id: "5-5")])
         XCTAssertFalse(exists(leftover), "nobody waits for an answer from before the launch")
     }
 
@@ -226,16 +249,16 @@ final class SessionCommandTests: XCTestCase {
 
         let output = commandLine(["start", "7200"], app: app)
 
-        XCTAssertEqual(app.requests, ["start 7200 9-9"])
+        XCTAssertEqual(app.requests, ["start 7200"])
         XCTAssertEqual(output, .init(lines: ["running until \(iso(now.addingTimeInterval(7200))) (2h left)"], status: 0))
         XCTAssertFalse(exists(h.home.paths.sessionCommandReply("9-9")), "the answer is removed once read")
     }
 
     func testARefusalIsPrintedAndExitsOne() {
         let app = FakeRunningApp()
-        app.answer = SessionCommandReply(error: "a session is already running; use extend")
+        app.answer = SessionCommandReply(error: SessionCommand.alreadyRunning)
 
-        XCTAssertEqual(commandLine(["start", "60"], app: app), .init(lines: ["a session is already running; use extend"], status: 1))
+        XCTAssertEqual(commandLine(["start", "60"], app: app), .init(lines: [SessionCommand.alreadyRunning], status: 1))
     }
 
     func testNothingTakingTheRequestMeansTheAppIsNotRunningAndTheRequestIsTakenBack() throws {
@@ -246,7 +269,7 @@ final class SessionCommandTests: XCTestCase {
 
         XCTAssertEqual(output.status, 1)
         XCTAssertTrue(output.lines.first?.contains("not running") == true, "\(output.lines)")
-        XCTAssertFalse(exists(h.home.paths.sessionCommandFile), "a request left behind could run at the next launch")
+        XCTAssertFalse(exists(h.home.paths.sessionCommandRequest("9-9")), "a request left behind could run at the next launch")
         XCTAssertEqual(Double(app.waits) * SessionCommandLine.pollInterval, SessionCommandLine.claimTimeout, accuracy: 0.5)
     }
 
@@ -258,7 +281,7 @@ final class SessionCommandTests: XCTestCase {
 
         XCTAssertEqual(output.status, 1)
         XCTAssertTrue(output.lines.first?.contains("version without --session") == true, "\(output.lines)")
-        XCTAssertFalse(exists(h.home.paths.sessionCommandFile))
+        XCTAssertFalse(exists(h.home.paths.sessionCommandRequest("9-9")))
     }
 
     func testACurrentAppThatTakesNothingInTimeMayStillBeStarting() throws {
@@ -271,35 +294,6 @@ final class SessionCommandTests: XCTestCase {
         XCTAssertTrue(output.lines.first?.contains("may still be starting, so try again") == true, "\(output.lines)")
     }
 
-    func testARequestAKilledCommandLineLeftIsReplaced() throws {
-        try drop("start 60 1-1", age: SessionCommandLine.staleAfter + 1)
-        let app = FakeRunningApp()
-
-        let output = try XCTUnwrap(commandLine(["end"], app: app))
-
-        XCTAssertEqual(output.status, 0, "\(output.lines)")
-        XCTAssertEqual(app.requests, ["end 9-9"], "the stale request never reaches the app")
-    }
-
-    // Once the app has taken this request, a newer one at the same path is
-    // another command line's: it is neither waited on nor taken back.
-    func testAnotherRequestAtThePathAfterTheTakeIsLeftAlone() throws {
-        let app = FakeRunningApp()
-        app.afterTake = { paths in try? Data("end 1-1\n".utf8).write(to: paths.sessionCommandFile) }
-
-        let output = try XCTUnwrap(commandLine(["start", "60"], app: app))
-
-        XCTAssertEqual(output.status, 0, "\(output.lines)")
-        XCTAssertEqual(app.requests, ["start 60 9-9"])
-        XCTAssertEqual(try String(contentsOf: h.home.paths.sessionCommandFile, encoding: .utf8), "end 1-1\n")
-    }
-
-    func testTheRemainingTimeIsRoundedUpToTheMinute() {
-        let now = h.clock.now
-        let session = Session(startedAt: now, endsAt: now.addingTimeInterval(119))
-        XCTAssertEqual(SessionCommandLine.describe(session, now: now, timeZone: utc), "running until \(iso(now.addingTimeInterval(119))) (2m left)")
-    }
-
     func testATakenRequestWithNoAnswerTimesOut() throws {
         let app = FakeRunningApp()
         app.answer = nil
@@ -310,16 +304,17 @@ final class SessionCommandTests: XCTestCase {
         XCTAssertTrue(output.lines.first?.contains("did not answer") == true, "\(output.lines)")
     }
 
-    func testARequestStillWaitingIsNotReplaced() throws {
-        let file = h.home.paths.sessionCommandFile
-        try Data("start 60 1-1\n".utf8).write(to: file)
+    // Another command line's request, waiting or left behind by one that was
+    // killed, has its own file: this one neither waits on it nor touches it.
+    func testAnotherCommandLinesRequestIsLeftAlone() throws {
+        try drop("start 60", id: "1-1", age: SessionCommandLine.staleAfter + 1)
         let app = FakeRunningApp()
-        app.takes = false
 
         let output = try XCTUnwrap(commandLine(["end"], app: app))
 
-        XCTAssertEqual(output.status, 1)
-        XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), "start 60 1-1\n", "the other request is left as it was")
+        XCTAssertEqual(output.status, 0, "\(output.lines)")
+        XCTAssertEqual(app.requests, ["end"])
+        XCTAssertEqual(try String(contentsOf: h.home.paths.sessionCommandRequest("1-1"), encoding: .utf8), "start 60")
     }
 
     func testStatusReadsTheSessionFileAndSendsNothing() throws {
@@ -329,7 +324,13 @@ final class SessionCommandTests: XCTestCase {
         try h.store.saveSession(Session(startedAt: now, endsAt: now.addingTimeInterval(90 * 60)))
 
         XCTAssertEqual(commandLine(["status"]), .init(lines: ["running until \(iso(now.addingTimeInterval(5400))) (1h 30m left)"], status: 0))
-        XCTAssertFalse(exists(h.home.paths.sessionCommandFile))
+        XCTAssertFalse(exists(h.home.paths.sessionCommandRequest("9-9")))
+    }
+
+    func testTheRemainingTimeIsRoundedUpToTheMinute() {
+        let now = h.clock.now
+        let session = Session(startedAt: now, endsAt: now.addingTimeInterval(119))
+        XCTAssertEqual(SessionCommandLine.describe(session, now: now, timeZone: utc), "running until \(iso(now.addingTimeInterval(119))) (2m left)")
     }
 
     func testUsageErrorsExit64AndOtherArgumentsAreNotThisMode() {
@@ -358,22 +359,22 @@ final class SessionCommandTests: XCTestCase {
         let paths = h.home.paths
         let now = h.clock.now
         return SessionCommandLine.run(
-            ["--session"] + words, paths: paths, now: { now }, timeZone: utc, replyName: "9-9", runningApp: { runningApp }
+            ["--session"] + words, paths: paths, now: { now }, timeZone: utc, id: app.id, runningApp: { runningApp }
         ) { _ in
             app.wait(paths: paths)
         }
     }
 
-    /// Puts `text` where the command line puts a request, written `age`
+    /// Writes a request file the way a command line does, written `age`
     /// seconds ago.
-    private func drop(_ text: String, age: TimeInterval = 0) throws {
-        let file = h.home.paths.sessionCommandFile
+    private func drop(_ text: String, id: String, age: TimeInterval = 0) throws {
+        let file = h.home.paths.sessionCommandRequest(id)
         try Data(text.utf8).write(to: file)
         try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-age)], ofItemAtPath: file.path)
     }
 
-    private func reply(_ name: String) throws -> SessionCommandReply? {
-        try h.store.read(SessionCommandReply.self, from: h.home.paths.sessionCommandReply(name))
+    private func reply(_ id: String) throws -> SessionCommandReply? {
+        try h.store.read(SessionCommandReply.self, from: h.home.paths.sessionCommandReply(id))
     }
 
     private func exists(_ url: URL) -> Bool {
