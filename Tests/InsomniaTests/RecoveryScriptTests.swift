@@ -3680,6 +3680,37 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(fx.log().contains("still held"), fx.log())
     }
 
+    /// The same hand-down from a shell with GNU coreutils first on PATH, as
+    /// Homebrew's gnubin puts it: GNU stat reads `-f` as --file-system, so a
+    /// bare `stat -f %i` prints no inode, fd 9 never matches the lock file,
+    /// and the backstop waits on its own caller's lock until it exits 75
+    /// (install.sh then stops). The backstop reaches stat only through
+    /// STAT, so the `stat` stub on PATH, which logs and prints what GNU
+    /// prints, never runs.
+    func testBackstopSharesLockHandedDownOnFd9WithGNUStatFirstOnPath() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try Data().write(to: fx.lock)
+        let shadow = fx.root.appendingPathComponent("shadow", isDirectory: true)
+        try FileManager.default.createDirectory(at: shadow, withIntermediateDirectories: true)
+        let stub = shadow.appendingPathComponent("stat")
+        try TestScripts.write("#!/bin/bash\nprintf 'PATH stat %s\\n' \"$*\" >> \"\(fx.callsLog.path)\"\nprintf '  File: \"%s\"\\n' \"$*\"\n", to: stub)
+        let wrapper = fx.root.appendingPathComponent("holder-then-backstop.sh")
+        try TestScripts.write("""
+        #!/bin/bash
+        set -eu
+        exec 9<>"\(fx.lock.path)"
+        /usr/bin/lockf -t 0 9
+        /bin/bash "\(fx.backstop.path)"
+        """, to: wrapper, executable: false)
+
+        let r = try fx.run(wrapper, extraEnvironment: ["PATH": "\(shadow.path):/usr/bin:/bin:/usr/sbin:/sbin"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"], "a stat from PATH ran")
+        XCTAssertFalse(fx.log().contains("still held"), fx.log())
+    }
+
     // MARK: - Final integration checks
 
     func testHungPowerCommandTimesOutReleasesLockAndKeepsJournalDirty() throws {

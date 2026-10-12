@@ -177,6 +177,9 @@ RM=/bin/rm
 MV=/bin/mv
 CP=/bin/cp
 MKTEMP=/usr/bin/mktemp
+# BSD stat: GNU coreutils stat, first on PATH in many Homebrew setups, reads
+# -f as --file-system, so `-f %i` and `-f %z` print no inode or size.
+STAT=/usr/bin/stat
 # The installed app binary, for the microsecond identity check of
 # frozenProcesses entries (see above), and the bundle's Info.plist, which
 # must declare InsomniaResumeFrozenVersion RESUME_FROZEN_VERSION before the
@@ -241,7 +244,7 @@ tighten() { # path...
   done
 }
 tighten "$APP_SUPPORT" "$LOG_DIR" "$LOG" "$LOCK" "$STATE" "$SESSION"
-inode() { stat -f %i "$1" 2>/dev/null; }
+inode() { "$STAT" -f %i "$1" 2>/dev/null; }
 lock_shared=0
 if [[ -e /dev/fd/9 && -e "$LOCK" && -n "$(inode "$LOCK")" && "$(inode /dev/fd/9)" == "$(inode "$LOCK")" ]]; then
   lock_shared=1 # fd 9 is the caller's handle on the lock file; share its lock.
@@ -1168,7 +1171,7 @@ resume_via_app() {
     valid=0
   else
     answer="$app_answer_dir/out"
-    size="$(stat -f %z "$answer" 2>/dev/null || echo 0)"
+    size="$("$STAT" -f %z "$answer" 2>/dev/null || echo 0)"
     excerpt="$(head -c 200 "$answer" | tr -c '[:print:]' ' ')"
     # A valid line is at most 24 bytes ("<10-digit pid> unverifiable\n").
     if (( size > n * 32 )); then
