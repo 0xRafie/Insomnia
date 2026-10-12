@@ -385,8 +385,8 @@ Freeze scope rules:
   every JetBrains IDE by the `com.jetbrains.` prefix
   (`builtInProtectedPrefixes`), terminals (Warp, Ghostty, iTerm, Alacritty,
   kitty, WezTerm, Tabby, Hyper), browsers (Arc, Chrome, Chromium, Edge, Brave,
-  Vivaldi, Opera, Firefox with its Developer and Nightly editions, Zen),
-  Tailscale, LM Studio, Ollama, Docker Desktop's Electron front end,
+  Vivaldi, Opera, Firefox with its Developer and Nightly editions, Zen,
+  Comet), Tailscale, LM Studio, Ollama, Docker Desktop's Electron front end,
   1Password, Bitwarden, Postgres.app and OrbStack, and meeting, recording
   and dictation apps (`meetingApps`): Zoom, Microsoft Teams (new and
   classic), Webex, the older Webex Meetings app with its meeting window and

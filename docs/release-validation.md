@@ -248,6 +248,26 @@ Command Line Tools build against it fails), ad-hoc signed, installed with
 - Not exercised: a lid-closed session with the new Low Power read, any
   session on battery, a session longer than 15 minutes, or heavy load.
 
+## October 11, 2026 Comet relaunch (MacBook Pro, Apple M2 Max)
+
+Machine: MacBook Pro (Mac14,6), Apple M2 Max, 64 GB, macOS 27.0 (26A428).
+Build: `main` `bb5cf2b` with the Comet change and the open PRs #58, #76 and
+#74 applied, built with Xcode 27.1 (Swift 6.4), ad-hoc signed, installed
+with `scripts/install.sh`. Comet 154.0.8037.179, Google Chrome 154.0.8037.98.
+
+- Comet's Info.plist gives `ai.perplexity.comet`. Its framework binary has
+  both `--disable-backgrounding-occluded-windows` and
+  `--disable-renderer-backgrounding`, as Chrome's has.
+- In a session with both browsers started without the flags, the log listed
+  "throttled browsers: Comet, Google Chrome". "Relaunch Comet unthrottled"
+  logged "relaunched ai.perplexity.comet unthrottled", and `ps -o args=`
+  showed both flags on the new Comet main process. Chrome did the same.
+- With Comet added to the freeze list by hand, two lid closes froze it (27
+  and 21 processes) and the opens resumed all of them, none gone or failed.
+- Not exercised: "Freeze every other app" with Comet running and not on the
+  freeze list (FreezerTests covers the protected list), and page timers in
+  Comet with the lid closed.
+
 ## Distribution boundary
 
 Packaging is automated: `scripts/build-app.sh` makes the bundle, and the

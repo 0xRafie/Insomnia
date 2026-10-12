@@ -264,6 +264,7 @@ below cover what only a real Mac shows.
 - Headed-browser throttling with the lid closed
 - Relaunch unthrottled: confirmation alert, profile arguments carried over, a browser that has not quit after 10 s is left as it is and the notification names it, a browser not running 5 s after `open` is reported
 - Relaunch failure while Insomnia is frontmost: with notifications allowed, the "Browser not relaunched" banner shows without switching apps after the confirmation; with notifications off for Insomnia, the reason is a warning line in the right-click menu
+- Comet (`ai.perplexity.comet`): with freeze-all on and Comet running but not on the freeze list, a lid close leaves it untouched; "Relaunch Comet unthrottled" carries its profile arguments over, and the headed-browser throttling check above passes in Comet after it
 
 ### Display and keyboard backlight
 
