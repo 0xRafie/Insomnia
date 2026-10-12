@@ -2,9 +2,11 @@
 
 These are design notes, not a release certification. The
 [README](../README.md) describes supported use and recovery limits; the
-[release validation record](release-validation.md) tracks unverified hardware
-scenarios. Historical model sketches and UI proposals below are not exhaustive
-descriptions of the current code.
+[release validation record](release-validation.md) records the real-Mac
+checks each release passed, and
+[Releasing](releasing.md#real-mac-checks-before-a-release) lists the checks
+to run before the next one. Historical model sketches and UI proposals below
+are not exhaustive descriptions of the current code.
 
 ## Purpose
 
@@ -320,8 +322,7 @@ the saved level, and keeps state.json, even with `--purge`, so a later
 install that can make the call restores it.
 
 The guards narrow the risk of calling a private function whose shape
-changed; they do not replace the hardware rows in
-docs/release-validation.md.
+changed; they do not replace the real-Mac checks in docs/releasing.md.
 An output device that is not connected when its entry is restored keeps the
 entry, and the restore of everything else goes on. Each restore decides
 again whether a device is connected: only a device CoreAudio reports as not
@@ -1035,8 +1036,8 @@ Backstop, independent of the app:
   says the key does not exist; a read that succeeds or fails any other way
   keeps the entry.
 - The agent is a recovery mechanism, not a guarantee of crash/reboot behavior
-  or a replacement for battery/thermal observers. These scenarios require
-  the separate hardware validation record.
+  or a replacement for battery/thermal observers. Their real-Mac checks are
+  in docs/releasing.md.
 
 ### 9. Notifications
 
@@ -1310,9 +1311,9 @@ Then set the hotspot in Settings, pick a freeze list, and start a session.
 
 ## Manual test plan
 
-Run under supervision on a ventilated surface using disposable work before
-claiming hardware validation. The checklist below is a test plan, not evidence
-that any case passed; record results in the release validation record.
+Run under supervision on a ventilated surface using disposable work. The
+checklist below is a test plan; record a release's results in the release
+validation record.
 
 1. **First launch.** Confirm the status item is visible to the right of the
    notch on first launch.
