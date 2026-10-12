@@ -317,7 +317,7 @@ final class ReleaseWorkflowTests: XCTestCase {
             try contents.write(to: url, atomically: true, encoding: .utf8)
         }
         let gh = bin.appendingPathComponent("gh")
-        try """
+        try TestScripts.write("""
             #!/bin/bash
             here="$(cd "$(dirname "$0")/.." && pwd)"
             echo "$*" >> "$here/calls"
@@ -325,8 +325,7 @@ final class ReleaseWorkflowTests: XCTestCase {
             echo "stub gh: unexpected call: $*" >&2
             exit 99
 
-            """.write(to: gh, atomically: true, encoding: .utf8)
-        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: gh.path)
+            """, to: gh)
         let scriptURL = root.appendingPathComponent("step.sh")
         try script.write(to: scriptURL, atomically: true, encoding: .utf8)
         let outputURL = root.appendingPathComponent("output")
