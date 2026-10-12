@@ -1,0 +1,567 @@
+#!/usr/bin/env bash
+# Tests for merge-gate.sh. CI runs them with bash 5 on Linux and with macOS
+# /bin/bash 3.2, and merge-gate.sh runs under the same bash as this file.
+# merge-gate-fake-gh.sh stands in for gh: each test writes the API responses
+# it needs as JSON files and reads back the statuses the script posted, so
+# nothing here reads or writes GitHub. Needs jq.
+#
+# Usage: bash .github/scripts/merge-gate-test.sh [test name without test_]...
+
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+command -v jq >/dev/null || {
+  echo "merge-gate-test: needs jq" >&2
+  exit 2
+}
+
+REPO=krishhgg/Insomnia
+OWNER=krishhgg
+BOT='github-actions[bot]'
+HEAD_SHA=1111111111111111111111111111111111111111
+MAIN_SHA=2222222222222222222222222222222222222222
+OLD_SHA=3333333333333333333333333333333333333333
+CI_CHECKS='["Swift test and release build (macOS 26)", "Swift test and release build (macOS 27)",
+  "ShellCheck scripts", "Lint workflows"]'
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/merge-gate-test.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+mkdir "$tmp/bin"
+ln -s "$here/merge-gate-fake-gh.sh" "$tmp/bin/gh"
+
+current='' dir='' out='' login=$BOT actions=true failed=no
+
+fail() {
+  echo "FAIL $current: $*"
+  if [ -n "$out" ]; then
+    printf '%s\n' "$out" | sed 's/^/       /'
+  fi
+  failed=yes
+}
+
+# run <exit status> <merge-gate.sh arguments>...: runs the script against
+# the fake gh as $login, with GITHUB_ACTIONS=$actions. Its stdout and stderr
+# land in $out; $dir/posts and $dir/pr-calls start empty for each run.
+run() {
+  local want=$1 got=0
+  shift
+  : >"$dir/posts"
+  : >"$dir/pr-calls"
+  out=$(PATH="$tmp/bin:$PATH" FAKE_GH_DIR=$dir FAKE_GH_LOGIN=$login GH_REPO=$REPO \
+    GH_HOST=merge-gate-test.invalid GH_TOKEN=none GITHUB_ACTIONS=$actions DRY_RUN='' \
+    "$BASH" "$here/merge-gate.sh" "$@" 2>&1) || got=$?
+  if [ "$got" != "$want" ]; then
+    fail "merge-gate.sh $* exited $got, not $want"
+  fi
+}
+
+says() {
+  case $out in
+    *"$1"*) ;;
+    *) fail "the output lacks: $1" ;;
+  esac
+}
+
+# gate <gate> <state> [text]: the newest merge-gate/<gate> status on the head
+# has this state, and its description holds the text.
+gate() {
+  local state description
+  state=$(newest "$1" state)
+  description=$(newest "$1" description)
+  if [ "$state" != "$2" ]; then
+    fail "merge-gate/$1 is $state ($description), not $2"
+  fi
+  case $description in
+    *"${3:-}"*) ;;
+    *) fail "merge-gate/$1 says: $description; wanted: $3" ;;
+  esac
+}
+
+# newest <gate> <field>: that field of the newest merge-gate/<gate> status on
+# the head, or none.
+newest() {
+  cat "$dir/commits_${HEAD_SHA}_statuses".*json | jq -rs --arg c "merge-gate/$1" --arg f "$2" \
+    '[.[][] | select(.context == $c)] | max_by(.id) | if . == null then "none" else (.[$f] // "none") end'
+}
+
+# posts [gate]: how many statuses the last run posted, for one gate or all.
+posts() {
+  awk -F '\t' -v c="merge-gate/${1:-}" '$3 == c || c == "merge-gate/"' "$dir/posts" | wc -l | tr -d ' '
+}
+
+# calls <lines>: the gh pr commands the last run gave, one per line.
+calls() {
+  local got
+  got=$(cat "$dir/pr-calls")
+  if [ "$got" != "$1" ]; then
+    fail "gh pr calls: ${got:-none}; wanted: ${1:-none}"
+  fi
+}
+
+# json <key>: stdin becomes the response for <key>; see merge-gate-fake-gh.sh.
+json() {
+  cat >"$dir/$1.json"
+}
+
+# change <key> <jq filter>: edits a response.
+change() {
+  jq "$2" "$dir/$1.json" >"$dir/$1.json.new"
+  mv "$dir/$1.json.new" "$dir/$1.json"
+}
+
+# seed <login> <gate> <state> <description> [url]: a status someone posted on
+# the head before the run under test.
+seed() {
+  FAKE_GH_DIR=$dir FAKE_GH_LOGIN=$1 GH_REPO=$REPO "$tmp/bin/gh" api -X POST "repos/$REPO/statuses/$HEAD_SHA" \
+    -f state="$3" -f context="merge-gate/$2" -f description="$4" -f target_url="${5:-}" >/dev/null
+}
+
+# pr_json <author> <labels> [draft] [mergeable] [state]
+pr_json() {
+  jq -n --arg author "$1" --argjson labels "$2" --argjson draft "${3:-false}" \
+    --argjson mergeable "${4:-true}" --arg state "${5:-open}" --arg head "$HEAD_SHA" \
+    '{number: 5, state: $state, draft: $draft, mergeable: $mergeable, base: {ref: "main"},
+      head: {sha: $head}, user: {login: $author}, labels: $labels}' | json pulls_5
+}
+
+# greptile_body <score> <reviewed sha>: Greptile's block as it writes it.
+greptile_body() {
+  printf '<h3>Greptile Summary</h3>\n\n<!-- greptile_confidence_score:%s -->\n\n' "$1"
+  printf '<sub>Last reviewed commit: ["Gate"](https://github.com/krishhgg/insomnia/commit/%s)</sub>\n' "$2"
+}
+
+# edit <time> <editor> <description>: one description edit as GraphQL lists
+# it; the diff is the whole description after the edit.
+edit() {
+  jq -n --arg t "2026-10-12T$1Z" --arg e "$2" --arg d "$3" '{editedAt: $t, editor: {login: $e}, diff: $d}'
+}
+
+# edits <file> <edit>...: one page of description edits.
+edits() {
+  local file=$1
+  shift
+  printf '%s\n' "$@" | jq -s '{data: {repository: {pullRequest: {userContentEdits: {nodes: .,
+    pageInfo: {hasNextPage: false, endCursor: null}}}}}}' >"$dir/$file.json"
+}
+
+# greptile <score> <reviewed sha>: Greptile's only edit.
+greptile() {
+  edits graphql-edits "$(edit 10:00:00 greptile-apps "Fixes the gate.
+$(greptile_body "$1" "$2")")"
+}
+
+# label_events <[[event, login], ...]>: who added and removed "accepted".
+label_events() {
+  jq -n --argjson e "$1" '[{id: 1, event: "committed"}]
+    + [$e | to_entries[] | {id: (.key + 2), event: .value[0], actor: {login: .value[1]}, label: {name: "accepted"}}]' |
+    json issues_5_events
+}
+
+# changed <file>...: the files the head changes against main.
+changed() {
+  printf '%s\n' "$@" | jq -R . | jq -s '{files: map({filename: ., status: "modified"})}' | json "compare_main...$HEAD_SHA"
+}
+
+# ci_runs <main sha>: the four CI jobs, ids 11 to 14, passed on the head,
+# each with a Tested merge note naming that main.
+ci_runs() {
+  local id
+  jq -n --argjson names "$CI_CHECKS" '{check_runs: [$names | to_entries[]
+    | {id: (.key + 11), name: .value, status: "completed", conclusion: "success", app: {id: 15368}}]}' |
+    json "commits_${HEAD_SHA}_check-runs"
+  for id in 11 12 13 14; do
+    note "$id" "main $1, pull request head $HEAD_SHA"
+  done
+}
+
+# note <check run id> [message]...: the run's annotations: a warning, then
+# one Tested merge note per message.
+note() {
+  local id=$1
+  shift
+  {
+    echo '{"title": "Deprecation", "message": "a warning", "annotation_level": "warning"}'
+    if [ $# -gt 0 ]; then
+      printf '%s\n' "$@" | jq -R '{title: "Tested merge", message: ., annotation_level: "notice"}'
+    fi
+  } | jq -s . | json "check-runs_${id}_annotations"
+}
+
+# rules [ruleset id] [context to leave out] [app id for the CI checks]: the
+# rules on main. Ruleset 1 is one nobody can bypass; ruleset 2 is the
+# owner's, which they bypass with --admin. "-" pins no app.
+rules() {
+  jq -n --argjson names "$CI_CHECKS" --argjson rid "${1:-1}" --arg drop "${2:-}" --arg pin "${3:-15368}" '[
+    {type: "pull_request", ruleset_id: 1, parameters: {required_review_thread_resolution: true}},
+    {type: "update", ruleset_id: 2, parameters: {}},
+    {type: "required_status_checks", ruleset_id: $rid, parameters: {required_status_checks:
+      ([$names[] | {context: ., integration_id: ($pin | tonumber? // null)}]
+        + (["greptile", "accepted", "evidence", "config", "codex"] | map({context: "merge-gate/\(.)"}))
+        | map(select(.context != $drop)))}}]' | json rules_branches_main
+  echo '{"id": 1, "current_user_can_bypass": "never"}' | json rulesets_1
+  echo '{"id": 2, "current_user_can_bypass": "pull_requests_only"}' | json rulesets_2
+}
+
+# threads <file> <[isResolved, ...]>: one page of review threads.
+threads() {
+  jq -n --argjson r "$2" '{data: {repository: {pullRequest: {reviewThreads: {nodes: [$r[] | {isResolved: .}],
+    pageInfo: {hasNextPage: false, endCursor: null}}}}}}' >"$dir/$1.json"
+}
+
+# Pull request #5 from "someone" changes a doc. The owner added the
+# accepted label, Greptile scored the head 5/5, the four CI jobs passed on
+# the current main, and a ruleset nobody can bypass requires everything.
+baseline() {
+  echo '[]' | json "commits_${HEAD_SHA}_statuses"
+  pr_json someone '[{"name": "accepted"}]'
+  greptile 5 "$HEAD_SHA"
+  label_events '[["labeled", "krishhgg"]]'
+  changed docs/guide.md
+  echo "{\"sha\": \"$MAIN_SHA\"}" | json commits_main
+  ci_runs "$MAIN_SHA"
+  rules
+  echo '{"statuses": []}' | json "commits_${HEAD_SHA}_status"
+  threads graphql-threads '[true]'
+}
+
+# The workflow posts the five gates, then the owner marks Codex done.
+all_gates_pass() {
+  run 0 evaluate 5
+  login=$OWNER
+  run 0 post 5 "$HEAD_SHA" codex success "nothing open"
+  login=$BOT
+}
+
+test_ready_pull_request_merges() {
+  run 0 evaluate 5
+  gate greptile success "Greptile scored 1111111 5/5"
+  gate accepted success "the owner accepted"
+  gate evidence success "not needed"
+  gate config success "unchanged"
+  gate codex pending "Codex review of 1111111"
+  login=$OWNER
+  run 0 post 5 "$HEAD_SHA" codex success "nothing open" https://example.com/review
+  gate codex success "nothing open"
+  [ "$(newest codex target_url)" = https://example.com/review ] || fail "codex lost its url"
+  run 0 check 5
+  says "READY: #5 at $HEAD_SHA"
+  run 0 merge 5
+  calls "merge 5 -R $REPO --merge --admin --match-head-commit $HEAD_SHA"
+}
+
+test_second_evaluate_posts_nothing() {
+  run 0 evaluate 5
+  [ "$(posts)" = 5 ] || fail "the first run posted $(posts) statuses, not 5"
+  run 0 evaluate 5
+  [ "$(posts)" = 0 ] || fail "the second run posted $(posts) statuses"
+}
+
+test_owner_rejection_stands_on_their_own_config_change() {
+  pr_json krishhgg '[{"name": "accepted"}]'
+  changed .github/workflows/ci.yml
+  seed "$OWNER" config failure "drop the new job"
+  seed "$OWNER" evidence failure "the log shows no sleep"
+  run 0 evaluate 5
+  gate config failure "drop the new job"
+  gate evidence failure "the log shows no sleep"
+  [ "$(posts config)$(posts evidence)" = 00 ] || fail "posted over the owner's failures"
+}
+
+test_owner_decision_comes_back_after_an_overwrite() {
+  changed Sources/Insomnia/App.swift
+  seed "$OWNER" evidence success "report checked" https://example.com/report
+  seed "$BOT" evidence pending "waiting for a real-Mac report"
+  run 0 evaluate 5
+  gate evidence success "report checked"
+  [ "$(newest evidence target_url)" = https://example.com/report ] || fail "the url did not come back"
+}
+
+test_owner_pending_hands_the_gate_back() {
+  changed .github/workflows/ci.yml
+  seed "$OWNER" config success "fine"
+  seed "$OWNER" config pending "taking it back"
+  run 0 evaluate 5
+  gate config pending "waiting for the owner's OK at 1111111"
+}
+
+test_owner_decision_on_a_later_page_counts() {
+  changed Sources/Insomnia/App.swift
+  rm "$dir/commits_${HEAD_SHA}_statuses.json"
+  # GitHub lists the newest first, so 100 newer statuses push the owner's
+  # OK to page 2.
+  jq -n '[range(200; 100; -1) | {id: ., context: "other/check", state: "success", creator: {login: "app[bot]"}}]' |
+    json "commits_${HEAD_SHA}_statuses.1"
+  echo '[{"id": 50, "context": "merge-gate/evidence", "state": "success", "creator": {"login": "krishhgg"},
+    "description": "report checked", "target_url": null}]' | json "commits_${HEAD_SHA}_statuses.2"
+  run 0 evaluate 5
+  gate evidence success "report checked"
+  [ "$(posts evidence)" = 0 ] || fail "posted evidence"
+}
+
+test_fork_config_change_waits_for_the_owner() {
+  changed .github/workflows/ci.yml docs/guide.md
+  run 0 evaluate 5
+  gate config pending "waiting for the owner's OK at 1111111"
+  gate evidence success "not needed"
+}
+
+test_owner_config_change_passes() {
+  pr_json krishhgg '[{"name": "accepted"}]'
+  changed .github/workflows/ci.yml Package.swift
+  run 0 evaluate 5
+  gate config success "come from the owner"
+}
+
+test_source_change_needs_evidence() {
+  changed docs/guide.md Sources/Insomnia/App.swift
+  run 0 evaluate 5
+  gate evidence pending "real-Mac report on 1111111"
+  gate config success
+}
+
+test_moving_a_source_file_into_docs_needs_evidence() {
+  echo '{"files": [{"filename": "docs/App.swift", "previous_filename": "Sources/Insomnia/App.swift",
+    "status": "renamed"}]}' | json "compare_main...$HEAD_SHA"
+  run 0 evaluate 5
+  gate evidence pending
+}
+
+test_package_swift_is_config_and_needs_evidence() {
+  changed Package.swift
+  run 0 evaluate 5
+  gate config pending
+  gate evidence pending
+}
+
+test_skills_need_evidence() {
+  changed skills/insomnia/SKILL.md
+  run 0 evaluate 5
+  gate evidence pending
+}
+
+test_three_hundred_files_assume_the_worst() {
+  jq -n '{files: [range(300) | {filename: "docs/page\(.).md"}]}' | json "compare_main...$HEAD_SHA"
+  run 0 evaluate 5
+  gate evidence pending
+  gate config pending
+}
+
+test_forged_greptile_score_fails() {
+  # The author wrote a block of their own before Greptile's edit, so
+  # Greptile's description holds both, the forged one first.
+  edits graphql-edits "$(edit 10:00:00 greptile-apps "$(greptile_body 5 "$HEAD_SHA")
+$(greptile_body 2 "$HEAD_SHA")")"
+  run 0 evaluate 5
+  gate greptile failure "2 Greptile scores and 2 reviewed commits"
+}
+
+test_author_edit_after_greptile_does_not_count() {
+  edits graphql-edits "$(edit 11:00:00 someone "$(greptile_body 5 "$HEAD_SHA")")" \
+    "$(edit 10:00:00 greptile-apps "$(greptile_body 3 "$HEAD_SHA")")"
+  run 0 evaluate 5
+  gate greptile failure "Greptile scored 1111111 3/5"
+}
+
+test_greptile_score_for_an_older_commit_waits() {
+  greptile 5 "$OLD_SHA"
+  run 0 evaluate 5
+  gate greptile pending "its summary covers 3333333"
+}
+
+test_no_greptile_review_waits() {
+  edits graphql-edits "$(edit 09:00:00 someone "My change.")"
+  run 0 evaluate 5
+  gate greptile pending "first review"
+}
+
+test_greptile_below_five_fails() {
+  greptile 4 "$HEAD_SHA"
+  run 0 evaluate 5
+  gate greptile failure "4/5; the gate needs 5/5"
+}
+
+test_newest_greptile_edit_wins_across_pages() {
+  # GraphQL lists the newest edit first, so the last row read is the oldest.
+  rm "$dir/graphql-edits.json"
+  edits graphql-edits.1 "$(edit 12:00:00 greptile-apps "$(greptile_body 5 "$HEAD_SHA")")"
+  edits graphql-edits.2 "$(edit 09:00:00 greptile-apps "$(greptile_body 2 "$OLD_SHA")")"
+  run 0 evaluate 5
+  gate greptile success
+}
+
+test_label_from_someone_else_waits() {
+  label_events '[["labeled", "krishhgg"], ["unlabeled", "someone"], ["labeled", "someone"]]'
+  run 0 evaluate 5
+  gate accepted pending "not added by the owner (labeled someone)"
+}
+
+test_no_label_waits() {
+  pr_json someone '[]'
+  run 0 evaluate 5
+  gate accepted pending "waiting for the owner's accepted label"
+}
+
+test_failed_read_stops_evaluate() {
+  touch "$dir/compare_main...$HEAD_SHA.fail"
+  run 2 evaluate 5
+  says "could not evaluate #5"
+  [ "$(posts evidence)$(posts config)$(posts codex)" = 000 ] || fail "posted gates it could not work out"
+}
+
+test_closed_pull_request_is_skipped() {
+  pr_json someone '[]' false true closed
+  run 0 evaluate 5
+  says "closed into main, skipped"
+  [ "$(posts)" = 0 ] || fail "posted on a closed pull request"
+}
+
+test_evaluate_posts_only_from_the_workflow() {
+  actions=''
+  run 2 evaluate 5
+  says "only the merge gate workflow posts these"
+  [ "$(posts)" = 0 ] || fail "posted outside the workflow"
+}
+
+test_post_refuses_another_head_and_other_gates() {
+  login=$OWNER
+  run 2 post 5 "$OLD_SHA" codex success "fine"
+  says "#5's head is $HEAD_SHA, not $OLD_SHA"
+  run 2 post 5 "$HEAD_SHA" greptile success "fine"
+  says "not greptile"
+  run 2 post 5 1111111 codex success "fine"
+  says "not a full commit sha"
+  [ "$(posts)" = 0 ] || fail "posted"
+}
+
+test_list() {
+  echo '[{"number": 5}, {"number": 9}]' | json pulls
+  run 0 list all
+  [ "$out" = "[5,9]" ] || fail "list all printed $out"
+  run 0 list 5 12
+  [ "$out" = "[5,12]" ] || fail "list 5 12 printed $out"
+  run 2 list 5x
+}
+
+test_check_refuses_ci_on_an_older_main() {
+  all_gates_pass
+  ci_runs "$OLD_SHA"
+  run 1 check 5
+  says "success on main 3333333, but main is now 2222222; run:"
+  says "rerun 5"
+  says "NOT READY: #5 at 1111111, 4 failing"
+}
+
+test_check_refuses_a_newer_run_still_going() {
+  all_gates_pass
+  mv "$dir/commits_${HEAD_SHA}_check-runs.json" "$dir/commits_${HEAD_SHA}_check-runs.1.json"
+  echo '{"check_runs": [{"id": 21, "name": "Swift test and release build (macOS 26)", "status": "in_progress",
+    "conclusion": null, "app": {"id": 15368}}]}' | json "commits_${HEAD_SHA}_check-runs.2"
+  run 1 check 5
+  says "in_progress, none"
+  says "1 failing"
+}
+
+test_check_needs_exactly_one_tested_merge_note() {
+  all_gates_pass
+  note 12 "main $MAIN_SHA, pull request head $HEAD_SHA" "main $MAIN_SHA, pull request head $HEAD_SHA"
+  run 1 check 5
+  says "2 Tested merge notes, not 1"
+  note 12
+  run 1 check 5
+  says "0 Tested merge notes, not 1"
+  note 12 "main $MAIN_SHA, pull request head $OLD_SHA"
+  run 1 check 5
+  says "its note names head 3333333"
+}
+
+test_check_ignores_runs_from_other_apps() {
+  all_gates_pass
+  change "commits_${HEAD_SHA}_check-runs" '(.check_runs[] | select(.id == 13)).conclusion = "failure"
+    | .check_runs += [{id: 30, name: "ShellCheck scripts", status: "completed", conclusion: "success", app: {id: 999}}]'
+  run 1 check 5
+  says "completed, failure"
+}
+
+test_check_refuses_gate_success_from_anyone_else() {
+  all_gates_pass
+  seed 'app[bot]' accepted success "looks good"
+  run 1 check 5
+  says "success from app[bot], who is neither the workflow nor the owner"
+}
+
+test_check_reads_threads_on_every_page() {
+  all_gates_pass
+  rm "$dir/graphql-threads.json"
+  threads graphql-threads.1 "$(jq -n '[range(100) | true]')"
+  threads graphql-threads.2 '[true, false]'
+  run 1 check 5
+  says "1 open"
+}
+
+test_check_refuses_a_conflict_or_draft() {
+  all_gates_pass
+  pr_json someone '[{"name": "accepted"}]' true null
+  run 1 check 5
+  says "the pull request is a draft"
+  says "GitHub is still working it out"
+}
+
+test_check_needs_rules_nobody_can_bypass() {
+  all_gates_pass
+  rules 2
+  run 1 check 5
+  says "not required by a ruleset you cannot bypass: Swift test and release build (macOS 26),"
+  rules 1 merge-gate/codex
+  run 1 check 5
+  says "cannot bypass: merge-gate/codex;"
+  rules 1 '' -
+  run 1 check 5
+  says "not pinned to GitHub Actions: Swift test and release build (macOS 26),"
+  rules
+  change rules_branches_main '(.[] | select(.type == "pull_request")).parameters.required_review_thread_resolution = false'
+  run 1 check 5
+  says "resolved conversations required: false"
+}
+
+test_check_evaluates_extra_required_checks() {
+  all_gates_pass
+  change rules_branches_main '(.[] | select(.type == "required_status_checks")).parameters.required_status_checks
+    += [{context: "mac-mini/macOS 15", integration_id: null}]'
+  echo '{"statuses": [{"context": "mac-mini/macOS 15", "state": "failure"}]}' | json "commits_${HEAD_SHA}_status"
+  run 1 check 5
+  says "FAIL  mac-mini/macOS 15"
+  echo '{"statuses": [{"context": "mac-mini/macOS 15", "state": "success"}]}' | json "commits_${HEAD_SHA}_status"
+  run 0 check 5
+  says "pass  mac-mini/macOS 15"
+}
+
+test_merge_refuses_what_check_refuses() {
+  all_gates_pass
+  pr_json someone '[{"name": "accepted"}]' true
+  run 2 merge 5
+  says "not merging #5"
+  calls ""
+}
+
+if [ $# -gt 0 ]; then
+  tests=$(printf 'test_%s\n' "$@")
+else
+  tests=$(declare -F | sed -n 's/^declare -f \(test_.*\)$/\1/p')
+fi
+passed=0 failures=0
+for t in $tests; do
+  current=${t#test_}
+  dir=$tmp/$current
+  mkdir "$dir"
+  out='' login=$BOT actions=true failed=no
+  baseline
+  "$t"
+  if [ "$failed" = no ]; then
+    echo "ok   $current"
+    passed=$((passed + 1))
+  else
+    failures=$((failures + 1))
+  fi
+done
+echo "$passed passed, $failures failed ($BASH $BASH_VERSION)"
+[ "$failures" -eq 0 ]

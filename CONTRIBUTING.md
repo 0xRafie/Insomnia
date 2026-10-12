@@ -70,11 +70,13 @@ including a maintainer's fix or a merge of main, starts every check over.
 | merge-gate/greptile | Greptile reviewed the head and scored it 5/5 |
 | merge-gate/accepted | the owner added the `accepted` label |
 | merge-gate/evidence | the maintainer checked a real-Mac report for the head, or the pull request only changes paths listed under "Real-Mac evidence" |
-| merge-gate/config | the pull request leaves `.github/`, `.greptile/` and `Package.swift` alone, or the owner OK'd those changes at the head |
+| merge-gate/config | the pull request leaves `.github/`, `.greptile/` and `Package.swift` alone, the owner wrote it, or the owner OK'd those changes at the head |
 | merge-gate/codex | the maintainer's Codex review of the head has nothing open |
 
 Every review conversation must be resolved too, and the branch must merge
-into main without conflicts. The
+into main without conflicts. Each CI job must also have tested the pull
+request merged with the current main. When main moves, the maintainer
+reruns CI, which leaves your head commit and your report as they are. The
 [merge gate workflow](.github/workflows/merge-gate.yml) posts the
 merge-gate statuses it can decide from GitHub's data and marks the rest
 pending with the reason; [merge-gate.sh](.github/scripts/merge-gate.sh)

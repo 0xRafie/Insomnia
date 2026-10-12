@@ -51,6 +51,24 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Note which main this run tests
+        # A pull_request run tests a merge of the pull request into main as
+        # main was when the run started, and a re-run keeps that merge.
+        # .github/scripts/merge-gate.sh check reads this note to tell whether
+        # a passing result still covers the current main. git cat-file reads
+        # the parent lines from the merge commit itself, which the shallow
+        # checkout has.
+        if: github.event_name == 'pull_request'
+        run: |
+          parents=$(git cat-file -p HEAD | sed -n 's/^parent //p')
+          base=$(printf '%s\n' "$parents" | sed -n 1p)
+          head=$(printf '%s\n' "$parents" | sed -n 2p)
+          if [ -z "$head" ]; then
+            echo "::warning::HEAD is not a merge commit, so this run names no main"
+          else
+            echo "::notice title=Tested merge::main $base, pull request head $head"
+          fi
+
       - name: Print macOS and toolchain versions
         # Also written to the job summary, so each run names the macOS
         # build it tested without opening the log.
@@ -73,7 +91,8 @@ jobs:
 
       - name: Syntax-check scripts with /bin/bash 3.2
         # The LaunchAgent runs backstop.sh with macOS /bin/bash 3.2, and
-        # install.sh and uninstall.sh run under it too. ShellCheck runs on
+        # install.sh and uninstall.sh run under it too, as does the
+        # maintainer's .github/scripts/merge-gate.sh. ShellCheck runs on
         # Linux and assumes bash 5, so bash 4 syntax passes lint. `bash -n`
         # parses each script under the real interpreter without executing
         # it; it rejects parse-level bash 4 syntax (;;&, |&, [[ -v x ]]).
@@ -90,16 +109,21 @@ jobs:
               exit 1
               ;;
           esac
-          for script in scripts/*.sh; do
+          for script in scripts/*.sh .github/scripts/*.sh; do
             /bin/bash -n "$script"
             echo "syntax ok: $script"
           done
           bash4='^[^#]*((^|[^A-Za-z0-9_])(mapfile|readarray|coproc)([^A-Za-z0-9_]|$)|declare +-[a-zA-Z]*A|(^|[^A-Za-z0-9_])local +-[a-zA-Z]*n([^A-Za-z0-9_]|$)|(^|[^A-Za-z0-9_])wait +-n([^A-Za-z0-9_]|$)|\$\{[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?(,,|\^\^|@[QEPAa])|\[-[0-9]+\])'
-          if grep -nE "$bash4" scripts/*.sh; then
+          if grep -nE "$bash4" scripts/*.sh .github/scripts/*.sh; then
             echo "bash 4 construct found above; /bin/bash 3.2 fails it at run time" >&2
             exit 1
           fi
           echo "no bash 4 builtins or expansions found"
+
+      - name: Test the merge gate with /bin/bash 3.2
+        # merge-gate-test.sh runs merge-gate.sh against a stand-in for gh
+        # that answers from files, so it reads and writes nothing on GitHub.
+        run: /bin/bash .github/scripts/merge-gate-test.sh
 
       - name: Install tmux
         # The hosted macOS image has no tmux, so the tmux integration tests skip.
@@ -233,10 +257,33 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Note which main this run tests
+        # A pull_request run tests a merge of the pull request into main as
+        # main was when the run started, and a re-run keeps that merge.
+        # .github/scripts/merge-gate.sh check reads this note to tell whether
+        # a passing result still covers the current main. git cat-file reads
+        # the parent lines from the merge commit itself, which the shallow
+        # checkout has.
+        if: github.event_name == 'pull_request'
+        run: |
+          parents=$(git cat-file -p HEAD | sed -n 's/^parent //p')
+          base=$(printf '%s\n' "$parents" | sed -n 1p)
+          head=$(printf '%s\n' "$parents" | sed -n 2p)
+          if [ -z "$head" ]; then
+            echo "::warning::HEAD is not a merge commit, so this run names no main"
+          else
+            echo "::notice title=Tested merge::main $base, pull request head $head"
+          fi
+
       - name: Lint shell scripts
         run: |
           shellcheck --version
           shellcheck scripts/*.sh .github/scripts/*.sh
+
+      - name: Test the merge gate with bash 5
+        # The macOS jobs run these tests with /bin/bash 3.2; the workflow
+        # that posts the merge-gate statuses runs on this runner's bash.
+        run: bash .github/scripts/merge-gate-test.sh
 
   lint-workflows:
     name: Lint workflows
@@ -261,6 +308,24 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Note which main this run tests
+        # A pull_request run tests a merge of the pull request into main as
+        # main was when the run started, and a re-run keeps that merge.
+        # .github/scripts/merge-gate.sh check reads this note to tell whether
+        # a passing result still covers the current main. git cat-file reads
+        # the parent lines from the merge commit itself, which the shallow
+        # checkout has.
+        if: github.event_name == 'pull_request'
+        run: |
+          parents=$(git cat-file -p HEAD | sed -n 's/^parent //p')
+          base=$(printf '%s\n' "$parents" | sed -n 1p)
+          head=$(printf '%s\n' "$parents" | sed -n 2p)
+          if [ -z "$head" ]; then
+            echo "::warning::HEAD is not a merge commit, so this run names no main"
+          else
+            echo "::notice title=Tested merge::main $base, pull request head $head"
+          fi
 
       - name: Install actionlint
         run: |
