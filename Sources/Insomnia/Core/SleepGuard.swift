@@ -56,12 +56,14 @@ struct PmsetSleepGuard: SleepGuarding {
     static let settle: TimeInterval = 5
 
     /// The app uses the defaults; tests point `sudo` at a fake, shorten the
-    /// limits, and start the deadline once the fake is ready.
+    /// limits, start the deadline once the fake is ready, and replace the
+    /// settle wait with one that tells the fake pmset the time has passed.
     let sudoPath: String
     let pmsetPath: String
     let commandTimeout: TimeInterval
     let grace: TimeInterval
     let settleDelay: TimeInterval
+    let settleWait: @Sendable (TimeInterval) async throws -> Void
     let runner: CancellableCommand
 
     init(
@@ -70,6 +72,7 @@ struct PmsetSleepGuard: SleepGuarding {
         timeout: TimeInterval = Self.timeout,
         stopGrace: TimeInterval = Self.stopGrace,
         settle: TimeInterval = Self.settle,
+        settleWait: @escaping @Sendable (TimeInterval) async throws -> Void = { try await Task.sleep(for: .seconds($0)) },
         runner: CancellableCommand = CancellableCommand()
     ) {
         sudoPath = sudo
@@ -77,17 +80,26 @@ struct PmsetSleepGuard: SleepGuarding {
         commandTimeout = timeout
         grace = stopGrace
         settleDelay = settle
+        self.settleWait = settleWait
         self.runner = runner
     }
 
-    /// A disable that no longer reads back after `settle` throws
-    /// `SleepDisableRevertedError`, which callers handle like a failed
-    /// pmset. Restoring sleep is not read back.
+    /// A disable that reads SleepDisabled 0 after `settle` throws
+    /// `SleepDisableRevertedError`, and one that cannot be read back throws
+    /// `SleepGuardError`; callers handle both like a failed pmset. Restoring
+    /// sleep is not read back.
     func setSleepDisabled(_ disabled: Bool) async throws {
         try await sudoPmset(["-a", "disablesleep", disabled ? "1" : "0"])
         guard disabled else { return }
-        try await Task.sleep(for: .seconds(settleDelay))
-        guard try await isSleepDisabled() else { throw SleepDisableRevertedError(settle: settleDelay) }
+        try await settleWait(settleDelay)
+        switch Self.readSleepDisabled(try await pmsetG()) {
+        case true?:
+            return
+        case false?:
+            throw SleepDisableRevertedError(settle: settleDelay)
+        case nil:
+            throw SleepGuardError(command: "pmset -g", status: 0, stderr: "no SleepDisabled line reading 0 or 1, so `pmset -a disablesleep 1` could not be read back")
+        }
     }
 
     func setLowPowerMode(_ on: Bool) async throws {
@@ -95,11 +107,16 @@ struct PmsetSleepGuard: SleepGuarding {
     }
 
     func isSleepDisabled() async throws -> Bool {
+        Self.parseSleepDisabled(try await pmsetG())
+    }
+
+    /// `pmset -g` output; throws when pmset fails.
+    private func pmsetG() async throws -> String {
         let r = try await runner.run(pmsetPath, ["-g"], timeout: commandTimeout)
         guard r.succeeded else {
             throw SleepGuardError(command: "pmset -g", status: r.status, stderr: r.stderr)
         }
-        return Self.parseSleepDisabled(r.stdout)
+        return r.stdout
     }
 
     func isLowPowerModeOn() async throws -> Bool {
@@ -116,14 +133,26 @@ struct PmsetSleepGuard: SleepGuarding {
     /// True when `pmset -g` output has a line whose first token is
     /// `SleepDisabled` and whose value is `1`.
     static func parseSleepDisabled(_ output: String) -> Bool {
+        readSleepDisabled(output) == true
+    }
+
+    /// The first `SleepDisabled` line in `pmset -g` output: true for `1`,
+    /// false for `0`, nil when there is no such line or its value is
+    /// anything else. The read back after a disable uses this, so output it
+    /// cannot read is not reported as macOS putting the bit back.
+    static func readSleepDisabled(_ output: String) -> Bool? {
         for rawLine in output.split(whereSeparator: \.isNewline) {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
             guard line.hasPrefix("SleepDisabled") else { continue }
             let parts = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
             guard parts.count >= 2, parts[0] == "SleepDisabled" else { continue }
-            return parts[1] == "1"
+            switch parts[1] {
+            case "1": return true
+            case "0": return false
+            default: return nil
+            }
         }
-        return false
+        return nil
     }
 
     /// `lowpowermode` in the `Battery Power:` section of `pmset -g custom`
