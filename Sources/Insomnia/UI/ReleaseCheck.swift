@@ -120,10 +120,16 @@ struct GitHubRelease: Decodable, Equatable, Sendable {
     }
 }
 
-/// What the releases list says next to the installed version. The newest
-/// stable release is the highest `v<version>` tag that is neither a draft
-/// nor a prerelease; the newest nightly is the prerelease with the latest
-/// date in its tag, and the latest `published_at` among those of one day.
+/// What GitHub says next to the installed version. The newest stable
+/// release is the one GitHub marks Latest (`releases/latest`: the newest
+/// release that is neither a draft nor a prerelease), which the channels
+/// in docs/install.md define the same way. It comes from its own endpoint
+/// because the releases list is paged newest first and a nightly is
+/// published on each day main has new commits, so the stable release can
+/// sit behind any number of nightlies. The newest nightly is the
+/// prerelease with the latest date in its tag on the list's first page,
+/// where the newest entries are, and the latest `published_at` among
+/// those of one day.
 struct ReleaseReport: Equatable, Sendable {
     enum Standing: Equatable, Sendable {
         /// A stable release with a higher version than the installed one.
@@ -149,22 +155,21 @@ struct ReleaseReport: Equatable, Sendable {
         self.newestNightly = newestNightly
     }
 
-    init(installed: AppBuild, releases: [GitHubRelease]) {
+    /// `latest` is GitHub's answer for `releases/latest`, nil when it has
+    /// none (HTTP 404). A Latest whose tag is not `v<version>` is not one
+    /// the Release workflow made and counts as none; the log line shows
+    /// "newest stable none" for it.
+    init(installed: AppBuild, latest: GitHubRelease?, releases: [GitHubRelease]) {
         var stable: SemanticVersion?
+        if let latest, !latest.draft, !latest.prerelease, case let .stable(version)? = ReleaseTag(latest.tagName) {
+            stable = version
+        }
         var nightly: (tag: String, date: String, published: String)?
-        for release in releases where !release.draft {
-            guard let tag = ReleaseTag(release.tagName) else { continue }
-            switch tag {
-            case let .stable(version) where !release.prerelease:
-                if let known = stable, known >= version { continue }
-                stable = version
-            case let .nightly(date, _) where release.prerelease:
-                let candidate = (tag: release.tagName, date: date, published: release.publishedAt ?? "")
-                if let known = nightly, (known.date, known.published) >= (candidate.date, candidate.published) { continue }
-                nightly = candidate
-            default:
-                continue
-            }
+        for release in releases where !release.draft && release.prerelease {
+            guard case let .nightly(date, _)? = ReleaseTag(release.tagName) else { continue }
+            let candidate = (tag: release.tagName, date: date, published: release.publishedAt ?? "")
+            if let known = nightly, (known.date, known.published) >= (candidate.date, candidate.published) { continue }
+            nightly = candidate
         }
         self.init(installed: installed, newestStable: stable, newestNightly: nightly?.tag)
     }
@@ -224,23 +229,27 @@ enum ReleaseCheckError: LocalizedError, Equatable {
     }
 }
 
-/// The releases list as GitHub's API answers it, behind a protocol so tests
+/// GitHub's two answers as its API gives them, behind a protocol so tests
 /// hand in JSON and failures without a network.
 protocol ReleaseFetching: Sendable {
+    /// `releases/latest`, or nil when GitHub has no stable release (404).
+    func latestRelease() async throws -> Data?
+    /// The first page of `releases`, newest first.
     func releases() async throws -> Data
 }
 
-/// One unauthenticated GET of this repository's releases list. No token,
-/// no cache, no redirects to follow: the endpoint answers directly. The
-/// request carries the installed version as its user agent and nothing
-/// else about the Mac.
+/// Two unauthenticated GETs of this repository's releases: the one GitHub
+/// marks Latest, and the first page of the list. No token, no cache, no
+/// redirects to follow: the endpoints answer directly. Each request carries
+/// the installed version as its user agent and nothing else about the Mac.
 struct GitHubReleaseFetcher: ReleaseFetching {
     static let releasesPage = URL(string: "https://github.com/krishhgg/Insomnia/releases")!
-    static let endpoint = URL(string: "https://api.github.com/repos/krishhgg/Insomnia/releases?per_page=30")!
+    static let latestEndpoint = URL(string: "https://api.github.com/repos/krishhgg/Insomnia/releases/latest")!
+    static let listEndpoint = URL(string: "https://api.github.com/repos/krishhgg/Insomnia/releases?per_page=30")!
     static let timeout: TimeInterval = 15
 
-    static func request(installed: AppBuild) -> URLRequest {
-        var request = URLRequest(url: endpoint, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: timeout)
+    static func request(_ url: URL, installed: AppBuild) -> URLRequest {
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: timeout)
         request.httpMethod = "GET"
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
@@ -248,20 +257,31 @@ struct GitHubReleaseFetcher: ReleaseFetching {
         return request
     }
 
+    func latestRelease() async throws -> Data? {
+        try await get(Self.latestEndpoint, noneOn404: true)
+    }
+
     func releases() async throws -> Data {
+        guard let data = try await get(Self.listEndpoint, noneOn404: false) else { throw ReleaseCheckError.status(404) }
+        return data
+    }
+
+    private func get(_ url: URL, noneOn404: Bool) async throws -> Data? {
         let session = URLSession(configuration: .ephemeral)
         defer { session.finishTasksAndInvalidate() }
-        let (data, response) = try await session.data(for: Self.request(installed: .current))
+        let (data, response) = try await session.data(for: Self.request(url, installed: .current))
         guard let http = response as? HTTPURLResponse else { throw ReleaseCheckError.notHTTP }
+        if http.statusCode == 404, noneOn404 { return nil }
         guard http.statusCode == 200 else { throw ReleaseCheckError.status(http.statusCode) }
         return data
     }
 }
 
-/// The "Check for updates" button in Settings > App. One request to
-/// GitHub's releases list when the user clicks, a report under the button,
-/// and nothing installed: an upgrade is the installer run again
-/// (docs/install.md, Upgrades). The app never checks on its own.
+/// The "Check for updates" button in Settings > App. Two requests to
+/// GitHub when the user clicks (the Latest release and the first page of
+/// the list), a report under the button, and nothing installed: an upgrade
+/// is the installer run again (docs/install.md, Upgrades). The app never
+/// checks on its own.
 @MainActor
 @Observable
 final class ReleaseChecker {
@@ -286,13 +306,15 @@ final class ReleaseChecker {
     func check() {
         guard inFlight == nil else { return }
         state = .checking
-        Log.info("release check: asking GitHub for the releases list")
+        Log.info("release check: asking GitHub for the latest release and the releases list")
         inFlight = Task { [fetcher, installed] in
             let outcome: State
             do {
-                let data = try await fetcher.releases()
-                let releases = try Self.decode(data)
-                let report = ReleaseReport(installed: installed, releases: releases)
+                async let latestData = fetcher.latestRelease()
+                async let listData = fetcher.releases()
+                let latest = try await Self.decodeLatest(latestData)
+                let releases = try await Self.decode(listData)
+                let report = ReleaseReport(installed: installed, latest: latest, releases: releases)
                 Log.info("release check: \(report.logLine)")
                 outcome = .checked(report)
             } catch {
@@ -312,6 +334,16 @@ final class ReleaseChecker {
     nonisolated static func decode(_ data: Data) throws -> [GitHubRelease] {
         do {
             return try JSONDecoder().decode([GitHubRelease].self, from: data)
+        } catch {
+            throw ReleaseCheckError.unexpectedAnswer
+        }
+    }
+
+    /// nil stays nil: GitHub had no stable release.
+    nonisolated static func decodeLatest(_ data: Data?) throws -> GitHubRelease? {
+        guard let data else { return nil }
+        do {
+            return try JSONDecoder().decode(GitHubRelease.self, from: data)
         } catch {
             throw ReleaseCheckError.unexpectedAnswer
         }

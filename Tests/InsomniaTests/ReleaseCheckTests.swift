@@ -2,28 +2,35 @@ import Foundation
 import XCTest
 @testable import Insomnia
 
-/// Stands in for GitHub's releases endpoint: the JSON or the failure the
-/// next request gets, and how many requests were made.
+/// Stands in for GitHub's two endpoints: what `releases/latest` and the
+/// first page of `releases` answer, and how many requests were made.
 private actor FakeReleases: ReleaseFetching {
-    private let answer: Result<Data, ReleaseCheckError>
+    private let latest: Result<Data?, ReleaseCheckError>
+    private let list: Result<Data, ReleaseCheckError>
     private let gate: AsyncGate?
     private(set) var requests = 0
 
-    init(_ answer: Result<Data, ReleaseCheckError>, gate: AsyncGate? = nil) {
-        self.answer = answer
+    init(latest: Result<Data?, ReleaseCheckError>, list: Result<Data, ReleaseCheckError>, gate: AsyncGate? = nil) {
+        self.latest = latest
+        self.list = list
         self.gate = gate
+    }
+
+    func latestRelease() async throws -> Data? {
+        requests += 1
+        return try latest.get()
     }
 
     func releases() async throws -> Data {
         requests += 1
         if let gate { await gate.wait() }
-        return try answer.get()
+        return try list.get()
     }
 }
 
 /// The version line and the update check, without a window and without a
 /// network: the fetcher is a fake, and the report is a pure function of
-/// the installed version and the releases list.
+/// the installed version and GitHub's two answers.
 final class ReleaseCheckTests: XCTestCase {
     private var home: TempHome!
 
@@ -84,36 +91,38 @@ final class ReleaseCheckTests: XCTestCase {
         GitHubRelease(tagName: tag, prerelease: prerelease, draft: draft, publishedAt: published)
     }
 
-    func testANewerStableReleaseIsReported() {
-        let report = ReleaseReport(installed: installed, releases: [
-            release("nightly-20261012-db9085ea12a8", prerelease: true),
-            release("v0.2.0", prerelease: false),
-            release("v0.1.0", prerelease: false),
-        ])
+    /// Thirty nightlies fill the list's first page, so the stable release
+    /// is on no page the check reads. It comes from `releases/latest`.
+    func testANewerStableReleaseIsReportedEvenWhenNightliesFillTheList() {
+        let nightlies = (1...30).map { day in
+            release(String(format: "nightly-202611%02d-%012x", day, day), prerelease: true, published: String(format: "2026-11-%02dT17:00:00Z", day))
+        }
+        let report = ReleaseReport(installed: installed, latest: release("v0.2.0", prerelease: false), releases: nightlies)
 
         XCTAssertEqual(report.standing, .newerStableAvailable)
         XCTAssertEqual(report.newestStable, SemanticVersion(0, 2, 0))
-        XCTAssertEqual(report.newestNightly, "nightly-20261012-db9085ea12a8")
-        XCTAssertEqual(report.summary, "A newer stable release exists: 0.2.0. You have 0.1.0. Newest nightly: nightly-20261012-db9085ea12a8.")
-        XCTAssertEqual(report.logLine, "installed 0.1.0 (1), newest stable 0.2.0, newest nightly nightly-20261012-db9085ea12a8: newer stable release available")
+        XCTAssertEqual(report.newestNightly, "nightly-20261130-00000000001e")
+        XCTAssertEqual(report.summary, "A newer stable release exists: 0.2.0. You have 0.1.0. Newest nightly: nightly-20261130-00000000001e.")
+        XCTAssertEqual(report.logLine, "installed 0.1.0 (1), newest stable 0.2.0, newest nightly nightly-20261130-00000000001e: newer stable release available")
     }
 
-    /// GitHub lists releases newest first, but the newest stable is the
-    /// highest version, not the first entry: a patch release of an older
-    /// line can be published after a newer line's release.
-    func testTheNewestStableIsTheHighestVersionNotTheFirstEntry() {
-        let report = ReleaseReport(installed: installed, releases: [
-            release("v0.1.1", prerelease: false),
+    /// The stable release is the one GitHub marks Latest, as
+    /// docs/install.md defines the channel, not the highest tag on the
+    /// list: the maintainer can mark an older line's patch release Latest.
+    func testTheStableReleaseIsWhatGitHubMarksLatestNotTheHighestTag() {
+        let report = ReleaseReport(installed: installed, latest: release("v0.1.1", prerelease: false), releases: [
             release("v0.2.0", prerelease: false),
+            release("v0.1.1", prerelease: false),
         ])
 
-        XCTAssertEqual(report.newestStable, SemanticVersion(0, 2, 0))
+        XCTAssertEqual(report.newestStable, SemanticVersion(0, 1, 1))
+        XCTAssertEqual(report.standing, .newerStableAvailable)
     }
 
     func testTheInstalledVersionCanBeTheNewestStable() {
-        let report = ReleaseReport(installed: installed, releases: [
-            release("v0.1.0", prerelease: false),
+        let report = ReleaseReport(installed: installed, latest: release("v0.1.0", prerelease: false), releases: [
             release("nightly-20261011-2c116dd6399c", prerelease: true),
+            release("v0.1.0", prerelease: false),
         ])
 
         XCTAssertEqual(report.standing, .upToDate)
@@ -123,7 +132,7 @@ final class ReleaseCheckTests: XCTestCase {
     /// A nightly reports the version Info.plist has on main, which is above
     /// the stable one once main bumps it. That is not an update.
     func testAVersionAboveTheNewestStableIsNotBehind() {
-        let report = ReleaseReport(installed: AppBuild(version: "0.2.0", build: "1"), releases: [
+        let report = ReleaseReport(installed: AppBuild(version: "0.2.0", build: "1"), latest: release("v0.1.0", prerelease: false), releases: [
             release("v0.1.0", prerelease: false),
         ])
 
@@ -131,55 +140,60 @@ final class ReleaseCheckTests: XCTestCase {
         XCTAssertEqual(report.summary, "You have 0.2.0, above the newest stable release, 0.1.0. That is a nightly or a source build. No nightly is published.")
     }
 
-    func testDraftsPrereleasesWithStableTagsAndForeignTagsAreNotStableReleases() {
-        let report = ReleaseReport(installed: installed, releases: [
+    func testALatestThatIsNotAStableReleaseCountsAsNone() {
+        for latest in [
             release("v0.3.0", prerelease: false, draft: true),
             release("v0.2.0", prerelease: true),
             release("0.4.0", prerelease: false),
-            release("v0.1.0", prerelease: false),
-            release("nightly-20261012-db9085ea12a8", prerelease: false),
+            release("nightly-20261012-db9085ea12a8", prerelease: true),
+        ] {
+            let report = ReleaseReport(installed: installed, latest: latest, releases: [])
+            XCTAssertNil(report.newestStable, latest.tagName)
+            XCTAssertEqual(report.standing, .noStableRelease, latest.tagName)
+        }
+    }
+
+    func testOnlyPrereleasesWithNightlyTagsAreNightlies() {
+        let report = ReleaseReport(installed: installed, latest: nil, releases: [
             release("nightly-20261013-0123456789ab", prerelease: true, draft: true),
+            release("nightly-20261012-db9085ea12a8", prerelease: false),
+            release("v0.2.0", prerelease: true),
+            release("nightly-20261011-2c116dd6399c", prerelease: true),
         ])
 
-        XCTAssertEqual(report.newestStable, SemanticVersion(0, 1, 0), "a draft, a prerelease and a tag without the v are not the newest stable")
-        XCTAssertNil(report.newestNightly, "a nightly tag not marked prerelease, and a draft, are not the newest nightly")
+        XCTAssertEqual(report.newestNightly, "nightly-20261011-2c116dd6399c", "a draft, a nightly tag not marked prerelease, and a prerelease with a stable tag are passed over")
     }
 
     func testTheNewestNightlyIsTheLatestDateThenTheLatestPublishedTime() {
-        let report = ReleaseReport(installed: installed, releases: [
+        let report = ReleaseReport(installed: installed, latest: nil, releases: [
             release("nightly-20261011-2c116dd6399c", prerelease: true, published: "2026-10-11T14:16:27Z"),
             release("nightly-20261012-0123456789ab", prerelease: true, published: "2026-10-12T09:00:00Z"),
             release("nightly-20261012-db9085ea12a8", prerelease: true, published: "2026-10-12T17:00:11Z"),
-            release("v0.1.0", prerelease: false),
         ])
 
         XCTAssertEqual(report.newestNightly, "nightly-20261012-db9085ea12a8")
     }
 
     func testNoStableReleaseYet() {
-        let report = ReleaseReport(installed: installed, releases: [
+        let report = ReleaseReport(installed: installed, latest: nil, releases: [
             release("nightly-20261012-db9085ea12a8", prerelease: true),
         ])
 
         XCTAssertEqual(report.standing, .noStableRelease)
         XCTAssertEqual(report.summary, "No stable release is published yet. Newest nightly: nightly-20261012-db9085ea12a8.")
-        XCTAssertEqual(ReleaseReport(installed: installed, releases: []).summary, "No stable release is published yet. No nightly is published.")
+        XCTAssertEqual(ReleaseReport(installed: installed, latest: nil, releases: []).summary, "No stable release is published yet. No nightly is published.")
     }
 
     func testABuildWithoutAVersionStillLearnsTheNewestTags() {
-        let unpackaged = ReleaseReport(installed: AppBuild(version: nil, build: nil), releases: [
-            release("v0.1.0", prerelease: false),
-        ])
-        let odd = ReleaseReport(installed: AppBuild(version: "0.1", build: "1"), releases: [
-            release("v0.1.0", prerelease: false),
-        ])
+        let unpackaged = ReleaseReport(installed: AppBuild(version: nil, build: nil), latest: release("v0.1.0", prerelease: false), releases: [])
+        let odd = ReleaseReport(installed: AppBuild(version: "0.1", build: "1"), latest: release("v0.1.0", prerelease: false), releases: [])
 
         XCTAssertEqual(unpackaged.standing, .installedVersionUnknown)
         XCTAssertEqual(unpackaged.summary, "This build has no version to compare. The newest stable release is 0.1.0. No nightly is published.")
         XCTAssertEqual(odd.standing, .installedVersionUnknown, "a version that is not major.minor.patch cannot be compared")
     }
 
-    // MARK: The answer from GitHub
+    // MARK: The answers from GitHub
 
     func testTheReleasesListDecodesFromGitHubsFields() throws {
         let json = """
@@ -197,42 +211,65 @@ final class ReleaseCheckTests: XCTestCase {
         ])
     }
 
-    func testAnAnswerThatIsNotAReleasesListIsOneError() {
+    func testTheLatestReleaseDecodesAndAMissingOneStaysMissing() throws {
+        let json = """
+        {"tag_name": "v0.1.0", "name": "Insomnia 0.1.0 (stable)", "draft": false, "prerelease": false, "published_at": "2026-10-10T17:42:47Z", "html_url": "https://github.com/krishhgg/Insomnia/releases/tag/v0.1.0", "assets": []}
+        """
+
+        XCTAssertEqual(try ReleaseChecker.decodeLatest(Data(json.utf8)), GitHubRelease(tagName: "v0.1.0", prerelease: false, publishedAt: "2026-10-10T17:42:47Z"))
+        XCTAssertNil(try ReleaseChecker.decodeLatest(nil))
+    }
+
+    func testAnAnswerThatIsNotWhatWasAskedIsOneError() {
         for body in ["{\"message\": \"API rate limit exceeded\"}", "<html>", "", "[{\"tag_name\": 1}]"] {
             XCTAssertThrowsError(try ReleaseChecker.decode(Data(body.utf8)), body) { error in
                 XCTAssertEqual(error as? ReleaseCheckError, .unexpectedAnswer)
             }
         }
+        for body in ["{\"message\": \"Not Found\"}", "<html>", "", "[]"] {
+            XCTAssertThrowsError(try ReleaseChecker.decodeLatest(Data(body.utf8)), body) { error in
+                XCTAssertEqual(error as? ReleaseCheckError, .unexpectedAnswer)
+            }
+        }
     }
 
-    func testTheRequestIsOneUnauthenticatedGetOfTheReleasesList() {
-        let request = GitHubReleaseFetcher.request(installed: installed)
-
-        XCTAssertEqual(request.url?.absoluteString, "https://api.github.com/repos/krishhgg/Insomnia/releases?per_page=30")
-        XCTAssertEqual(request.httpMethod, "GET")
-        XCTAssertEqual(request.value(forHTTPHeaderField: "Accept"), "application/vnd.github+json")
-        XCTAssertEqual(request.value(forHTTPHeaderField: "User-Agent"), "Insomnia/0.1.0")
-        XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
-        XCTAssertNil(request.httpBody)
-        XCTAssertEqual(request.cachePolicy, .reloadIgnoringLocalAndRemoteCacheData)
-        XCTAssertEqual(request.timeoutInterval, 15)
-        XCTAssertEqual(GitHubReleaseFetcher.request(installed: AppBuild(version: nil, build: nil)).value(forHTTPHeaderField: "User-Agent"), "Insomnia/unpackaged")
+    func testTheRequestsAreUnauthenticatedGetsOfTheTwoEndpoints() {
+        XCTAssertEqual(GitHubReleaseFetcher.latestEndpoint.absoluteString, "https://api.github.com/repos/krishhgg/Insomnia/releases/latest")
+        XCTAssertEqual(GitHubReleaseFetcher.listEndpoint.absoluteString, "https://api.github.com/repos/krishhgg/Insomnia/releases?per_page=30")
         XCTAssertEqual(GitHubReleaseFetcher.releasesPage.absoluteString, "https://github.com/krishhgg/Insomnia/releases")
+
+        for url in [GitHubReleaseFetcher.latestEndpoint, GitHubReleaseFetcher.listEndpoint] {
+            let request = GitHubReleaseFetcher.request(url, installed: installed)
+            XCTAssertEqual(request.url, url)
+            XCTAssertEqual(request.httpMethod, "GET")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Accept"), "application/vnd.github+json")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "User-Agent"), "Insomnia/0.1.0")
+            XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
+            XCTAssertNil(request.httpBody)
+            XCTAssertEqual(request.cachePolicy, .reloadIgnoringLocalAndRemoteCacheData)
+            XCTAssertEqual(request.timeoutInterval, 15)
+        }
+        XCTAssertEqual(GitHubReleaseFetcher.request(GitHubReleaseFetcher.listEndpoint, installed: AppBuild(version: nil, build: nil)).value(forHTTPHeaderField: "User-Agent"), "Insomnia/unpackaged")
     }
 
     // MARK: The button
 
-    private func json(_ releases: [[String: Any]]) throws -> Data {
-        try JSONSerialization.data(withJSONObject: releases)
+    private func json(_ object: Any) throws -> Data {
+        try JSONSerialization.data(withJSONObject: object)
+    }
+
+    private func stable(_ tag: String) throws -> Data {
+        try json(["tag_name": tag, "draft": false, "prerelease": false, "published_at": "2026-10-20T10:00:00Z"])
     }
 
     @MainActor
     func testAClickReportsTheNewestReleasesAndLogsThem() async throws {
-        let data = try json([
+        let list = try json([
+            ["tag_name": "nightly-20261021-0123456789ab", "draft": false, "prerelease": true, "published_at": "2026-10-21T17:00:00Z"],
             ["tag_name": "v0.2.0", "draft": false, "prerelease": false, "published_at": "2026-10-20T10:00:00Z"],
-            ["tag_name": "v0.1.0", "draft": false, "prerelease": false, "published_at": "2026-10-10T17:42:47Z"],
         ])
-        let fake = FakeReleases(.success(data))
+        let latest = try stable("v0.2.0")
+        let fake = FakeReleases(latest: .success(latest), list: .success(list))
         let checker = ReleaseChecker(fetcher: fake, installed: installed)
         XCTAssertEqual(checker.state, .idle)
 
@@ -240,17 +277,31 @@ final class ReleaseCheckTests: XCTestCase {
         XCTAssertEqual(checker.state, .checking)
         await checker.finish()
 
-        XCTAssertEqual(checker.state, .checked(ReleaseReport(installed: installed, newestStable: SemanticVersion(0, 2, 0), newestNightly: nil)))
+        XCTAssertEqual(checker.state, .checked(ReleaseReport(installed: installed, newestStable: SemanticVersion(0, 2, 0), newestNightly: "nightly-20261021-0123456789ab")))
         let requests = await fake.requests
-        XCTAssertEqual(requests, 1)
+        XCTAssertEqual(requests, 2)
         let log = try String(contentsOf: home.paths.logFile, encoding: .utf8)
-        XCTAssertTrue(log.contains("[info] insomnia: release check: asking GitHub for the releases list"), log)
-        XCTAssertTrue(log.contains("[info] insomnia: release check: installed 0.1.0 (1), newest stable 0.2.0, newest nightly none: newer stable release available"), log)
+        XCTAssertTrue(log.contains("[info] insomnia: release check: asking GitHub for the latest release and the releases list"), log)
+        XCTAssertTrue(log.contains("[info] insomnia: release check: installed 0.1.0 (1), newest stable 0.2.0, newest nightly nightly-20261021-0123456789ab: newer stable release available"), log)
+    }
+
+    /// GitHub answers 404 for `releases/latest` while only nightlies are
+    /// published. That is an answer, not a failure.
+    @MainActor
+    func testNoLatestReleaseIsReportedNotFailed() async throws {
+        let list = try json([["tag_name": "nightly-20261021-0123456789ab", "draft": false, "prerelease": true]])
+        let checker = ReleaseChecker(fetcher: FakeReleases(latest: .success(nil), list: .success(list)), installed: installed)
+
+        checker.check()
+        await checker.finish()
+
+        XCTAssertEqual(checker.state, .checked(ReleaseReport(installed: installed, newestStable: nil, newestNightly: "nightly-20261021-0123456789ab")))
     }
 
     @MainActor
     func testAFailedRequestShowsItsReasonAndLogsIt() async throws {
-        let checker = ReleaseChecker(fetcher: FakeReleases(.failure(.status(403))), installed: installed)
+        let latest = try stable("v0.1.0")
+        let checker = ReleaseChecker(fetcher: FakeReleases(latest: .success(latest), list: .failure(.status(403))), installed: installed)
 
         checker.check()
         await checker.finish()
@@ -262,7 +313,8 @@ final class ReleaseCheckTests: XCTestCase {
 
     @MainActor
     func testAnAnswerThatIsNotAListFailsTheCheck() async throws {
-        let checker = ReleaseChecker(fetcher: FakeReleases(.success(Data("{\"message\":\"API rate limit exceeded\"}".utf8))), installed: installed)
+        let rateLimited = Data("{\"message\":\"API rate limit exceeded\"}".utf8)
+        let checker = ReleaseChecker(fetcher: FakeReleases(latest: .success(rateLimited), list: .success(rateLimited)), installed: installed)
 
         checker.check()
         await checker.finish()
@@ -270,29 +322,30 @@ final class ReleaseCheckTests: XCTestCase {
         XCTAssertEqual(checker.state, .failed("GitHub's answer was not a releases list"))
     }
 
-    /// A second click while the request is in flight makes no second
-    /// request; a click after the answer does.
+    /// A second click while the requests are in flight makes no further
+    /// request (two per check, not four); a click after the answer does.
     @MainActor
-    func testAClickDuringACheckMakesNoSecondRequest() async throws {
+    func testAClickDuringACheckMakesNoFurtherRequest() async throws {
         let gate = AsyncGate()
-        let data = try json([["tag_name": "v0.1.0", "draft": false, "prerelease": false]])
-        let fake = FakeReleases(.success(data), gate: gate)
+        let list = try json([["tag_name": "v0.1.0", "draft": false, "prerelease": false]])
+        let latest = try stable("v0.1.0")
+        let fake = FakeReleases(latest: .success(latest), list: .success(list), gate: gate)
         let checker = ReleaseChecker(fetcher: fake, installed: installed)
 
         checker.check()
         await gate.waitUntilStarted()
         checker.check()
-        var requests = await fake.requests
-        XCTAssertEqual(requests, 1)
         XCTAssertEqual(checker.state, .checking)
 
         await gate.open()
         await checker.finish()
         XCTAssertEqual(checker.state, .checked(ReleaseReport(installed: installed, newestStable: SemanticVersion(0, 1, 0), newestNightly: nil)))
+        var requests = await fake.requests
+        XCTAssertEqual(requests, 2)
 
         checker.check()
         await checker.finish()
         requests = await fake.requests
-        XCTAssertEqual(requests, 2)
+        XCTAssertEqual(requests, 4)
     }
 }

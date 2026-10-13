@@ -112,10 +112,11 @@ points to, and it logs that once. You set up the link, so trimming the file
 it points to is up to you.
 
 Insomnia makes one kind of network request, and only when you click "Check
-for updates" in Settings > App: an unauthenticated GET of this repository's
-releases list at api.github.com, with the installed version as its user
-agent and nothing else about the Mac. It never checks on its own, opens the
-releases page only on request, and never downloads or installs a build.
+for updates" in Settings > App: two unauthenticated GETs at api.github.com,
+for the release this repository marks Latest and for the first page of its
+releases list, with the installed version as their user agent and nothing
+else about the Mac. It never checks on its own, opens the releases page only
+on request, and never downloads or installs a build.
 
 `INSOMNIA_HOME` relocates app support files, logs, and LaunchAgents for testing.
 It is **not an installation sandbox**: installation/removal also involves the

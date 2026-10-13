@@ -205,9 +205,9 @@ four `pmset` commands itself.
 ## Upgrades
 
 Settings > App shows the installed version. "Check for updates" there asks
-GitHub for the releases list once, when you click, and tells you the newest
-stable and nightly tags and whether a newer stable release exists. It
-installs nothing; an upgrade is the steps above run again.
+GitHub once, when you click, for the release marked Latest and for the
+newest nightly, and tells you both tags and whether a newer stable release
+exists. It installs nothing; an upgrade is the steps above run again.
 
 An upgrade asks the running app to quit and stops if it refuses. The new
 bundle is built in a staging directory next to the app and moved into place in
