@@ -88,13 +88,25 @@ that is settled first.
 
 `config` exists because some files can switch off a check: a pull request
 from a fork runs the workflow files on its own branch, and Greptile reads
-its rules from the branch it reviews. Those files are `.github/`, a
-`.greptile/` folder or `greptile.json` anywhere, `Package.swift` and any
-`Package@swift-<version>.swift`, `scripts/check-lid-simulation-gate.sh`,
-`zizmor.yml`, and a `.shellcheckrc`, `.gitignore`, `.ignore` or
-`.gitattributes` anywhere. Names count in any case, and so does any name
-with a non-ASCII character, since the Mac runners check out to a disk that
-treats `S`, `s` and look-alikes such as `ſ` as one letter.
+its rules from the branch it reviews. So the gate passes a change without
+the owner's OK only when every file it touches is one of these kinds:
+
+- Swift files under `Sources/`, and `.swift`, `.h` or `.c` files under
+  `Tests/`
+- `.md`, `.html`, `.svg`, `.png`, `.jpg` or `.gif` files under `docs/`, and
+  `.md` files under `skills/`
+- `.sh` or `.swift` files directly in `scripts/`, except
+  `scripts/check-lid-simulation-gate.sh`, which CI runs
+- `.png`, `.icns` or `.plist` files under `Resources/`
+- `README.md`, `CONTRIBUTING.md`, `SECURITY.md` and `LICENSE`
+
+Even there, a name starting with a dot (such as `.greptile/` or
+`.shellcheckrc`) and an `AGENTS.md`, `CLAUDE.md` or `GEMINI.md`, which
+review agents follow, count as config. Anything else, such as `.github/`,
+`Package.swift` or a new kind of file, waits for the owner. Names match in
+any case, and any name with a non-ASCII character counts, since the Mac
+runners check out to a disk that treats `S`, `s` and look-alikes such as
+`ſ` as one letter.
 
 ### Real-Mac evidence
 

@@ -112,34 +112,44 @@ is_exempt() {
   return 1
 }
 
-# Paths that can switch off a check or loosen a review. A fork's
-# pull_request run uses the workflow files on the fork's branch, so a
-# changed ci.yml can report a job as passed without running it, and CI
-# runs check-lid-simulation-gate.sh from the branch too. Greptile reads
-# .greptile/ folders at any depth (a nested one overrides the rules above
-# it) and greptile.json from the branch. SwiftPM builds from Package.swift
-# or, if one matches the toolchain, a Package@swift-<version>.swift. Lint
-# settings: ShellCheck reads .shellcheckrc from a script's folder or any
-# folder above it, zizmor reads zizmor.yml, and zizmor skips what a
-# .gitignore or .ignore file lists. .gitattributes can mark files as
-# generated, which hides them from the diff a reviewer sees. Names match
-# in any case: the Mac runners check out to a case-insensitive disk, where
+# Paths that may steer a check or a review, so a fork's change to them waits
+# for the owner. This is an allowlist: only kinds of files that no check
+# reads as settings pass, and anything else counts, since a list of the
+# dangerous files always misses one. Swift sources and tests, docs, the
+# product's scripts and resources, and the root README, CONTRIBUTING,
+# SECURITY and LICENSE pass. Within those, a name starting with a dot
+# counts (.greptile/ folders, .shellcheckrc, .gitignore and .ignore, which
+# zizmor honors, and .gitattributes, which can hide a file from the diff),
+# as does an AGENTS.md or CLAUDE.md, which Codex and other review agents
+# follow, and scripts/check-lid-simulation-gate.sh, which CI runs from the
+# branch. A fork's pull_request run uses the workflow files on the fork's
+# branch, so .github/ is never safe, and SwiftPM builds from Package.swift
+# or a Package@swift-<version>.swift at the root. Names match in any case:
+# the Mac runners check out to a case-insensitive disk, where
 # scripts/Check-Lid-Simulation-Gate.sh lands on the real one. That disk
 # also folds Unicode (scripts/ spelled with U+017F, a long s, lands on
 # scripts/), so any name with a byte outside printable ASCII counts too.
 is_config() {
-  local path
+  local path name
   if LC_ALL=C grep -q '[^ -~]' <<<"$1"; then
     return 0
   fi
   path=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  name=${path##*/}
   case $path in
-    .github/* | .greptile/* | */.greptile/* | greptile.json | */greptile.json) return 0 ;;
-    package.swift | package@swift*.swift | scripts/check-lid-simulation-gate.sh) return 0 ;;
-    .shellcheckrc | */.shellcheckrc | zizmor.yml | zizmor.yaml) return 0 ;;
-    .gitignore | */.gitignore | .ignore | */.ignore | .gitattributes | */.gitattributes) return 0 ;;
+    */.* | scripts/*/* | scripts/check-lid-simulation-gate.sh) return 0 ;;
   esac
-  return 1
+  case $name in
+    agents.md | agents.override.md | claude.md | claude.local.md | gemini.md) return 0 ;;
+  esac
+  case $path in
+    sources/*.swift | tests/*.swift | tests/*.h | tests/*.c) return 1 ;;
+    docs/*.md | docs/*.html | docs/*.svg | docs/*.png | docs/*.jpg | docs/*.gif) return 1 ;;
+    scripts/*.sh | scripts/*.swift | skills/*.md) return 1 ;;
+    resources/*.png | resources/*.icns | resources/*.plist) return 1 ;;
+    readme.md | contributing.md | security.md | license) return 1 ;;
+  esac
+  return 0
 }
 
 post() { # <sha> <context> <state> <description> [url]

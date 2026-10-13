@@ -361,12 +361,22 @@ test_files_that_steer_checks_are_config() {
     .gitignore .github/.gitignore docs/.ignore .ignore .gitattributes Sources/.gitattributes \
     package@swift-6.swift PACKAGE.SWIFT Scripts/Check-Lid-Simulation-Gate.sh .GitHub/workflows/ci.yml \
     "$(printf '\305\277cripts/check-lid-simulation-gate.sh')" "$(printf 'Package.\305\277wift')" \
-    "$(printf 'docs/caf\303\251.md')"; do
+    "$(printf 'docs/caf\303\251.md')" Makefile notes.txt AGENTS.md docs/AGENTS.md skills/x/claude.md \
+    docs/Gemini.md Tests/InsomniaTests/.hidden.swift Tests/InsomniaTests/fixture.json Resources/run.sh \
+    Sources/Insomnia/data.json scripts/lib/x.sh Plugins/Lint/plugin.swift docs/run.sh; do
     changed "$f"
     run 0 evaluate 5
     [ "$(newest config state)" = pending ] || fail "$f does not count as config"
   done
-  changed scripts/install.sh Sources/Insomnia/Package.swift
+}
+
+test_only_kinds_no_check_reads_skip_config() {
+  changed Sources/Insomnia/App.swift Sources/Insomnia/Package.swift Tests/InsomniaTests/AppTests.swift \
+    Tests/InsomniaTestHome/include/Home.h Tests/InsomniaTestHome/Home.c docs/install.md \
+    docs/mockups/menubar-ux.html docs/assets/eye.svg docs/shot.png docs/shot.jpg docs/shot.gif \
+    scripts/install.sh scripts/generate-app-icon.swift skills/install-insomnia/SKILL.md \
+    Resources/AppIcon-1024.png Resources/AppIcon.icns Resources/Info.plist README.md CONTRIBUTING.md \
+    SECURITY.md LICENSE
   run 0 evaluate 5
   gate config success
 }
