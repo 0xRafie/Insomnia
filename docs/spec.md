@@ -1107,6 +1107,24 @@ older build is tightened when the app reads it:
   whenever the app becomes active, so an approval or removal made in
   System Settings shows without a relaunch. With the flag off nothing is
   registered or unregistered at launch.
+- version and update check (Settings > App). The version line shows
+  `CFBundleShortVersionString` and `CFBundleVersion` from the running
+  bundle's Info.plist, and the launch log line carries the same, so a bug
+  report can name the build. A binary from `swift run` has no Info.plist
+  and says so. "Check for updates" sends one unauthenticated GET to
+  `https://api.github.com/repos/krishhgg/Insomnia/releases` when clicked,
+  with the installed version as its user agent and nothing else about the
+  Mac, and never on its own. From the answer it takes the highest
+  `v<version>` tag that is neither draft nor prerelease as the newest
+  stable release and the prerelease with the latest `nightly-<date>-<commit>`
+  tag as the newest nightly, compares the installed version with the
+  stable one (newer available, up to date, ahead of it, or no version to
+  compare), and shows both under the button; a failure shows its reason.
+  The result and the failure are logged. "Open releases page" opens the
+  fixed releases URL, never a URL from the answer. Nothing is installed:
+  the upgrade is the installer run again (docs/install.md, Upgrades),
+  because the recovery agent pins the installed build's code requirement
+  and the installer needs the administrator password.
 
 ### 11. Menu bar UI: inline time entry
 
@@ -1211,6 +1229,7 @@ transitions. If it feels like a web dropdown, it is wrong.
 | session deadline | one in-app timer plus independent launchd recovery | recovery checks may wake periodically |
 | countdown redraw | 1 Hz timer, stopped while lid closed | one wake per second while active and visible |
 | hotspot retry | only during an outage | none otherwise |
+| update check | one HTTPS request to api.github.com per click on "Check for updates" | none |
 
 ## Repository layout
 
@@ -1261,6 +1280,7 @@ Insomnia/
       MenuBarModel.swift
       Motion.swift
       PillView.swift
+      ReleaseCheck.swift
       ReminderScheduler.swift
       StatusMenu.swift
       SettingsView.swift

@@ -26,7 +26,11 @@ is, so an ACL someone added can still give another account access. Logs are capp
 rotated: the file it points to is the user's to manage. Location
 Services access is requested only when a hotspot is saved or a session starts
 with one configured; it is used to read Wi-Fi network names and the app never
-requests location updates. With the App Nap setting on (off by default), the
+requests location updates. The app makes one network request, and only
+when you click "Check for updates" in Settings: an unauthenticated GET of
+this repository's releases list at api.github.com, with the installed
+version as its user agent and nothing else about the Mac. It opens the
+releases page on request and never downloads or installs a build. With the App Nap setting on (off by default), the
 app writes `NSAppSleepDisabled` into the preferences of each app on the agent
 list, after recording the previous value in its journal, and puts it back at
 session end.
