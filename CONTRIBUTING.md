@@ -93,11 +93,11 @@ the owner's OK only when every file it touches is one of these kinds:
 
 - Swift files under `Sources/`, and `.swift`, `.h` or `.c` files under
   `Tests/`
-- `.md`, `.html`, `.svg`, `.png`, `.jpg` or `.gif` files under `docs/`, and
-  `.md` files under `skills/`
+- `.md`, `.html` or `.svg` files under `docs/`, and `.md` files under
+  `skills/`
 - `.sh` or `.swift` files directly in `scripts/`, except
   `scripts/check-lid-simulation-gate.sh`, which CI runs
-- `.png`, `.icns` or `.plist` files under `Resources/`
+- `.plist` files under `Resources/`
 - `README.md` and `LICENSE` (`SECURITY.md` and this file set the project's
   policy, and Greptile reads them as guidance for every review)
 
@@ -109,17 +109,19 @@ Even there, some files count as config:
 - a file whose diff adds a ShellCheck directive (`# shellcheck ...`) or a
   Swift `@diagnose` or `@warn` attribute in any spelling, since those switch
   off warnings from inside the file
-- a file GitHub shows no diff for, because it is too big or binary (one NUL
-  byte makes a script binary), unless it is a `.png`, `.jpg`, `.gif` or
-  `.icns` image or was deleted
+- a file GitHub shows no diff for, because it is too big or binary, unless
+  it was deleted. No reviewer can read it, one NUL byte makes a script
+  binary, and a script could source it.
+- a symlink or a submodule. CI follows a symlink, so `scripts/x.sh`
+  pointing at an image would be linted with whatever the image holds.
 
-Anything else, such as `.github/`, `Package.swift` or a new kind of file,
-waits for the owner. The kinds in the first list pass only in the case
-shown there, so `scripts/backstop.SH` counts as config: CI's `scripts/*.sh`
-checks would skip it, but a Mac still opens it as `scripts/backstop.sh`.
-The Mac runners check out to a disk that treats `S`, `s` and look-alikes
-such as `ſ` as one letter, so the names that count match in any case, and
-any name with a non-ASCII character counts.
+Anything else, such as `.github/`, `Package.swift`, an image or a new kind
+of file, waits for the owner. The kinds in the first list pass only in the
+case shown there, so `scripts/backstop.SH` counts as config: CI's
+`scripts/*.sh` checks would skip it, but a Mac still opens it as
+`scripts/backstop.sh`. The Mac runners check out to a disk that treats `S`,
+`s` and look-alikes such as `ſ` as one letter, so the names that count
+match in any case, and any name with a non-ASCII character counts.
 
 CI runs your code, so a test could make a check pass without doing its
 work. The release build and the lid check run before the tests for that

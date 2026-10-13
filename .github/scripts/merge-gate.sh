@@ -115,8 +115,9 @@ is_exempt() {
 # Paths that may steer a check or a review, so a fork's change to them waits
 # for the owner. This is an allowlist: only kinds of files that no check
 # reads as settings pass, and anything else counts, since a list of the
-# dangerous files always misses one. Swift sources and tests, docs, the
-# product's scripts and resources, and the root README and LICENSE pass.
+# dangerous files always misses one. Swift sources and tests, text docs,
+# the product's scripts, plists, and the root README and LICENSE pass.
+# Images do not: no reviewer can read one, and a script could source it.
 # Within those, a name starting with a dot counts (.greptile/ folders,
 # .shellcheckrc, .gitignore and .ignore, which zizmor honors, and
 # .gitattributes, which can hide a file from the diff), as does an
@@ -155,9 +156,9 @@ is_config() {
   esac
   case $1 in
     Sources/*.swift | Tests/*.swift | Tests/*.h | Tests/*.c) return 1 ;;
-    docs/*.md | docs/*.html | docs/*.svg | docs/*.png | docs/*.jpg | docs/*.gif) return 1 ;;
+    docs/*.md | docs/*.html | docs/*.svg) return 1 ;;
     scripts/*.sh | scripts/*.swift | skills/*.md) return 1 ;;
-    Resources/*.png | Resources/*.icns | Resources/*.plist) return 1 ;;
+    Resources/*.plist) return 1 ;;
     README.md | LICENSE) return 1 ;;
   esac
   return 0
@@ -326,7 +327,7 @@ decide() {
 # from what GitHub says now. Reads everything before evaluate posts
 # anything. Returns 1 if a read fails.
 decide_gates() {
-  local pr=$1 head=$PR_HEAD short=${PR_HEAD:0:7} review scores reviews score reviewed event compare count files f
+  local pr=$1 head=$PR_HEAD short=${PR_HEAD:0:7} review scores reviews score reviewed event compare count files f tree links
   local needs_evidence=no touches_config=no
   EXISTING=$(gate_statuses "$head") || return 1
 
@@ -366,21 +367,36 @@ decide_gates() {
   # or a Swift @diagnose attribute (SE-0522, in the Swift 6.4 that CI's
   # macOS 27 job runs) or @warn, in any spelling Swift accepts, such as
   # @`diagnose`, since the release build treats warnings as errors. GitHub
-  # sends no diff for a file too big to show or for a binary file, and one
-  # NUL byte makes a script binary, so any file without a diff counts too,
-  # unless it is an image or was removed. A control character in a name
+  # sends no diff for a file too big to show or for a binary file, such as
+  # an image, and one NUL byte makes a script binary. No reviewer can read
+  # such a file, and a script could source it, so any file without a diff
+  # counts too, unless it was removed. A control character in a name
   # becomes U+00FF, which is_config counts, so a line break cannot split one
   # name into two that each look safe.
   compare=$(gh api "repos/$REPO/compare/$BASE...$head" --jq '
     def clean: gsub("[[:cntrl:]]"; "\u00ff");
     def sets: .status != "removed" and
-      (if .patch == null then .filename | test("\\.(png|jpg|gif|icns)$") | not
-       else .patch | test("(^|\n)\\+[^\n]*(#[ \t]*shellcheck[ \t]|@[ \t]*\\x60?(warn|diagnose)\\x60?([^A-Za-z0-9_]|$))") end);
+      (.patch == null or
+       (.patch | test("(^|\n)\\+[^\n]*(#[ \t]*shellcheck[ \t]|@[ \t]*\\x60?(warn|diagnose)\\x60?([^A-Za-z0-9_]|$))")));
     (.files // [] | length),
     (.files // [] | .[] | (.filename, (.previous_filename // empty)) | "path\t" + clean),
     (.files // [] | .[] | select(sets) | "sets\t" + (.filename | clean))') || return 1
   count=$(printf '%s\n' "$compare" | sed -n 1p)
   files=$(printf '%s\n' "$compare" | sed 1d)
+  # A changed symlink or submodule counts too. CI follows a symlink, so
+  # scripts/x.sh pointing at a binary docs/x.png would be linted with
+  # whatever directives the image holds, and git keeps no content for a
+  # submodule. The head's tree gives each file's mode (120000 for a
+  # symlink, 160000 for a submodule). If GitHub cuts the tree short,
+  # assume the worst.
+  tree=$(gh api "repos/$REPO/git/trees/$head?recursive=1" --jq '
+    (.truncated | tostring),
+    (.tree // [] | .[] | select(.mode == "120000" or .mode == "160000") | .path | gsub("[[:cntrl:]]"; "\u00ff"))') ||
+    return 1
+  links=$(printf '%s\n' "$tree" | sed 1d)
+  if [ "$(printf '%s\n' "$tree" | sed -n 1p)" != false ]; then
+    touches_config=yes
+  fi
   if [ "$count" -ge 300 ]; then
     needs_evidence=yes
     touches_config=yes
@@ -394,7 +410,7 @@ decide_gates() {
       if ! is_exempt "$f"; then
         needs_evidence=yes
       fi
-      if is_config "$f"; then
+      if is_config "$f" || { [ -n "$links" ] && grep -Fxq -- "$f" <<<"$links"; }; then
         touches_config=yes
       fi
     done <<<"$files"

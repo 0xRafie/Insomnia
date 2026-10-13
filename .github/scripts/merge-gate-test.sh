@@ -193,6 +193,12 @@ diff_of() {
     json "compare_main...$HEAD_SHA"
 }
 
+# head_tree <entries> [truncated]: the head's tree as GitHub lists it,
+# with only the entries given, such as [{"path": "x", "mode": "120000"}].
+head_tree() {
+  jq -n --argjson t "$1" --argjson cut "${2:-false}" '{truncated: $cut, tree: $t}' | json "git_trees_$HEAD_SHA"
+}
+
 # ci_runs <main sha>: the four CI jobs, ids 11 to 14, passed on the head,
 # each with a Tested merge note naming that main.
 ci_runs() {
@@ -250,6 +256,7 @@ baseline() {
   greptile 5 "$HEAD_SHA"
   label_events '[["labeled", "krishhgg"]]'
   changed docs/guide.md
+  head_tree '[{"path": "docs", "mode": "040000"}, {"path": "docs/guide.md", "mode": "100644"}]'
   echo "{\"sha\": \"$MAIN_SHA\"}" | json commits_main
   ci_runs "$MAIN_SHA"
   rules
@@ -380,7 +387,8 @@ test_files_that_steer_checks_are_config() {
     docs/AGENTS.override.md scripts/backstop.SH scripts/Install.Sh Sources/Insomnia/App.SWIFT \
     sources/Insomnia/App.swift Tests/InsomniaTests/AppTests.Swift tests/InsomniaTests/AppTests.swift \
     Docs/install.md docs/Shot.PNG Resources/AppIcon.ICNS resources/Info.plist Skills/x/SKILL.md \
-    Readme.md README.MD License; do
+    Readme.md README.MD License docs/shot.png docs/shot.jpg docs/shot.gif Resources/AppIcon.icns \
+    Resources/AppIcon-1024.png; do
     changed "$f"
     run 0 evaluate 5
     [ "$(newest config state)" = pending ] || fail "$f does not count as config"
@@ -391,9 +399,9 @@ test_only_kinds_no_check_reads_skip_config() {
   changed Sources/Insomnia/App.swift Sources/Insomnia/Package.swift Tests/InsomniaTests/AppTests.swift \
     Tests/InsomniaTestHome/include/Home.h Tests/InsomniaTestHome/Home.c docs/install.md docs/spec.md \
     docs/release-validation.md \
-    docs/mockups/menubar-ux.html docs/assets/eye.svg docs/shot.png docs/shot.jpg docs/shot.gif \
+    docs/mockups/menubar-ux.html docs/assets/eye.svg \
     scripts/install.sh scripts/generate-app-icon.swift skills/install-insomnia/SKILL.md \
-    Resources/AppIcon-1024.png Resources/AppIcon.icns Resources/Info.plist README.md LICENSE
+    Resources/Info.plist README.md LICENSE
   run 0 evaluate 5
   gate config success
 }
@@ -453,7 +461,7 @@ test_a_file_without_a_diff_is_config() {
   local spec
   for spec in 'Sources/Insomnia/Huge.swift modified 9000' 'scripts/backstop.sh modified 0' \
     'Sources/Insomnia/B.swift renamed 0' 'docs/assets/eye.svg added 0' 'scripts/x.png.sh added 0' \
-    'docs/Shot.PNG added 0'; do
+    'Resources/Info.plist modified 0' 'docs/guide.md modified 0'; do
     # shellcheck disable=SC2086 # split the spec into the arguments
     diff_of $spec
     run 0 evaluate 5
@@ -461,13 +469,45 @@ test_a_file_without_a_diff_is_config() {
   done
 }
 
-test_images_and_removed_files_need_no_diff() {
-  jq -n '{files: [{filename: "Resources/AppIcon.icns", status: "modified", changes: 0},
-    {filename: "docs/Shot.png", status: "added", changes: 0}, {filename: "docs/a.jpg", status: "added", changes: 0},
-    {filename: "Resources/b.png", status: "added", changes: 0}, {filename: "docs/c.gif", status: "added", changes: 0},
-    {filename: "Sources/Insomnia/Old.swift", status: "removed", changes: 9000}]}' | json "compare_main...$HEAD_SHA"
+test_removed_files_need_no_diff() {
+  jq -n '{files: [{filename: "Sources/Insomnia/Old.swift", status: "removed", changes: 9000},
+    {filename: "scripts/old.sh", status: "removed", changes: 0}]}' | json "compare_main...$HEAD_SHA"
   run 0 evaluate 5
   gate config success
+}
+
+test_a_changed_symlink_or_submodule_is_config() {
+  # CI would lint the file a symlink points at, such as a binary image
+  # holding a script and its ShellCheck directives.
+  local mode
+  for mode in 120000 160000; do
+    diff_of scripts/unchecked.sh added 1 $'@@ -0,0 +1 @@\n+../docs/guide.md\n\\ No newline at end of file'
+    head_tree "[{\"path\": \"scripts/unchecked.sh\", \"mode\": \"$mode\"}]"
+    run 0 evaluate 5
+    [ "$(newest config state)" = pending ] || fail "a changed file of mode $mode does not count as config"
+  done
+}
+
+test_an_unchanged_symlink_is_not_config() {
+  head_tree '[{"path": "docs/guide.md.link", "mode": "120000"}, {"path": "docs/guide.md", "mode": "100644"}]'
+  run 0 evaluate 5
+  gate config success
+}
+
+test_a_tree_cut_short_is_config() {
+  local cut
+  for cut in true null; do
+    head_tree '[]' "$cut"
+    run 0 evaluate 5
+    [ "$(newest config state)" = pending ] || fail "a tree with truncated $cut does not count as config"
+  done
+}
+
+test_a_failed_tree_read_stops_evaluate() {
+  touch "$dir/git_trees_$HEAD_SHA.fail"
+  run 2 evaluate 5
+  says "could not evaluate #5"
+  [ "$(posts)" = 0 ] || fail "posted before every read succeeded"
 }
 
 test_a_rename_to_another_case_is_config() {
