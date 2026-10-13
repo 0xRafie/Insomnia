@@ -17,13 +17,31 @@ lists() {
   (cd "$tmp/repo" && "$here/shellcheck-hidden.sh")
 }
 
-# hides <name> <script body>: ShellCheck must not report the SC2086 on
-# "echo $x", since a directive hides it, and the list must hold it.
+# lint <script body>: what ShellCheck reports for a script with a bash
+# shebang and then the body. ShellCheck exits 1 when it reports anything,
+# so its exit code and its report are read apart.
+lint() {
+  local report rc=0
+  printf '#!/bin/bash\n%s\n' "$1" >"$tmp/lint.sh"
+  report=$("${SHELLCHECK:-shellcheck}" --shell=bash --norc -f gcc "$tmp/lint.sh") || rc=$?
+  if [ "$rc" -gt 1 ]; then
+    echo "shellcheck failed (exit code $rc)"
+  else
+    printf '%s\n' "$report"
+  fi
+}
+
+# hides <name> <script body>: the directive in the body hides the SC2086 on
+# "echo $x", which ShellCheck reports once the directive names another
+# check instead, and the list holds it. A directive ShellCheck can't parse
+# where it stands hides nothing: the lint fails on it.
 hides() {
-  local list
+  local list control
   list=$(lists "$2")
-  if "${SHELLCHECK:-shellcheck}" --shell=bash --norc -f gcc "$tmp/repo/scripts/a.sh" | grep -q 'SC2086'; then
-    echo "FAIL $1: ShellCheck reports the SC2086, so the directive hides nothing"
+  control=${2//disable=SC2086/disable=SC1000}
+  control=${control//disable=all/disable=SC1000}
+  if grep -q 'SC2086' <<<"$(lint "$2")" || ! grep -q 'SC2086' <<<"$(lint "$control")"; then
+    echo "FAIL $1: the directive hides nothing"
     failed=1
   elif grep -qxF $'scripts/a.sh\tSC2086\techo $x' <<<"$list"; then
     echo "ok   $1"
@@ -43,8 +61,7 @@ hides "tabs" $'x=$1\n#\tshellcheck\tdisable=SC2086\necho $x'
 hides "spaces before #" $'x=$1\n  # shellcheck disable=SC2086\necho $x'
 hides "a directive after ;" $'x=$1\ntrue;# shellcheck disable=SC2086\necho $x'
 hides "a directive after (" $'x=$1\n(# shellcheck disable=SC2086\necho $x\n)'
-hides "a directive after |" $'x=$1\ntrue |# shellcheck disable=SC2086\necho $x'
-hides "a directive after &&" $'x=$1\ntrue &&# shellcheck disable=SC2086\necho $x'
+hides "a directive after &" $'x=$1\ntrue &# shellcheck disable=SC2086\necho $x'
 hides "a directive inside \$(" $'x=$1\ny=$(# shellcheck disable=SC2086\necho $x\n)\necho "$y"'
 hides "a directive inside backticks" $'x=$1\ny=`# shellcheck disable=SC2086\necho $x\n`\necho "$y"'
 hides "a directive after a case pattern" $'x=$1\ncase $2 in\na)# shellcheck disable=SC2086\necho $x\n;;\nesac'
@@ -67,7 +84,8 @@ cp "$tmp/rc/.shellcheckrc" "$tmp/rc/scripts/.shellcheckrc"
 cp "$tmp/rc/.shellcheckrc" "$tmp/home/.shellcheckrc"
 printf '%s' $'#!/bin/bash\nx=$1\necho $x\n' >"$tmp/rc/scripts/a.sh"
 for setting in HOME="$tmp/home" SHELLCHECK_OPTS=--exclude=SC2086; do
-  if (cd "$tmp/rc" && env "$setting" "$here/shellcheck-hidden.sh") | grep -q 'SC2086'; then
+  list=$(cd "$tmp/rc" && env "$setting" "$here/shellcheck-hidden.sh") || true
+  if grep -q 'SC2086' <<<"$list"; then
     echo "ok   .shellcheckrc with $setting"
   else
     echo "FAIL .shellcheckrc with $setting hides a finding from the list"
