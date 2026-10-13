@@ -281,9 +281,24 @@ jobs:
           fi
 
       - name: Lint shell scripts
+        # Every script runs under bash, so its first line must say so.
+        # ShellCheck picks its rules from that line: a pull request that
+        # changed backstop.sh to #!/bin/ksh would be linted as ksh while the
+        # LaunchAgent still runs it with /bin/bash, and the bash checks in
+        # the macOS jobs would no longer match how ./install.sh runs.
+        # --shell=bash lints as bash whatever a file says.
         run: |
           shellcheck --version
-          shellcheck scripts/*.sh .github/scripts/*.sh
+          for script in scripts/*.sh .github/scripts/*.sh; do
+            case $(head -n 1 "$script") in
+              '#!/bin/bash' | '#!/usr/bin/env bash') ;;
+              *)
+                echo "::error file=$script,line=1::$script must start with #!/bin/bash or #!/usr/bin/env bash"
+                exit 1
+                ;;
+            esac
+          done
+          shellcheck --shell=bash scripts/*.sh .github/scripts/*.sh
 
       - name: Test the merge gate with bash 5
         # The macOS jobs run these tests with /bin/bash 3.2; the workflow
