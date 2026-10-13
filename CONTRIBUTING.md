@@ -92,8 +92,9 @@ its rules from the branch it reviews. Those files are `.github/`, a
 `.greptile/` folder or `greptile.json` anywhere, `Package.swift` and any
 `Package@swift-<version>.swift`, `scripts/check-lid-simulation-gate.sh`,
 `zizmor.yml`, and a `.shellcheckrc`, `.gitignore`, `.ignore` or
-`.gitattributes` anywhere. Names count in any case, since the Mac runners
-check out to a case-insensitive disk.
+`.gitattributes` anywhere. Names count in any case, and so does any name
+with a non-ASCII character, since the Mac runners check out to a disk that
+treats `S`, `s` and look-alikes such as `ſ` as one letter.
 
 ### Real-Mac evidence
 

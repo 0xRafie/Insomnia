@@ -124,9 +124,14 @@ is_exempt() {
 # .gitignore or .ignore file lists. .gitattributes can mark files as
 # generated, which hides them from the diff a reviewer sees. Names match
 # in any case: the Mac runners check out to a case-insensitive disk, where
-# scripts/Check-Lid-Simulation-Gate.sh lands on the real one.
+# scripts/Check-Lid-Simulation-Gate.sh lands on the real one. That disk
+# also folds Unicode (scripts/ spelled with U+017F, a long s, lands on
+# scripts/), so any name with a byte outside printable ASCII counts too.
 is_config() {
   local path
+  if LC_ALL=C grep -q '[^ -~]' <<<"$1"; then
+    return 0
+  fi
   path=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
   case $path in
     .github/* | .greptile/* | */.greptile/* | greptile.json | */greptile.json) return 0 ;;

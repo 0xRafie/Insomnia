@@ -359,7 +359,9 @@ test_files_that_steer_checks_are_config() {
   for f in Sources/Insomnia/Core/.greptile/config.json greptile.json docs/greptile.json Package@swift-6.swift \
     scripts/check-lid-simulation-gate.sh .shellcheckrc scripts/.shellcheckrc zizmor.yml zizmor.yaml \
     .gitignore .github/.gitignore docs/.ignore .ignore .gitattributes Sources/.gitattributes \
-    package@swift-6.swift PACKAGE.SWIFT Scripts/Check-Lid-Simulation-Gate.sh .GitHub/workflows/ci.yml; do
+    package@swift-6.swift PACKAGE.SWIFT Scripts/Check-Lid-Simulation-Gate.sh .GitHub/workflows/ci.yml \
+    "$(printf '\305\277cripts/check-lid-simulation-gate.sh')" "$(printf 'Package.\305\277wift')" \
+    "$(printf 'docs/caf\303\251.md')"; do
     changed "$f"
     run 0 evaluate 5
     [ "$(newest config state)" = pending ] || fail "$f does not count as config"

@@ -344,10 +344,11 @@ jobs:
 
       - name: Install zizmor
         # A private venv; pip refuses the install unless the downloaded wheel
-        # matches the pinned hash.
+        # matches the pinned hash. -I keeps the checkout off Python's path,
+        # so a venv.py on a pull request's branch can't stand in for venv.
         run: |
           python3 --version
-          python3 -m venv "$RUNNER_TEMP/zizmor"
+          python3 -I -m venv "$RUNNER_TEMP/zizmor"
           printf 'zizmor==%s --hash=sha256:%s\n' "$ZIZMOR_VERSION" "$ZIZMOR_SHA256" > "$RUNNER_TEMP/zizmor-requirements.txt"
           "$RUNNER_TEMP/zizmor/bin/pip" install --require-hashes --only-binary=:all: --no-deps \
             -r "$RUNNER_TEMP/zizmor-requirements.txt"
