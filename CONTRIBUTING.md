@@ -21,9 +21,11 @@ finding that a directive hides in `scripts/`, and fails unless the list
 matches `.github/shellcheck-hidden.txt`. A directive covers the next
 command, so a `{` added after an existing one and a `}` at the end would
 put the rest of the script under it without touching the directive. If
-your change hides something new
-on purpose, copy the list CI prints into that file. The file counts as
-config, so the owner OKs the change.
+your change hides something new on purpose, copy the list CI prints into
+that file. The file counts as config, so the owner OKs the change. The
+check also fails if a `# shellcheck` stands outside a comment, in a
+string, a here-document or backticks, since it could not then remove the
+directives without changing how the script parses.
 
 The tmux integration cases require tmux at one of the executable paths probed
 by the app. CI installs it explicitly; when checking a local run, inspect the

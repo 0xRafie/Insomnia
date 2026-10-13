@@ -11,18 +11,48 @@
 # A directive covers the next command, so a change can widen one without
 # touching it: a "{" right after an existing directive and a "}" at the end
 # of the file put the rest of the script under it. So this lints a copy in
-# which every comment starts "#~", which no directive in any spelling
-# survives, with no .shellcheckrc or SHELLCHECK_OPTS. Each finding there is
-# one the real lint, which must be clean, does not report.
+# which each "#" that whitespace and "shellcheck" follow becomes "#~",
+# which ShellCheck reads as no directive, with no .shellcheckrc or
+# SHELLCHECK_OPTS. Each finding there is one the real lint, which must be
+# clean, does not report.
+#
+# The copy must parse as the script does, or a changed line could end a
+# here-document early, or start one, and hide the code after it. bash
+# --pretty-print, from 5.2 on, parses a script without running it and
+# prints it back without comments, so the copy and the script must print
+# the same. A "# shellcheck" in a string, a here-document or backticks
+# fails that, so spell it another way. Set $PARSE_WITH to the bash to use
+# (default: bash).
 set -euo pipefail
-unset SHELLCHECK_OPTS
+# bash reads $BASH_ENV before it parses, even with --pretty-print.
+unset SHELLCHECK_OPTS BASH_ENV ENV
 shellcheck=${SHELLCHECK:-shellcheck}
+parser=${PARSE_WITH:-bash}
+
+version=$("$parser" --version 2>/dev/null | sed -n '1s/^GNU bash, version \([0-9]*\)\.\([0-9]*\)\..*/\1 \2/p') ||
+  version=
+case $version in
+  5\ [2-9] | [6-9]\ *) ;;
+  *)
+    echo "$parser is not bash 5.2 or later (it says \"$version\"); set PARSE_WITH to one" >&2
+    exit 1
+    ;;
+esac
 
 copy=$(mktemp -d)
 trap 'rm -rf "$copy"' EXIT
 mkdir "$copy/scripts"
 for f in scripts/*.sh; do
-  sed -E 's/(^|[[:space:];&|()<>`])#/\1#~/g' "$f" >"$copy/$f"
+  sed -E 's/#([[:space:]]*shellcheck)/#~\1/g' "$f" >"$copy/$f"
+  if ! "$parser" --pretty-print "$f" >"$copy/parsed" ||
+    ! "$parser" --pretty-print "$copy/$f" >"$copy/parsed-copy"; then
+    echo "$parser could not parse $f" >&2
+    exit 1
+  fi
+  if ! cmp -s "$copy/parsed" "$copy/parsed-copy"; then
+    echo "$f has a \"# shellcheck\" outside a comment, in a string, a here-document or backticks; spell it another way" >&2
+    exit 1
+  fi
 done
 
 rc=0

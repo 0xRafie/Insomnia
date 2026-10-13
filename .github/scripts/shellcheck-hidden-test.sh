@@ -1,7 +1,8 @@
 #!/bin/bash
 # Tests shellcheck-hidden.sh: a finding hidden behind a directive, wherever
 # ShellCheck accepts one, must show in its list. CI runs this in the
-# ShellCheck job with the ShellCheck it pins, as $SHELLCHECK.
+# ShellCheck job with the ShellCheck it pins, as $SHELLCHECK, and Ubuntu's
+# bash 5.2; elsewhere set $PARSE_WITH to a bash 5.2 or later.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 tmp=$(mktemp -d)
@@ -63,9 +64,39 @@ hides "a directive after ;" $'x=$1\ntrue;# shellcheck disable=SC2086\necho $x'
 hides "a directive after (" $'x=$1\n(# shellcheck disable=SC2086\necho $x\n)'
 hides "a directive after &" $'x=$1\ntrue &# shellcheck disable=SC2086\necho $x'
 hides "a directive inside \$(" $'x=$1\ny=$(# shellcheck disable=SC2086\necho $x\n)\necho "$y"'
-hides "a directive inside backticks" $'x=$1\ny=`# shellcheck disable=SC2086\necho $x\n`\necho "$y"'
 hides "a directive after a case pattern" $'x=$1\ncase $2 in\na)# shellcheck disable=SC2086\necho $x\n;;\nesac'
 hides "a directive after a # in a string" $'x=$1\ntrue " #";# shellcheck disable=SC2086\necho $x'
+hides "a here-document that ends at a line with a #" \
+  $'x=$1\n# shellcheck disable=SC2086\n{\n: <<\'#~E\'\n#E\n: <<\'true\'\n#~E\necho $x\ntrue\n}'
+
+# refuses <name> <script body>: the copy without directives would not parse
+# as the script does, so shellcheck-hidden.sh must fail.
+refuses() {
+  if lists "$2" >/dev/null 2>&1; then
+    echo "FAIL $1: gave a list"
+    failed=1
+  else
+    echo "ok   $1 fails"
+  fi
+}
+
+refuses "a directive inside backticks" $'x=$1\ny=`# shellcheck disable=SC2086\necho $x\n`\necho "$y"'
+refuses "a # shellcheck in a string" $'echo "# shellcheck disable=SC2086"'
+refuses "a # shellcheck in a here-document" $'cat <<EOF\n# shellcheck disable=SC2086\nEOF'
+refuses "a here-document a changed line would end early" \
+  $'x=$1\n# shellcheck disable=SC2086\n{\n: <<\'#~ shellcheck E\'\n# shellcheck E\n: <<\'true\'\n#~ shellcheck E\necho $x\ntrue\n}'
+refuses "a script bash cannot parse" $'if true; then\necho'
+
+# bash reads $BASH_ENV before --pretty-print; one that exits there would
+# print nothing for the script and the copy alike. This one exits only
+# while bash reads scripts/a.sh, not while it runs shellcheck-hidden.sh.
+printf '%s\n' "case \$0 in *scripts/a.sh) exit 0 ;; esac" >"$tmp/bash-env"
+if (BASH_ENV="$tmp/bash-env" lists $'echo "# shellcheck disable=SC2086"') >/dev/null 2>&1; then
+  echo "FAIL a \$BASH_ENV that exits gave a list"
+  failed=1
+else
+  echo "ok   a \$BASH_ENV that exits fails"
+fi
 
 list=$(lists $'x=$1\n# shellcheck disable=SC2086\necho $x # a note')
 if grep -qxF $'scripts/a.sh\tSC2086\techo $x # a note' <<<"$list"; then
@@ -120,6 +151,20 @@ if (cd "$tmp/rc" && SHELLCHECK="$tmp/failing-shellcheck" "$here/shellcheck-hidde
   failed=1
 else
   echo "ok   a shellcheck that exits 2 fails"
+fi
+
+# A bash without --pretty-print could print nothing for the script and the
+# copy alike.
+rm -rf "$tmp/repo"
+mkdir -p "$tmp/repo/scripts"
+printf '%s' $'#!/bin/bash\nx=$1\n# shellcheck disable=SC2086\necho $x\n' >"$tmp/repo/scripts/a.sh"
+printf '#!/bin/bash\necho "GNU bash, version 5.1.16(1)-release"\n' >"$tmp/old-bash"
+chmod +x "$tmp/old-bash"
+if (cd "$tmp/repo" && PARSE_WITH="$tmp/old-bash" "$here/shellcheck-hidden.sh") >/dev/null 2>&1; then
+  echo "FAIL bash 5.1 gave a list"
+  failed=1
+else
+  echo "ok   bash 5.1 fails"
 fi
 
 list=$(lists $'# shellcheck disable=SC2086 # nothing to hide\nx=$1\necho "$x"')
