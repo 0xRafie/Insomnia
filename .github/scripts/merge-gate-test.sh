@@ -377,7 +377,10 @@ test_files_that_steer_checks_are_config() {
     docs/Gemini.md Tests/InsomniaTests/.hidden.swift Tests/InsomniaTests/fixture.json Resources/run.sh \
     Sources/Insomnia/data.json scripts/lib/x.sh Plugins/Lint/plugin.swift docs/run.sh \
     CONTRIBUTING.md SECURITY.md security.md docs/CLAUDE.local.md \
-    docs/AGENTS.override.md; do
+    docs/AGENTS.override.md scripts/backstop.SH scripts/Install.Sh Sources/Insomnia/App.SWIFT \
+    sources/Insomnia/App.swift Tests/InsomniaTests/AppTests.Swift tests/InsomniaTests/AppTests.swift \
+    Docs/install.md docs/Shot.PNG Resources/AppIcon.ICNS resources/Info.plist Skills/x/SKILL.md \
+    Readme.md README.MD License; do
     changed "$f"
     run 0 evaluate 5
     [ "$(newest config state)" = pending ] || fail "$f does not count as config"
@@ -449,7 +452,8 @@ test_a_file_without_a_diff_is_config() {
   # renamed: GitHub sends no patch for any of them.
   local spec
   for spec in 'Sources/Insomnia/Huge.swift modified 9000' 'scripts/backstop.sh modified 0' \
-    'Sources/Insomnia/B.swift renamed 0' 'docs/assets/eye.svg added 0' 'scripts/x.png.sh added 0'; do
+    'Sources/Insomnia/B.swift renamed 0' 'docs/assets/eye.svg added 0' 'scripts/x.png.sh added 0' \
+    'docs/Shot.PNG added 0'; do
     # shellcheck disable=SC2086 # split the spec into the arguments
     diff_of $spec
     run 0 evaluate 5
@@ -459,11 +463,21 @@ test_a_file_without_a_diff_is_config() {
 
 test_images_and_removed_files_need_no_diff() {
   jq -n '{files: [{filename: "Resources/AppIcon.icns", status: "modified", changes: 0},
-    {filename: "docs/Shot.PNG", status: "added", changes: 0}, {filename: "docs/a.jpg", status: "added", changes: 0},
+    {filename: "docs/Shot.png", status: "added", changes: 0}, {filename: "docs/a.jpg", status: "added", changes: 0},
     {filename: "Resources/b.png", status: "added", changes: 0}, {filename: "docs/c.gif", status: "added", changes: 0},
     {filename: "Sources/Insomnia/Old.swift", status: "removed", changes: 9000}]}' | json "compare_main...$HEAD_SHA"
   run 0 evaluate 5
   gate config success
+}
+
+test_a_rename_to_another_case_is_config() {
+  # CI's scripts/*.sh globs would skip the new name, while the Mac's
+  # case-insensitive disk still opens it as scripts/backstop.sh.
+  jq -n '{files: [{filename: "scripts/backstop.SH", previous_filename: "scripts/backstop.sh",
+    status: "renamed", changes: 2, patch: "@@ -1 +1 @@\n-#!/bin/bash\n+#!/bin/ksh"}]}' |
+    json "compare_main...$HEAD_SHA"
+  run 0 evaluate 5
+  gate config pending
 }
 
 test_a_line_break_in_a_name_counts_as_config() {

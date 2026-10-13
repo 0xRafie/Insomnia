@@ -114,9 +114,12 @@ Even there, some files count as config:
   `.icns` image or was deleted
 
 Anything else, such as `.github/`, `Package.swift` or a new kind of file,
-waits for the owner. Names match in any case, and any name with a
-non-ASCII character counts, since the Mac runners check out to a disk that
-treats `S`, `s` and look-alikes such as `ſ` as one letter.
+waits for the owner. The kinds in the first list pass only in the case
+shown there, so `scripts/backstop.SH` counts as config: CI's `scripts/*.sh`
+checks would skip it, but a Mac still opens it as `scripts/backstop.sh`.
+The Mac runners check out to a disk that treats `S`, `s` and look-alikes
+such as `ſ` as one letter, so the names that count match in any case, and
+any name with a non-ASCII character counts.
 
 CI runs your code, so a test could make a check pass without doing its
 work. The release build and the lid check run before the tests for that

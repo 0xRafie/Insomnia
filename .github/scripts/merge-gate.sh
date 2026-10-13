@@ -133,11 +133,13 @@ is_exempt() {
 # that every other file files.json names counts. A fork's pull_request run uses the
 # workflow files on the fork's branch, so .github/ is never safe, and
 # SwiftPM builds from Package.swift or a Package@swift-<version>.swift at
-# the root. Names match in any case: the
-# Mac runners check out to a case-insensitive disk, where
-# scripts/Check-Lid-Simulation-Gate.sh lands on the real one. That disk
-# also folds Unicode (scripts/ spelled with U+017F, a long s, lands on
-# scripts/), so any name with a byte outside printable ASCII counts too.
+# the root. The Mac runners check out to a case-insensitive disk, so the
+# names that count match in any case: scripts/Check-Lid-Simulation-Gate.sh
+# lands on the real one. The allowlist matches names exactly, case
+# included: CI's scripts/*.sh globs skip scripts/backstop.SH, which that
+# disk still opens as scripts/backstop.sh. The disk also folds Unicode
+# (scripts/ spelled with U+017F, a long s, lands on scripts/), so any name
+# with a byte outside printable ASCII counts too.
 is_config() {
   local path name
   if LC_ALL=C grep -q '[^ -~]' <<<"$1"; then
@@ -151,12 +153,12 @@ is_config() {
   case $name in
     agents.md | agents.override.md | claude.md | claude.local.md | gemini.md) return 0 ;;
   esac
-  case $path in
-    sources/*.swift | tests/*.swift | tests/*.h | tests/*.c) return 1 ;;
+  case $1 in
+    Sources/*.swift | Tests/*.swift | Tests/*.h | Tests/*.c) return 1 ;;
     docs/*.md | docs/*.html | docs/*.svg | docs/*.png | docs/*.jpg | docs/*.gif) return 1 ;;
     scripts/*.sh | scripts/*.swift | skills/*.md) return 1 ;;
-    resources/*.png | resources/*.icns | resources/*.plist) return 1 ;;
-    readme.md | license) return 1 ;;
+    Resources/*.png | Resources/*.icns | Resources/*.plist) return 1 ;;
+    README.md | LICENSE) return 1 ;;
   esac
   return 0
 }
@@ -372,7 +374,7 @@ decide_gates() {
   compare=$(gh api "repos/$REPO/compare/$BASE...$head" --jq '
     def clean: gsub("[[:cntrl:]]"; "\u00ff");
     def sets: .status != "removed" and
-      (if .patch == null then .filename | ascii_downcase | test("\\.(png|jpg|gif|icns)$") | not
+      (if .patch == null then .filename | test("\\.(png|jpg|gif|icns)$") | not
        else .patch | test("(^|\n)\\+[^\n]*(#[ \t]*shellcheck[ \t]|@[ \t]*\\x60?(warn|diagnose)\\x60?([^A-Za-z0-9_]|$))") end);
     (.files // [] | length),
     (.files // [] | .[] | (.filename, (.previous_filename // empty)) | "path\t" + clean),
