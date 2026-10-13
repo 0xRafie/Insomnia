@@ -354,6 +354,19 @@ test_package_swift_is_config_and_needs_evidence() {
   gate evidence pending
 }
 
+test_files_that_steer_checks_are_config() {
+  local f
+  for f in Sources/Insomnia/Core/.greptile/config.json greptile.json docs/greptile.json Package@swift-6.swift \
+    scripts/check-lid-simulation-gate.sh .shellcheckrc scripts/.shellcheckrc zizmor.yml zizmor.yaml; do
+    changed "$f"
+    run 0 evaluate 5
+    [ "$(newest config state)" = pending ] || fail "$f does not count as config"
+  done
+  changed scripts/install.sh Sources/Insomnia/Package.swift
+  run 0 evaluate 5
+  gate config success
+}
+
 test_skills_need_evidence() {
   changed skills/insomnia/SKILL.md
   run 0 evaluate 5
@@ -673,7 +686,7 @@ test_check_runs_match_in_any_case_but_count_only_by_name() {
     {id: 41, name: "Mac-Mini", status: "completed", conclusion: "failure", app: {id: 555}}]'
   run 1 check 5
   says "FAIL  mac-mini                                 check run from app 555: completed, failure"
-  change "commits_${HEAD_SHA}_check-runs" '.check_runs |= map(select(.id != 40)) | .check_runs[-1].conclusion = "success"'
+  change "commits_${HEAD_SHA}_check-runs" '.check_runs |= map(select(.id != 40) | if .id == 41 then .conclusion = "success" else . end)'
   run 1 check 5
   says "FAIL  mac-mini                                 no check run or status"
   change "commits_${HEAD_SHA}_check-runs" '.check_runs = [.check_runs[] | select(.name != "Mac-Mini")] + [

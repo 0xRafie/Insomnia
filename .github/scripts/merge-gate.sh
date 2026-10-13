@@ -114,12 +114,18 @@ is_exempt() {
 
 # Paths that can switch off a check or loosen a review. A fork's
 # pull_request run uses the workflow files on the fork's branch, so a
-# changed ci.yml can report a job as passed without running it. Greptile
-# reads .greptile/ from the pull request's branch. Package.swift decides
-# what builds and which tests exist.
+# changed ci.yml can report a job as passed without running it, and CI
+# runs check-lid-simulation-gate.sh from the branch too. Greptile reads
+# .greptile/ folders at any depth (a nested one overrides the rules above
+# it) and greptile.json from the branch. SwiftPM builds from Package.swift
+# or, if one matches the toolchain, a Package@swift-<version>.swift. Lint
+# settings: ShellCheck reads .shellcheckrc from a script's folder or any
+# folder above it, and zizmor reads zizmor.yml.
 is_config() {
   case $1 in
-    .github/* | .greptile/* | Package.swift) return 0 ;;
+    .github/* | .greptile/* | */.greptile/* | greptile.json | */greptile.json) return 0 ;;
+    Package.swift | Package@swift*.swift | scripts/check-lid-simulation-gate.sh) return 0 ;;
+    .shellcheckrc | */.shellcheckrc | zizmor.yml | zizmor.yaml) return 0 ;;
   esac
   return 1
 }

@@ -70,7 +70,7 @@ including a maintainer's fix or a merge of main, starts every check over.
 | merge-gate/greptile | Greptile reviewed the head and scored it 5/5 |
 | merge-gate/accepted | the owner added the `accepted` label |
 | merge-gate/evidence | the maintainer checked a real-Mac report for the head, or the pull request only changes paths listed under "Real-Mac evidence" |
-| merge-gate/config | the pull request leaves `.github/`, `.greptile/` and `Package.swift` alone, the owner wrote it, or the owner OK'd those changes at the head |
+| merge-gate/config | the pull request leaves the config that steers checks alone (listed below), the owner wrote it, or the owner OK'd those changes at the head |
 | merge-gate/codex | the maintainer's Codex review of the head has nothing open |
 
 Every review conversation must be resolved too, and the branch must merge
@@ -86,9 +86,12 @@ describes each one.
 all. Before you build a new feature or change a default, open an issue so
 that is settled first.
 
-`config` exists because those paths can switch off a check: a pull request
+`config` exists because some files can switch off a check: a pull request
 from a fork runs the workflow files on its own branch, and Greptile reads
-`.greptile/` from the branch it reviews.
+its rules from the branch it reviews. Those files are `.github/`, a
+`.greptile/` folder or `greptile.json` anywhere, `Package.swift` and any
+`Package@swift-<version>.swift`, `scripts/check-lid-simulation-gate.sh`,
+a `.shellcheckrc` anywhere, and `zizmor.yml`.
 
 ### Real-Mac evidence
 
