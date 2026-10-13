@@ -67,6 +67,14 @@ hides "a directive inside backticks" $'x=$1\ny=`# shellcheck disable=SC2086\nech
 hides "a directive after a case pattern" $'x=$1\ncase $2 in\na)# shellcheck disable=SC2086\necho $x\n;;\nesac'
 hides "a directive after a # in a string" $'x=$1\ntrue " #";# shellcheck disable=SC2086\necho $x'
 
+list=$(lists $'x=$1\n# shellcheck disable=SC2086\necho $x # a note')
+if grep -qxF $'scripts/a.sh\tSC2086\techo $x # a note' <<<"$list"; then
+  echo "ok   a line's comment as it is"
+else
+  echo "FAIL a line's comment as it is, but the list is: ${list:-empty}"
+  failed=1
+fi
+
 list=$(lists $'x=$1\n# shellcheck disable=SC2086\n{\necho $x\necho $x\n}')
 if [ "$(grep -cxF $'scripts/a.sh\tSC2086\techo $x' <<<"$list")" = 2 ]; then
   echo "ok   a second hidden copy of a line"

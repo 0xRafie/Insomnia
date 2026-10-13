@@ -34,9 +34,11 @@ if [ "$rc" -gt 1 ] || ! jq -e '.comments | type == "array"' "$copy/findings.json
   exit 1
 fi
 # The list keeps one line per finding, so a second hidden copy of a line
-# already in it still changes the list.
+# already in it still changes the list. Each line's text comes from the
+# script itself, which has the copy's line numbers, so it shows comments
+# as they are.
 jq -r '.comments[] | "\(.file)\t\(.line)\tSC\(.code)"' "$copy/findings.json" |
   while IFS=$'\t' read -r file line code; do
-    text=$(sed -n "${line}p" "$copy/$file" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+    text=$(sed -n "${line}p" "$file" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
     printf '%s\t%s\t%s\n' "$file" "$code" "$text"
   done | LC_ALL=C sort
