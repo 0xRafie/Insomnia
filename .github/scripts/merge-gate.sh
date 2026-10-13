@@ -120,12 +120,19 @@ is_exempt() {
 # it) and greptile.json from the branch. SwiftPM builds from Package.swift
 # or, if one matches the toolchain, a Package@swift-<version>.swift. Lint
 # settings: ShellCheck reads .shellcheckrc from a script's folder or any
-# folder above it, and zizmor reads zizmor.yml.
+# folder above it, zizmor reads zizmor.yml, and zizmor skips what a
+# .gitignore or .ignore file lists. .gitattributes can mark files as
+# generated, which hides them from the diff a reviewer sees. Names match
+# in any case: the Mac runners check out to a case-insensitive disk, where
+# scripts/Check-Lid-Simulation-Gate.sh lands on the real one.
 is_config() {
-  case $1 in
+  local path
+  path=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case $path in
     .github/* | .greptile/* | */.greptile/* | greptile.json | */greptile.json) return 0 ;;
-    Package.swift | Package@swift*.swift | scripts/check-lid-simulation-gate.sh) return 0 ;;
+    package.swift | package@swift*.swift | scripts/check-lid-simulation-gate.sh) return 0 ;;
     .shellcheckrc | */.shellcheckrc | zizmor.yml | zizmor.yaml) return 0 ;;
+    .gitignore | */.gitignore | .ignore | */.ignore | .gitattributes | */.gitattributes) return 0 ;;
   esac
   return 1
 }

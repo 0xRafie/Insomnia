@@ -357,7 +357,9 @@ test_package_swift_is_config_and_needs_evidence() {
 test_files_that_steer_checks_are_config() {
   local f
   for f in Sources/Insomnia/Core/.greptile/config.json greptile.json docs/greptile.json Package@swift-6.swift \
-    scripts/check-lid-simulation-gate.sh .shellcheckrc scripts/.shellcheckrc zizmor.yml zizmor.yaml; do
+    scripts/check-lid-simulation-gate.sh .shellcheckrc scripts/.shellcheckrc zizmor.yml zizmor.yaml \
+    .gitignore .github/.gitignore docs/.ignore .ignore .gitattributes Sources/.gitattributes \
+    package@swift-6.swift PACKAGE.SWIFT Scripts/Check-Lid-Simulation-Gate.sh .GitHub/workflows/ci.yml; do
     changed "$f"
     run 0 evaluate 5
     [ "$(newest config state)" = pending ] || fail "$f does not count as config"

@@ -91,7 +91,9 @@ from a fork runs the workflow files on its own branch, and Greptile reads
 its rules from the branch it reviews. Those files are `.github/`, a
 `.greptile/` folder or `greptile.json` anywhere, `Package.swift` and any
 `Package@swift-<version>.swift`, `scripts/check-lid-simulation-gate.sh`,
-a `.shellcheckrc` anywhere, and `zizmor.yml`.
+`zizmor.yml`, and a `.shellcheckrc`, `.gitignore`, `.ignore` or
+`.gitattributes` anywhere. Names count in any case, since the Mac runners
+check out to a case-insensitive disk.
 
 ### Real-Mac evidence
 
