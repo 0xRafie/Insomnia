@@ -363,7 +363,9 @@ decide_gates() {
   # while this runs. The comparison lists at most 300 files; at 300, assume
   # the worst. A file also counts as config if its diff adds a setting a
   # check reads from inside the file: a ShellCheck directive (a
-  # "# shellcheck disable=all" line silences every warning in its script),
+  # "# shellcheck disable=all" line silences every warning in its script,
+  # and CI's .github/shellcheck-hidden.txt check catches a change that
+  # widens an existing directive without touching it),
   # or a Swift @diagnose attribute (SE-0522, in the Swift 6.4 that CI's
   # macOS 27 job runs) or @warn, in any spelling Swift accepts, such as
   # @`diagnose`, since the release build treats warnings as errors. GitHub

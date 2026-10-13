@@ -253,9 +253,16 @@ jobs:
 
   shellcheck:
     name: ShellCheck scripts
-    # shellcheck ships preinstalled on ubuntu-24.04; the macOS image has none.
+    # ShellCheck is pinned, as in the macOS jobs, since each version finds
+    # different things and .github/shellcheck-hidden.txt lists what one
+    # version finds.
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    env:
+      SHELLCHECK_VERSION: "0.11.0"
+      # sha256 of shellcheck-v0.11.0.linux.x86_64.tar.gz, as GitHub lists it
+      # for the release asset.
+      SHELLCHECK_SHA256: b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -280,6 +287,15 @@ jobs:
             echo "::notice title=Tested merge::main $base, pull request head $head"
           fi
 
+      - name: Install ShellCheck
+        run: |
+          tools="$RUNNER_TEMP/shellcheck"
+          mkdir -p "$tools"
+          curl -sSfL --retry 3 -o "$tools/shellcheck.tar.gz" \
+            "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.gz"
+          echo "${SHELLCHECK_SHA256}  $tools/shellcheck.tar.gz" | sha256sum -c -
+          tar -xzf "$tools/shellcheck.tar.gz" -C "$tools" --strip-components 1 "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
+
       - name: Lint shell scripts
         # Every script runs under bash, so its first line must say so.
         # ShellCheck picks its rules from that line: a pull request that
@@ -288,7 +304,8 @@ jobs:
         # the macOS jobs would no longer match how ./install.sh runs.
         # --shell=bash lints as bash whatever a file says.
         run: |
-          shellcheck --version
+          shellcheck="$RUNNER_TEMP/shellcheck/shellcheck"
+          "$shellcheck" --version
           for script in scripts/*.sh .github/scripts/*.sh; do
             case $(head -n 1 "$script") in
               '#!/bin/bash' | '#!/usr/bin/env bash') ;;
@@ -298,7 +315,27 @@ jobs:
                 ;;
             esac
           done
-          shellcheck --shell=bash scripts/*.sh .github/scripts/*.sh
+          "$shellcheck" --shell=bash scripts/*.sh .github/scripts/*.sh
+
+      - name: Test the check of what ShellCheck directives hide
+        run: SHELLCHECK="$RUNNER_TEMP/shellcheck/shellcheck" bash .github/scripts/shellcheck-hidden-test.sh
+
+      - name: Check what ShellCheck directives hide
+        # A directive covers the next command, so a pull request can widen
+        # one without touching it, for example with a "{" right after an
+        # existing directive and a "}" at the end of the file. The script
+        # lists every finding a directive hides, however far it reaches,
+        # and the list must match .github/shellcheck-hidden.txt, which
+        # counts as config. .github/scripts needs no list: it is config.
+        run: |
+          SHELLCHECK="$RUNNER_TEMP/shellcheck/shellcheck" .github/scripts/shellcheck-hidden.sh >"$RUNNER_TEMP/hidden.txt"
+          if ! diff -u .github/shellcheck-hidden.txt "$RUNNER_TEMP/hidden.txt"; then
+            echo "::error file=.github/shellcheck-hidden.txt::ShellCheck directives hide other findings than this file lists (diff above). If the change is right, put the new list in it; the owner OKs that as config."
+            echo "::group::the new list"
+            cat "$RUNNER_TEMP/hidden.txt"
+            echo "::endgroup::"
+            exit 1
+          fi
 
       - name: Test the merge gate with bash 5
         # The macOS jobs run these tests with /bin/bash 3.2; the workflow

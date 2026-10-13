@@ -420,7 +420,8 @@ test_greptile_guidance_files_are_config() {
 
 test_an_added_shellcheck_directive_is_config() {
   local line
-  for line in '# shellcheck disable=all' $'#\tshellcheck disable=all' '#   shellcheck shell=sh'; do
+  for line in '# shellcheck disable=all' $'#\tshellcheck disable=all' '#   shellcheck shell=sh' \
+    'true;# shellcheck disable=SC2086'; do
     diff_of scripts/backstop.sh modified 1 "$(printf '@@ -1,2 +1,3 @@\n #!/bin/bash\n+%s\n set -u' "$line")"
     run 0 evaluate 5
     [ "$(newest config state)" = pending ] || fail "\"$line\" does not count as config"

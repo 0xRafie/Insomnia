@@ -16,6 +16,15 @@ warning fails the build. Two Linux jobs run ShellCheck over `scripts/` and
 push to a pull request with the rules in `.greptile/`; it reads that folder
 from the pull request's branch.
 
+The ShellCheck job, with the ShellCheck version it pins, also lists every
+finding that a directive hides in `scripts/`, and fails unless the list
+matches `.github/shellcheck-hidden.txt`. A directive covers the next
+command, so a `{` added after an existing one and a `}` at the end would
+put the rest of the script under it without touching the directive. If
+your change hides something new
+on purpose, copy the list CI prints into that file. The file counts as
+config, so the owner OKs the change.
+
 The tmux integration cases require tmux at one of the executable paths probed
 by the app. CI installs it explicitly; when checking a local run, inspect the
 skip count so missing tmux is not mistaken for integration coverage. Tests
