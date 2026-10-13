@@ -98,15 +98,29 @@ the owner's OK only when every file it touches is one of these kinds:
 - `.sh` or `.swift` files directly in `scripts/`, except
   `scripts/check-lid-simulation-gate.sh`, which CI runs
 - `.png`, `.icns` or `.plist` files under `Resources/`
-- `README.md`, `CONTRIBUTING.md`, `SECURITY.md` and `LICENSE`
+- `README.md` and `LICENSE`
 
-Even there, a name starting with a dot (such as `.greptile/` or
-`.shellcheckrc`) and an `AGENTS.md`, `CLAUDE.md` or `GEMINI.md`, which
-review agents follow, count as config. Anything else, such as `.github/`,
-`Package.swift` or a new kind of file, waits for the owner. Names match in
-any case, and any name with a non-ASCII character counts, since the Mac
-runners check out to a disk that treats `S`, `s` and look-alikes such as
-`ſ` as one letter.
+Even there, some files count as config:
+
+- a name starting with a dot, such as `.greptile/` or `.shellcheckrc`
+- an `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, `CLAUDE.local.md` or
+  `GEMINI.md`, which review agents follow
+- `docs/spec.md` and `docs/release-validation.md`, which Greptile reads as
+  guidance for every review, as it does `SECURITY.md` and this file
+- a file whose diff adds a ShellCheck directive (`# shellcheck ...`) or a
+  Swift `@warn` or `@diagnose` attribute, since those switch off warnings
+  from inside the file
+- a changed file too big for GitHub to show its diff
+
+Anything else, such as `.github/`, `Package.swift` or a new kind of file,
+waits for the owner. Names match in any case, and any name with a
+non-ASCII character counts, since the Mac runners check out to a disk that
+treats `S`, `s` and look-alikes such as `ſ` as one letter.
+
+CI runs your code, so a test could make a check pass without doing its
+work. The release build and the lid check run before the tests for that
+reason, and the Codex review looks for tests and sources that skip, weaken
+or tamper with checks.
 
 ### Real-Mac evidence
 

@@ -116,16 +116,23 @@ is_exempt() {
 # for the owner. This is an allowlist: only kinds of files that no check
 # reads as settings pass, and anything else counts, since a list of the
 # dangerous files always misses one. Swift sources and tests, docs, the
-# product's scripts and resources, and the root README, CONTRIBUTING,
-# SECURITY and LICENSE pass. Within those, a name starting with a dot
-# counts (.greptile/ folders, .shellcheckrc, .gitignore and .ignore, which
-# zizmor honors, and .gitattributes, which can hide a file from the diff),
-# as does an AGENTS.md or CLAUDE.md, which Codex and other review agents
-# follow, and scripts/check-lid-simulation-gate.sh, which CI runs from the
-# branch. A fork's pull_request run uses the workflow files on the fork's
-# branch, so .github/ is never safe, and SwiftPM builds from Package.swift
-# or a Package@swift-<version>.swift at the root. Names match in any case:
-# the Mac runners check out to a case-insensitive disk, where
+# product's scripts and resources, and the root README and LICENSE pass.
+# Within those, a name starting with a dot counts (.greptile/ folders,
+# .shellcheckrc, .gitignore and .ignore, which zizmor honors, and
+# .gitattributes, which can hide a file from the diff), as does an
+# AGENTS.md or CLAUDE.md, which Codex and other review agents follow, and
+# scripts/check-lid-simulation-gate.sh, which CI runs from the branch.
+# .greptile/files.json gives Greptile docs/spec.md, SECURITY.md,
+# CONTRIBUTING.md and docs/release-validation.md as guidance for every
+# review, so those count too: the two root files by being left off the
+# allowlist (the tests check that every such file counts). Its scoped
+# entries, backstop.sh and RuntimeState.swift, are code under review in
+# their own right, and a comment anywhere in a change can argue the same
+# way, so the Codex review weighs those. A fork's pull_request run uses the
+# workflow files on the fork's branch, so .github/ is never safe, and
+# SwiftPM builds from Package.swift or a Package@swift-<version>.swift at
+# the root. Names match in any case: the
+# Mac runners check out to a case-insensitive disk, where
 # scripts/Check-Lid-Simulation-Gate.sh lands on the real one. That disk
 # also folds Unicode (scripts/ spelled with U+017F, a long s, lands on
 # scripts/), so any name with a byte outside printable ASCII counts too.
@@ -138,6 +145,7 @@ is_config() {
   name=${path##*/}
   case $path in
     */.* | scripts/*/* | scripts/check-lid-simulation-gate.sh) return 0 ;;
+    docs/spec.md | docs/release-validation.md) return 0 ;;
   esac
   case $name in
     agents.md | agents.override.md | claude.md | claude.local.md | gemini.md) return 0 ;;
@@ -147,7 +155,7 @@ is_config() {
     docs/*.md | docs/*.html | docs/*.svg | docs/*.png | docs/*.jpg | docs/*.gif) return 1 ;;
     scripts/*.sh | scripts/*.swift | skills/*.md) return 1 ;;
     resources/*.png | resources/*.icns | resources/*.plist) return 1 ;;
-    readme.md | contributing.md | security.md | license) return 1 ;;
+    readme.md | license) return 1 ;;
   esac
   return 0
 }
@@ -349,17 +357,36 @@ decide_gates() {
 
   # The files of this head, not of the pull request, which a push can move
   # while this runs. The comparison lists at most 300 files; at 300, assume
-  # the worst.
-  compare=$(gh api "repos/$REPO/compare/$BASE...$head" \
-    --jq '(.files // [] | length), (.files // [] | .[] | .filename, (.previous_filename // empty))') || return 1
+  # the worst. A file also counts as config if its diff adds a setting a
+  # check reads from inside the file: a ShellCheck directive (a
+  # "# shellcheck disable=all" line silences every warning in its script),
+  # or a Swift @warn or @diagnose attribute, which Swift 6.3 rejects but a
+  # later Swift may accept, and the release build treats warnings as
+  # errors. GitHub leaves out the diff of a file too big to show, so a
+  # changed file without one counts too; a file it holds as binary reports
+  # no changed lines. A control character in a name becomes U+00FF, which
+  # is_config counts, so a line break cannot split one name into two that
+  # each look safe.
+  compare=$(gh api "repos/$REPO/compare/$BASE...$head" --jq '
+    def clean: gsub("[[:cntrl:]]"; "\u00ff");
+    def sets: .status != "removed" and
+      (if .patch == null then (.changes // 1) > 0
+       else .patch | test("(^|\n)\\+[^\n]*(#[ \t]*shellcheck[ \t]|@warn\\(|@diagnose\\()") end);
+    (.files // [] | length),
+    (.files // [] | .[] | (.filename, (.previous_filename // empty)) | "path\t" + clean),
+    (.files // [] | .[] | select(sets) | "sets\t" + (.filename | clean))') || return 1
   count=$(printf '%s\n' "$compare" | sed -n 1p)
   files=$(printf '%s\n' "$compare" | sed 1d)
   if [ "$count" -ge 300 ]; then
     needs_evidence=yes
     touches_config=yes
   else
-    while IFS= read -r f; do
+    while IFS=$'\t' read -r kind f; do
       [ -n "$f" ] || continue
+      if [ "$kind" = sets ]; then
+        touches_config=yes
+        continue
+      fi
       if ! is_exempt "$f"; then
         needs_evidence=yes
       fi
@@ -491,8 +518,9 @@ expected_pair() {
 
 # required_check <context> <app id or -> [all|runs|status]: prints why
 # GitHub would not count this required check as passed on the head, or
-# nothing if it would. The newest check run with the name from each app
-# (only the named app, if the rule names one) must be a success. So must
+# nothing if it would. From each app (only the named app, if the rule
+# names one), the newest check run under each spelling of the name must be
+# a success, so a passing Mac-Mini cannot hide a failing mac-mini. So must
 # the newest status with the name, whatever app the rule names: GitHub
 # needs both when a check run and a status share a name, and a status does
 # not say which app posted it, so this fails closed. Names match in any
@@ -504,7 +532,7 @@ expected_pair() {
 # are for pairs whose rows check_pr prints already cover the rest. Reads
 # $runs and $latest from check_pr.
 required_check() {
-  local context=$1 app=$2 mode=${3:-all} apps='' a line status conclusion state seen=no
+  local context=$1 app=$2 mode=${3:-all} apps='' a names name line status conclusion state seen=no
   if [ "$mode" != status ]; then
     if [ "$app" = - ]; then
       apps=$(printf '%s\n' "$runs" | awk -F '\t' -v n="$context" 'tolower($2) == tolower(n) { print $5 }' | sort -u)
@@ -513,17 +541,20 @@ required_check() {
     fi
   fi
   for a in $apps; do
-    line=$(printf '%s\n' "$runs" | awk -F '\t' -v n="$context" -v a="$a" 'tolower($2) == tolower(n) && $5 == a' |
-      sort -n | tail -n 1)
-    [ -n "$line" ] || continue
-    IFS=$'\t' read -r _ _ status conclusion _ <<<"$line"
-    if [ "$conclusion" != success ]; then
-      echo "check run from app $a: $status, $conclusion"
-      return 0
-    fi
-    if printf '%s\n' "$runs" | awk -F '\t' -v n="$context" -v a="$a" '$2 == n && $5 == a { f = 1 } END { exit !f }'; then
-      seen=yes
-    fi
+    names=$(printf '%s\n' "$runs" | awk -F '\t' -v n="$context" -v a="$a" 'tolower($2) == tolower(n) && $5 == a { print $2 }' |
+      sort -u)
+    while IFS= read -r name; do
+      [ -n "$name" ] || continue
+      line=$(printf '%s\n' "$runs" | awk -F '\t' -v n="$name" -v a="$a" '$2 == n && $5 == a' | sort -n | tail -n 1)
+      IFS=$'\t' read -r _ _ status conclusion _ <<<"$line"
+      if [ "$conclusion" != success ]; then
+        echo "check run from app $a: $status, $conclusion"
+        return 0
+      fi
+      if [ "$name" = "$context" ]; then
+        seen=yes
+      fi
+    done <<<"$names"
   done
   if [ "$mode" = runs ]; then
     return 0

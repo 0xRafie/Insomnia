@@ -178,7 +178,19 @@ label_events() {
 
 # changed <file>...: the files the head changes against main.
 changed() {
-  printf '%s\n' "$@" | jq -R . | jq -s '{files: map({filename: ., status: "modified"})}' | json "compare_main...$HEAD_SHA"
+  printf '%s\n' "$@" | jq -R . |
+    jq -s '{files: map({filename: ., status: "modified", changes: 2, patch: "@@ -1 +1 @@\n-old\n+new"})}' |
+    json "compare_main...$HEAD_SHA"
+}
+
+# diff_of <file> <status> <changes> [patch]: a comparison of one file, with
+# no patch if none is given, as GitHub sends for a file too big to show.
+diff_of() {
+  local has=false
+  [ $# -lt 4 ] || has=true
+  jq -n --arg f "$1" --arg s "$2" --argjson c "$3" --arg p "${4-}" --argjson has "$has" \
+    '{files: [{filename: $f, status: $s, changes: $c} + (if $has then {patch: $p} else {} end)]}' |
+    json "compare_main...$HEAD_SHA"
 }
 
 # ci_runs <main sha>: the four CI jobs, ids 11 to 14, passed on the head,
@@ -342,7 +354,7 @@ test_source_change_needs_evidence() {
 
 test_moving_a_source_file_into_docs_needs_evidence() {
   echo '{"files": [{"filename": "docs/App.swift", "previous_filename": "Sources/Insomnia/App.swift",
-    "status": "renamed"}]}' | json "compare_main...$HEAD_SHA"
+    "status": "renamed", "changes": 0}]}' | json "compare_main...$HEAD_SHA"
   run 0 evaluate 5
   gate evidence pending
 }
@@ -363,7 +375,9 @@ test_files_that_steer_checks_are_config() {
     "$(printf '\305\277cripts/check-lid-simulation-gate.sh')" "$(printf 'Package.\305\277wift')" \
     "$(printf 'docs/caf\303\251.md')" Makefile notes.txt AGENTS.md docs/AGENTS.md skills/x/claude.md \
     docs/Gemini.md Tests/InsomniaTests/.hidden.swift Tests/InsomniaTests/fixture.json Resources/run.sh \
-    Sources/Insomnia/data.json scripts/lib/x.sh Plugins/Lint/plugin.swift docs/run.sh; do
+    Sources/Insomnia/data.json scripts/lib/x.sh Plugins/Lint/plugin.swift docs/run.sh docs/spec.md \
+    docs/release-validation.md CONTRIBUTING.md SECURITY.md security.md docs/CLAUDE.local.md \
+    docs/AGENTS.override.md; do
     changed "$f"
     run 0 evaluate 5
     [ "$(newest config state)" = pending ] || fail "$f does not count as config"
@@ -375,10 +389,74 @@ test_only_kinds_no_check_reads_skip_config() {
     Tests/InsomniaTestHome/include/Home.h Tests/InsomniaTestHome/Home.c docs/install.md \
     docs/mockups/menubar-ux.html docs/assets/eye.svg docs/shot.png docs/shot.jpg docs/shot.gif \
     scripts/install.sh scripts/generate-app-icon.swift skills/install-insomnia/SKILL.md \
-    Resources/AppIcon-1024.png Resources/AppIcon.icns Resources/Info.plist README.md CONTRIBUTING.md \
-    SECURITY.md LICENSE
+    Resources/AppIcon-1024.png Resources/AppIcon.icns Resources/Info.plist README.md LICENSE
   run 0 evaluate 5
   gate config success
+}
+
+test_greptile_guidance_files_are_config() {
+  local f n=0
+  while IFS= read -r f; do
+    n=$((n + 1))
+    changed "$f"
+    run 0 evaluate 5
+    [ "$(newest config state)" = pending ] || fail "$f, Greptile guidance in files.json, does not count as config"
+  done < <(jq -r '.[] | select(has("scope") | not) | .path' "$here/../../.greptile/files.json")
+  [ "$n" -gt 0 ] || fail "read no unscoped paths from .greptile/files.json"
+}
+
+test_an_added_shellcheck_directive_is_config() {
+  local line
+  for line in '# shellcheck disable=all' $'#\tshellcheck disable=all' '#   shellcheck shell=sh'; do
+    diff_of scripts/backstop.sh modified 1 "$(printf '@@ -1,2 +1,3 @@\n #!/bin/bash\n+%s\n set -u' "$line")"
+    run 0 evaluate 5
+    [ "$(newest config state)" = pending ] || fail "\"$line\" does not count as config"
+  done
+}
+
+test_a_shellcheck_directive_in_a_swift_test_is_config() {
+  diff_of Tests/InsomniaTests/FakeTests.swift modified 1 $'@@ -1 +1,2 @@\n let a = 1\n+let fake = "#!/bin/sh\\n#shellcheck\tdisable=SC2086"'
+  run 0 evaluate 5
+  gate config pending
+}
+
+test_an_added_swift_warning_control_is_config() {
+  local attr
+  for attr in '@warn(DeprecatedDeclaration, as: ignored)' '@diagnose(DeprecatedDeclaration, as: ignored)'; do
+    diff_of Sources/Insomnia/App.swift modified 1 "$(printf '@@ -1 +1,2 @@\n+%s\n func f() {}' "$attr")"
+    run 0 evaluate 5
+    [ "$(newest config state)" = pending ] || fail "$attr does not count as config"
+  done
+}
+
+test_a_directive_the_diff_only_keeps_or_removes_is_not_config() {
+  diff_of scripts/backstop.sh modified 2 $'@@ -1,4 +1,4 @@\n # shellcheck disable=SC2086\n x=$((a+1)) # shellcheck disable=SC2004\n-# shellcheck disable=SC2034\n-echo $a\n+echo "$a"'
+  run 0 evaluate 5
+  gate config success
+}
+
+test_a_changed_file_without_a_diff_is_config() {
+  diff_of Sources/Insomnia/Huge.swift modified 9000
+  run 0 evaluate 5
+  gate config pending
+  echo '{"files": [{"filename": "Sources/Insomnia/Huge.swift", "status": "modified"}]}' |
+    json "compare_main...$HEAD_SHA"
+  run 0 evaluate 5
+  [ "$(newest config state)" = pending ] || fail "a file with no diff and no count of changes does not count as config"
+}
+
+test_files_without_changed_lines_need_no_diff() {
+  jq -n '{files: [{filename: "Sources/Insomnia/B.swift", previous_filename: "Sources/Insomnia/A.swift",
+    status: "renamed", changes: 0}, {filename: "Resources/AppIcon.icns", status: "modified", changes: 0},
+    {filename: "Sources/Insomnia/Old.swift", status: "removed", changes: 9000}]}' | json "compare_main...$HEAD_SHA"
+  run 0 evaluate 5
+  gate config success
+}
+
+test_a_line_break_in_a_name_counts_as_config() {
+  diff_of "$(printf 'README.md\nSources/a.swift')" added 1 $'@@ -0,0 +1 @@\n+x'
+  run 0 evaluate 5
+  gate config pending
 }
 
 test_skills_need_evidence() {
@@ -708,6 +786,12 @@ test_check_runs_match_in_any_case_but_count_only_by_name() {
     {id: 43, name: "MAC-MINI", status: "completed", conclusion: "failure", app: {id: 556}}]'
   run 1 check 5
   says "FAIL  mac-mini                                 check run from app 556: completed, failure"
+  # A newer passing run under another spelling does not hide the failure.
+  change "commits_${HEAD_SHA}_check-runs" '.check_runs = [.check_runs[] | select(.id < 40)] + [
+    {id: 44, name: "mac-mini", status: "completed", conclusion: "failure", app: {id: 555}},
+    {id: 45, name: "Mac-Mini", status: "completed", conclusion: "success", app: {id: 555}}]'
+  run 1 check 5
+  says "FAIL  mac-mini                                 check run from app 555: completed, failure"
 }
 
 test_check_fails_if_any_status_with_the_name_fails() {

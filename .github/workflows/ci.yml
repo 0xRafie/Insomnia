@@ -125,6 +125,22 @@ jobs:
         # that answers from files, so it reads and writes nothing on GitHub.
         run: /bin/bash .github/scripts/merge-gate-test.sh
 
+      - name: Build release
+        # docs/release-validation.md cites "no compiler warnings" as evidence,
+        # so a warning fails this build instead of scrolling past. This and
+        # the lid check run before the tests: from the tests on, the pull
+        # request's own code runs in this job, and it could change what a
+        # later step does, for example by writing BASH_ENV to $GITHUB_ENV or
+        # by editing the checkout.
+        run: swift build -c release -Xswiftc -warnings-as-errors
+
+      - name: Check the lid simulation is compiled out of the release binary
+        # Looks at the binaries, not the compilation condition: the plain
+        # release build above must lack the simulate-lid.sh watcher, and a
+        # build with -DINSOMNIA_LID_SIMULATION (what build-app.sh adds
+        # for INSOMNIA_LID_SIMULATION=1) must have it.
+        run: scripts/check-lid-simulation-gate.sh
+
       - name: Install tmux
         # The hosted macOS image has no tmux, so the tmux integration tests skip.
         # Homebrew is preinstalled; on arm64 it links into /opt/homebrew/bin,
@@ -199,18 +215,6 @@ jobs:
           fi
           wait "$test_pid"
 
-      - name: Build release
-        # docs/release-validation.md cites "no compiler warnings" as evidence,
-        # so a warning fails this build instead of scrolling past.
-        run: swift build -c release -Xswiftc -warnings-as-errors
-
-      - name: Check the lid simulation is compiled out of the release binary
-        # Looks at the binaries, not the compilation condition: the plain
-        # release build above must lack the simulate-lid.sh watcher, and a
-        # build with -DINSOMNIA_LID_SIMULATION (what build-app.sh adds
-        # for INSOMNIA_LID_SIMULATION=1) must have it.
-        run: scripts/check-lid-simulation-gate.sh
-
       - name: ShellCheck the scripts the tests wrote
         # A broken fake makes a test pass or fail for the wrong reason: a
         # fake gh that used $10, which bash reads as ${1}0, faked 16
@@ -218,8 +222,9 @@ jobs:
         # pinned release and checks its digest before running it. An empty
         # folder fails, so a renamed variable cannot pass by checking
         # nothing. index.tsv names the test line that wrote each script.
-        # It runs last, and whenever the tests passed, so a lint failure
-        # does not hide the release build's result.
+        # It runs after the tests, which write the scripts, and only if they
+        # passed. Code the tests run can change what this step does, so the
+        # Codex review checks the tests for that.
         if: ${{ !cancelled() && steps.tests.outcome == 'success' }}
         env:
           SHELLCHECK_VERSION: "0.11.0"
