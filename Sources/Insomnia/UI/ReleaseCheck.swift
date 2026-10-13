@@ -309,7 +309,7 @@ final class ReleaseChecker {
         await inFlight?.value
     }
 
-    static func decode(_ data: Data) throws -> [GitHubRelease] {
+    nonisolated static func decode(_ data: Data) throws -> [GitHubRelease] {
         do {
             return try JSONDecoder().decode([GitHubRelease].self, from: data)
         } catch {
