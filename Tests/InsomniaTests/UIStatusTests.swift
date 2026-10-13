@@ -94,11 +94,19 @@ final class UIStatusTests: XCTestCase {
     }
 
     @MainActor
-    func testTickAnimationIsShorterThanBaseAndHoldIsSubSecond() {
+    func testHoldToEndIsSubSecond() {
         XCTAssertEqual(Motion.holdDuration, 0.6, accuracy: 0.0001)
         XCTAssertLessThan(Motion.holdDuration, 1)
-        XCTAssertEqual(Motion.tick(reduceMotion: true), Motion.reduced)
-        XCTAssertNotEqual(Motion.tick(reduceMotion: false), Motion.base)
+    }
+
+    /// Every frame of an animated countdown is a content change, and AppKit
+    /// re-renders the whole status item on each one, about 23 ms of main
+    /// thread per frame. The 0.18 s spring that used to run here held the app
+    /// at about 46% of one core for the whole session, against 2.3% with no
+    /// animation. The tick must stay unanimated.
+    @MainActor
+    func testTheCountdownDoesNotAnimateItsDigits() {
+        XCTAssertNil(Motion.countdownTick)
     }
 
     /// The blink was over in a handful of frames and barely read. It has to
