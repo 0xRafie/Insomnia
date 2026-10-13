@@ -375,8 +375,8 @@ test_files_that_steer_checks_are_config() {
     "$(printf '\305\277cripts/check-lid-simulation-gate.sh')" "$(printf 'Package.\305\277wift')" \
     "$(printf 'docs/caf\303\251.md')" Makefile notes.txt AGENTS.md docs/AGENTS.md skills/x/claude.md \
     docs/Gemini.md Tests/InsomniaTests/.hidden.swift Tests/InsomniaTests/fixture.json Resources/run.sh \
-    Sources/Insomnia/data.json scripts/lib/x.sh Plugins/Lint/plugin.swift docs/run.sh docs/spec.md \
-    docs/release-validation.md CONTRIBUTING.md SECURITY.md security.md docs/CLAUDE.local.md \
+    Sources/Insomnia/data.json scripts/lib/x.sh Plugins/Lint/plugin.swift docs/run.sh \
+    CONTRIBUTING.md SECURITY.md security.md docs/CLAUDE.local.md \
     docs/AGENTS.override.md; do
     changed "$f"
     run 0 evaluate 5
@@ -386,7 +386,8 @@ test_files_that_steer_checks_are_config() {
 
 test_only_kinds_no_check_reads_skip_config() {
   changed Sources/Insomnia/App.swift Sources/Insomnia/Package.swift Tests/InsomniaTests/AppTests.swift \
-    Tests/InsomniaTestHome/include/Home.h Tests/InsomniaTestHome/Home.c docs/install.md \
+    Tests/InsomniaTestHome/include/Home.h Tests/InsomniaTestHome/Home.c docs/install.md docs/spec.md \
+    docs/release-validation.md \
     docs/mockups/menubar-ux.html docs/assets/eye.svg docs/shot.png docs/shot.jpg docs/shot.gif \
     scripts/install.sh scripts/generate-app-icon.swift skills/install-insomnia/SKILL.md \
     Resources/AppIcon-1024.png Resources/AppIcon.icns Resources/Info.plist README.md LICENSE
@@ -401,7 +402,8 @@ test_greptile_guidance_files_are_config() {
     changed "$f"
     run 0 evaluate 5
     [ "$(newest config state)" = pending ] || fail "$f, Greptile guidance in files.json, does not count as config"
-  done < <(jq -r '.[] | select(has("scope") | not) | .path' "$here/../../.greptile/files.json")
+  done < <(jq -r '.[] | select(has("scope") | not) | .path
+    | select(. != "docs/spec.md" and . != "docs/release-validation.md")' "$here/../../.greptile/files.json")
   [ "$n" -gt 0 ] || fail "read no unscoped paths from .greptile/files.json"
 }
 
@@ -422,11 +424,18 @@ test_a_shellcheck_directive_in_a_swift_test_is_config() {
 
 test_an_added_swift_warning_control_is_config() {
   local attr
-  for attr in '@warn(DeprecatedDeclaration, as: ignored)' '@diagnose(DeprecatedDeclaration, as: ignored)'; do
+  for attr in '@warn(DeprecatedDeclaration, as: ignored)' '@diagnose(DeprecatedDeclaration, as: ignored)' \
+    "@\`diagnose\`(DeprecatedDeclaration, as: ignored)" '@ warn(DeprecatedDeclaration, as: ignored)' '@diagnose'; do
     diff_of Sources/Insomnia/App.swift modified 1 "$(printf '@@ -1 +1,2 @@\n+%s\n func f() {}' "$attr")"
     run 0 evaluate 5
     [ "$(newest config state)" = pending ] || fail "$attr does not count as config"
   done
+  diff_of Sources/Insomnia/App.swift modified 1 $'@@ -1 +1 @@\n+@diagnose'
+  run 0 evaluate 5
+  [ "$(newest config state)" = pending ] || fail "@diagnose at the end of a diff does not count as config"
+  diff_of Sources/Insomnia/App.swift modified 1 $'@@ -1 +1,2 @@\n+@warn_unqualified_access\n func f() {}'
+  run 0 evaluate 5
+  gate config success
 }
 
 test_a_directive_the_diff_only_keeps_or_removes_is_not_config() {
@@ -435,19 +444,23 @@ test_a_directive_the_diff_only_keeps_or_removes_is_not_config() {
   gate config success
 }
 
-test_a_changed_file_without_a_diff_is_config() {
-  diff_of Sources/Insomnia/Huge.swift modified 9000
-  run 0 evaluate 5
-  gate config pending
-  echo '{"files": [{"filename": "Sources/Insomnia/Huge.swift", "status": "modified"}]}' |
-    json "compare_main...$HEAD_SHA"
-  run 0 evaluate 5
-  [ "$(newest config state)" = pending ] || fail "a file with no diff and no count of changes does not count as config"
+test_a_file_without_a_diff_is_config() {
+  # Too big to show, binary (a NUL byte in a script makes it so), or
+  # renamed: GitHub sends no patch for any of them.
+  local spec
+  for spec in 'Sources/Insomnia/Huge.swift modified 9000' 'scripts/backstop.sh modified 0' \
+    'Sources/Insomnia/B.swift renamed 0' 'docs/assets/eye.svg added 0' 'scripts/x.png.sh added 0'; do
+    # shellcheck disable=SC2086 # split the spec into the arguments
+    diff_of $spec
+    run 0 evaluate 5
+    [ "$(newest config state)" = pending ] || fail "$spec without a diff does not count as config"
+  done
 }
 
-test_files_without_changed_lines_need_no_diff() {
-  jq -n '{files: [{filename: "Sources/Insomnia/B.swift", previous_filename: "Sources/Insomnia/A.swift",
-    status: "renamed", changes: 0}, {filename: "Resources/AppIcon.icns", status: "modified", changes: 0},
+test_images_and_removed_files_need_no_diff() {
+  jq -n '{files: [{filename: "Resources/AppIcon.icns", status: "modified", changes: 0},
+    {filename: "docs/Shot.PNG", status: "added", changes: 0}, {filename: "docs/a.jpg", status: "added", changes: 0},
+    {filename: "Resources/b.png", status: "added", changes: 0}, {filename: "docs/c.gif", status: "added", changes: 0},
     {filename: "Sources/Insomnia/Old.swift", status: "removed", changes: 9000}]}' | json "compare_main...$HEAD_SHA"
   run 0 evaluate 5
   gate config success

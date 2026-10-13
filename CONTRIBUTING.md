@@ -98,19 +98,20 @@ the owner's OK only when every file it touches is one of these kinds:
 - `.sh` or `.swift` files directly in `scripts/`, except
   `scripts/check-lid-simulation-gate.sh`, which CI runs
 - `.png`, `.icns` or `.plist` files under `Resources/`
-- `README.md` and `LICENSE`
+- `README.md` and `LICENSE` (`SECURITY.md` and this file set the project's
+  policy, and Greptile reads them as guidance for every review)
 
 Even there, some files count as config:
 
 - a name starting with a dot, such as `.greptile/` or `.shellcheckrc`
 - an `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, `CLAUDE.local.md` or
   `GEMINI.md`, which review agents follow
-- `docs/spec.md` and `docs/release-validation.md`, which Greptile reads as
-  guidance for every review, as it does `SECURITY.md` and this file
 - a file whose diff adds a ShellCheck directive (`# shellcheck ...`) or a
-  Swift `@warn` or `@diagnose` attribute, since those switch off warnings
-  from inside the file
-- a changed file too big for GitHub to show its diff
+  Swift `@diagnose` or `@warn` attribute in any spelling, since those switch
+  off warnings from inside the file
+- a file GitHub shows no diff for, because it is too big or binary (one NUL
+  byte makes a script binary), unless it is a `.png`, `.jpg`, `.gif` or
+  `.icns` image or was deleted
 
 Anything else, such as `.github/`, `Package.swift` or a new kind of file,
 waits for the owner. Names match in any case, and any name with a

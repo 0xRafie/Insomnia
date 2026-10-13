@@ -122,13 +122,15 @@ is_exempt() {
 # .gitattributes, which can hide a file from the diff), as does an
 # AGENTS.md or CLAUDE.md, which Codex and other review agents follow, and
 # scripts/check-lid-simulation-gate.sh, which CI runs from the branch.
-# .greptile/files.json gives Greptile docs/spec.md, SECURITY.md,
-# CONTRIBUTING.md and docs/release-validation.md as guidance for every
-# review, so those count too: the two root files by being left off the
-# allowlist (the tests check that every such file counts). Its scoped
-# entries, backstop.sh and RuntimeState.swift, are code under review in
-# their own right, and a comment anywhere in a change can argue the same
-# way, so the Codex review weighs those. A fork's pull_request run uses the
+# .greptile/files.json gives Greptile SECURITY.md and CONTRIBUTING.md as
+# guidance for every review, so they are left off the allowlist. It also
+# gives docs/spec.md and docs/release-validation.md, and in its scoped
+# entries backstop.sh and RuntimeState.swift, but contributors are meant to
+# change those: the spec with the behavior, the validation record with
+# their real-Mac checks. Each reviewer sees such a change in the diff, a
+# comment anywhere in a change could argue the same way, and the Codex
+# review, which a pull request cannot steer, weighs it. The tests check
+# that every other file files.json names counts. A fork's pull_request run uses the
 # workflow files on the fork's branch, so .github/ is never safe, and
 # SwiftPM builds from Package.swift or a Package@swift-<version>.swift at
 # the root. Names match in any case: the
@@ -145,7 +147,6 @@ is_config() {
   name=${path##*/}
   case $path in
     */.* | scripts/*/* | scripts/check-lid-simulation-gate.sh) return 0 ;;
-    docs/spec.md | docs/release-validation.md) return 0 ;;
   esac
   case $name in
     agents.md | agents.override.md | claude.md | claude.local.md | gemini.md) return 0 ;;
@@ -360,18 +361,19 @@ decide_gates() {
   # the worst. A file also counts as config if its diff adds a setting a
   # check reads from inside the file: a ShellCheck directive (a
   # "# shellcheck disable=all" line silences every warning in its script),
-  # or a Swift @warn or @diagnose attribute, which Swift 6.3 rejects but a
-  # later Swift may accept, and the release build treats warnings as
-  # errors. GitHub leaves out the diff of a file too big to show, so a
-  # changed file without one counts too; a file it holds as binary reports
-  # no changed lines. A control character in a name becomes U+00FF, which
-  # is_config counts, so a line break cannot split one name into two that
-  # each look safe.
+  # or a Swift @diagnose attribute (SE-0522, in the Swift 6.4 that CI's
+  # macOS 27 job runs) or @warn, in any spelling Swift accepts, such as
+  # @`diagnose`, since the release build treats warnings as errors. GitHub
+  # sends no diff for a file too big to show or for a binary file, and one
+  # NUL byte makes a script binary, so any file without a diff counts too,
+  # unless it is an image or was removed. A control character in a name
+  # becomes U+00FF, which is_config counts, so a line break cannot split one
+  # name into two that each look safe.
   compare=$(gh api "repos/$REPO/compare/$BASE...$head" --jq '
     def clean: gsub("[[:cntrl:]]"; "\u00ff");
     def sets: .status != "removed" and
-      (if .patch == null then (.changes // 1) > 0
-       else .patch | test("(^|\n)\\+[^\n]*(#[ \t]*shellcheck[ \t]|@warn\\(|@diagnose\\()") end);
+      (if .patch == null then .filename | ascii_downcase | test("\\.(png|jpg|gif|icns)$") | not
+       else .patch | test("(^|\n)\\+[^\n]*(#[ \t]*shellcheck[ \t]|@[ \t]*\\x60?(warn|diagnose)\\x60?([^A-Za-z0-9_]|$))") end);
     (.files // [] | length),
     (.files // [] | .[] | (.filename, (.previous_filename // empty)) | "path\t" + clean),
     (.files // [] | .[] | select(sets) | "sets\t" + (.filename | clean))') || return 1
