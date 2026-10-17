@@ -68,11 +68,17 @@ HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_ENV_HINTS=1 
 
 # A second fence inside the VM, under Softnet's on the host: no private or
 # tailnet addresses, DNS allowed. Code that runs as admin can lift this one
-# with sudo; it cannot lift Softnet's.
-sudo tee /etc/pf.insomnia-ci.conf >/dev/null <<'RULES'
+# with sudo; it cannot lift Softnet's. The rules go at the end of
+# /etc/pf.conf, because macOS loads that file at startup, replacing any
+# rules loaded before it; the LaunchDaemon then turns pf on, which macOS
+# leaves off.
+sudo tee -a /etc/pf.conf >/dev/null <<'RULES'
+
+# Insomnia CI: no private or tailnet addresses; DNS allowed.
 pass out quick proto { udp tcp } to any port 53
 block drop out quick to { 100.64.0.0/10, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 }
 RULES
+sudo /sbin/pfctl -n -f /etc/pf.conf
 sudo tee /Library/LaunchDaemons/org.insomnia.ci-pf.plist >/dev/null <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -80,7 +86,7 @@ sudo tee /Library/LaunchDaemons/org.insomnia.ci-pf.plist >/dev/null <<'PLIST'
 <dict>
   <key>Label</key><string>org.insomnia.ci-pf</string>
   <key>ProgramArguments</key>
-  <array><string>/sbin/pfctl</string><string>-E</string><string>-f</string><string>/etc/pf.insomnia-ci.conf</string></array>
+  <array><string>/sbin/pfctl</string><string>-E</string><string>-f</string><string>/etc/pf.conf</string></array>
   <key>RunAtLoad</key><true/>
 </dict>
 </plist>
@@ -92,5 +98,19 @@ xcodebuild -version
 /opt/homebrew/bin/tmux -V
 ./actions-runner/bin/Runner.Listener --version
 GUEST
+
+# Shut down from inside, so every write reaches the disk image. tart stop
+# asks macOS to shut down, macOS answers with a dialog, and after the
+# timeout tart turns the VM off: writes still in the guest's cache are
+# lost. A base VM made that way had the runner but not tmux or pf.
+"$TART" exec "$BASE" /bin/bash -c 'sync; sudo /sbin/shutdown -h now' >/dev/null 2>&1 || true
+for _ in $(seq 60); do
+  kill -0 "$run_pid" 2>/dev/null || break
+  sleep 2
+done
+if kill -0 "$run_pid" 2>/dev/null; then
+  echo "$BASE did not shut down within 2 minutes; delete it and run this again" >&2
+  exit 1
+fi
 
 echo "made $BASE from $IMAGE with runner $RUNNER_VERSION"

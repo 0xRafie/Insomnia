@@ -30,6 +30,15 @@ jobs:
     runs-on: [self-hosted, insomnia-mini]
     timeout-minutes: 60
     steps:
+      - name: Check the VM
+        # mini-base.sh turns on pf with a block on private and tailnet
+        # addresses, and installs tmux. A base VM that lost either fails
+        # here instead of running the job with one fence fewer.
+        run: |
+          sudo -n /sbin/pfctl -s info 2>/dev/null | grep -q 'Status: Enabled'
+          sudo -n /sbin/pfctl -s rules 2>/dev/null | grep -q '100.64.0.0/10'
+          /opt/homebrew/bin/tmux -V
+
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

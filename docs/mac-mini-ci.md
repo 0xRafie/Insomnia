@@ -58,8 +58,9 @@ gives the job a read-only token and no secrets. Three fences cover the rest:
   to start. On the default shared network a VM reached the MacBook's SSH and
   screen sharing ports over the tailnet (tested 2026-10-16).
 - **pf in the VM.** The base VM blocks private and tailnet addresses itself.
-  Job code runs as the VM's admin user and can lift this one; it cannot
-  lift Softnet's.
+  The job's first step fails if pf is off or the block is missing. Job code
+  runs as the VM's admin user and can lift this one; it cannot lift
+  Softnet's.
 
 The gateway address is the mini itself, so a job can reach any port the mini
 listens on from all interfaces. Keep the mini's SSH on keys only, and its
