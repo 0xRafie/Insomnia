@@ -115,6 +115,8 @@ sw_vers
 xcodebuild -version
 /opt/homebrew/bin/tmux -V
 ./actions-runner/bin/Runner.Listener --version
+# Everything above on disk before the host asks for a shutdown.
+sync
 GUEST
 
 # Shut down from inside, so every write reaches the disk image. tart stop
@@ -130,6 +132,12 @@ done
 kill "$shutdown_pid" 2>/dev/null || true
 if kill -0 "$run_pid" 2>/dev/null; then
   echo "$WORK did not shut down within 2 minutes" >&2
+  exit 1
+fi
+# tart run exits 0 when the guest shuts down. Anything else is a crash, and
+# the disk image may lack the guest's last writes.
+if ! wait "$run_pid"; then
+  echo "tart run for $WORK failed; not using it" >&2
   exit 1
 fi
 
