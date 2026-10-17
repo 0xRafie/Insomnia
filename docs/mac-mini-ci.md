@@ -31,7 +31,8 @@ the mini is off.
    runs 75 minutes from pickup is stopped too.
 
 Each pass starts by deleting any clone and runner registration an earlier
-pass left, after a crash or a reboot. If a clone won't delete, no new job
+pass left, after a crash or a reboot. It ends a leftover clone's `tart`
+processes first, found by the clone's name. If a clone won't delete, no new job
 starts; the loop logs it and tries again each minute. Run one loop at a
 time, since each pass deletes every clone the loop names.
 

@@ -72,15 +72,23 @@ unregister() {
 
 # Registrations an interrupted pass left: the runner's VM is gone, but its
 # registration stays until it is removed. Runs only when no clone exists,
-# so none of these can be running a job.
+# so none of these can be running a job. All pages are read before any
+# removal, since a removal moves the later entries up a page.
 unregister_leftovers() {
-  local runners id
-  runners=$(github_curl GET 'actions/runners?per_page=100' -f) || {
-    log "could not list runners"
-    return 1
-  }
-  for id in $(printf '%s' "$runners" | /usr/bin/jq -r --arg p "$NAME_PATTERN" \
-    '.runners[] | select(.name | test($p)) | .id'); do
+  local runners count id ids='' page=1
+  while [ "$page" -le 50 ]; do
+    runners=$(github_curl GET "actions/runners?per_page=100&page=$page" -f) || {
+      log "could not list runners"
+      return 1
+    }
+    ids="$ids $(printf '%s' "$runners" | /usr/bin/jq -r --arg p "$NAME_PATTERN" \
+      '.runners[] | select(.name | test($p)) | .id')"
+    count=$(printf '%s' "$runners" | /usr/bin/jq '.runners | length')
+    # A short page is the last; so is one jq could not read.
+    [ "${count:-0}" -ge 100 ] 2>/dev/null || break
+    page=$((page + 1))
+  done
+  for id in $ids; do
     log "removing runner $id, left from an earlier pass"
     unregister "$id"
   done
@@ -104,15 +112,34 @@ reap() {
   return 0
 }
 
+# A clone's tart processes, found by their command line, for a clone that
+# an earlier run of this script started. The process name must be tart, so
+# another program that names the clone in its arguments is left alone.
+tart_pids() {
+  local pid
+  for pid in $(pgrep -U "$(id -u)" -f "tart (run|exec) .*$1"); do
+    case $(ps -o comm= -p "$pid") in
+      */tart | tart) echo "$pid" ;;
+    esac
+  done
+}
+
 # Stops and deletes a clone, then checks that tart no longer lists it.
 # Further arguments are the clone's tart processes, which must exit before
-# the clone can be deleted.
+# the clone can be deleted; any others still running are found by name.
 remove_vm() {
-  local name=$1 vms
+  local name=$1 vms pid
+  local pids=()
   shift
   "$TART" stop "$name" --timeout 10 >/dev/null 2>&1
+  pids=(${@+"$@"})
+  while read -r pid; do
+    pids+=("$pid")
+  done < <(tart_pids "$name")
+  if [ ${#pids[@]} -gt 0 ]; then
+    reap "${pids[@]}"
+  fi
   if [ $# -gt 0 ]; then
-    reap "$@"
     wait "$@" 2>/dev/null
   fi
   "$TART" delete "$name" >/dev/null 2>&1
