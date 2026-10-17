@@ -1,0 +1,96 @@
+#!/bin/bash
+# Makes the VM that mini-runner.sh clones for every Mac mini job: Cirrus
+# Labs' macOS 27 image with Xcode 27, plus the GitHub Actions runner and
+# tmux. Run it on the Mac mini, as the user that runs mini-runner.sh, once
+# and again to move to a new image or runner version. docs/mac-mini-ci.md
+# has the steps around it.
+#
+# The base VM gets no credentials of any kind. The runner is registered per
+# job by mini-runner.sh, with a one-job token, inside a clone.
+set -eu
+
+TART=${TART:-$HOME/.local/bin/tart}
+IMAGE=${INSOMNIA_MINI_IMAGE:-ghcr.io/cirruslabs/macos-golden-gate-xcode:27}
+BASE=${INSOMNIA_MINI_BASE:-insomnia-ci-base}
+RUNNER_VERSION=2.338.0
+# sha256 of actions-runner-osx-arm64-2.338.0.tar.gz, as the release lists it.
+RUNNER_SHA256=df4cebda25c86a886ed204e49fee63f5c2e7cec5f447b5c98440a826bbdf9df2
+# The mini has 12 cores and 16 GB, and macOS runs at most two VMs. This
+# leaves room for one lab VM next to a job.
+CPUS=8
+MEMORY_MB=8192
+
+if "$TART" list --quiet | grep -qx "$BASE"; then
+  echo "$BASE exists; to remake it, run: $TART delete $BASE" >&2
+  exit 1
+fi
+
+"$TART" pull "$IMAGE"
+"$TART" clone "$IMAGE" "$BASE"
+"$TART" set "$BASE" --cpu "$CPUS" --memory "$MEMORY_MB"
+"$TART" run --no-graphics "$BASE" >/dev/null 2>&1 &
+run_pid=$!
+trap '"$TART" stop "$BASE" >/dev/null 2>&1 || true; wait "$run_pid" 2>/dev/null || true' EXIT
+
+# The guest agent answers once macOS has booted and logged in.
+ready=
+for _ in $(seq 60); do
+  if "$TART" exec "$BASE" true 2>/dev/null; then
+    ready=1
+    break
+  fi
+  sleep 5
+done
+if [ -z "$ready" ]; then
+  echo "$BASE did not answer within 5 minutes" >&2
+  exit 1
+fi
+
+# Inside the VM, as the image's admin user. The quoted heredoc reaches the
+# guest's bash unexpanded; the two values come in as arguments.
+"$TART" exec -i "$BASE" /bin/bash -s -- "$RUNNER_VERSION" "$RUNNER_SHA256" <<'GUEST'
+set -eu
+version=$1
+sha=$2
+cd "$HOME"
+rm -rf actions-runner
+curl -sSfL --retry 3 -o runner.tar.gz \
+  "https://github.com/actions/runner/releases/download/v$version/actions-runner-osx-arm64-$version.tar.gz"
+echo "$sha  runner.tar.gz" | shasum -a 256 -c -
+mkdir actions-runner
+tar -xzf runner.tar.gz -C actions-runner
+rm runner.tar.gz
+
+# CI installs tmux in its job; here the job runs as the same user, but the
+# image is made once, so a job does not wait on Homebrew.
+HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_ENV_HINTS=1 \
+  /opt/homebrew/bin/brew install tmux
+
+# A second fence inside the VM, under Softnet's on the host: no private or
+# tailnet addresses, DNS allowed. Code that runs as admin can lift this one
+# with sudo; it cannot lift Softnet's.
+sudo tee /etc/pf.insomnia-ci.conf >/dev/null <<'RULES'
+pass out quick proto { udp tcp } to any port 53
+block drop out quick to { 100.64.0.0/10, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 }
+RULES
+sudo tee /Library/LaunchDaemons/org.insomnia.ci-pf.plist >/dev/null <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>org.insomnia.ci-pf</string>
+  <key>ProgramArguments</key>
+  <array><string>/sbin/pfctl</string><string>-E</string><string>-f</string><string>/etc/pf.insomnia-ci.conf</string></array>
+  <key>RunAtLoad</key><true/>
+</dict>
+</plist>
+PLIST
+sudo /usr/sbin/softwareupdate --schedule off >/dev/null 2>&1 || true
+
+sw_vers
+xcodebuild -version
+/opt/homebrew/bin/tmux -V
+./actions-runner/bin/Runner.Listener --version
+GUEST
+
+echo "made $BASE from $IMAGE with runner $RUNNER_VERSION"
