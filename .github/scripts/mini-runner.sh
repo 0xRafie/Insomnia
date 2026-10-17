@@ -5,10 +5,12 @@
 #      unregisters itself;
 #   2. clones the VM that mini-base.sh made and boots it on Softnet;
 #   3. starts the runner in the clone and waits for it to exit;
-#   4. stops and deletes the clone, so no job sees another job's files.
+#   4. stops and deletes the clone, so no job sees another job's files, and
+#      removes the runner's registration if it is still there.
 # One runner always waits for a job, so a job starts within seconds, and
 # the waiting VM takes one of the two VMs macOS allows. A LaunchAgent on the
-# mini keeps this running; docs/mac-mini-ci.md has the setup.
+# mini keeps this running; docs/mac-mini-ci.md has the setup. Run one loop
+# at a time: each pass deletes every clone and runner the loop names.
 set -u
 
 REPO=${INSOMNIA_MINI_REPO:-krishhgg/Insomnia}
@@ -22,17 +24,15 @@ LABEL=insomnia-mini
 # From the moment the runner takes a job. The job's own timeout is 60
 # minutes; this is the backstop if the runner hangs past it.
 JOB_LIMIT=${INSOMNIA_MINI_JOB_LIMIT:-4500}
+# Clones and runners this loop made, and only those.
+NAME_PATTERN='^mini-[0-9]{8}-[0-9]{6}$'
 
 # Softnet lets the VM reach the internet and the host's gateway address,
 # and nothing else on the mini's networks. Its default already leaves out
 # private ranges; the tailnet's range is named as well, so it stays out
 # whatever Softnet counts as private. Without Softnet the VM would share the
-# mini's network, tailnet included, so the loop refuses to start, unless
-# INSOMNIA_MINI_ALLOW_NAT=1 says the jobs are the owner's own.
-net=(--net-softnet "--net-softnet-block=100.64.0.0/10")
-if [ "${INSOMNIA_MINI_ALLOW_NAT:-}" = 1 ]; then
-  net=()
-elif ! command -v softnet >/dev/null 2>&1; then
+# mini's network, tailnet included, so the loop refuses to start.
+if ! command -v softnet >/dev/null 2>&1; then
   echo "softnet is not on PATH; see docs/mac-mini-ci.md" >&2
   exit 1
 fi
@@ -41,62 +41,135 @@ mkdir -p "$LOG_DIR"
 
 log() { printf '%s %s\n' "$(date '+%F %T')" "$*"; }
 
-# GitHub's REST API for this repository: method, path, optional JSON body.
-# The token goes to curl through its config on stdin, never in an argument
-# list that ps shows.
-github_api() {
-  local token
+# curl with the token, for GitHub's REST API for this repository: method,
+# path, then more curl arguments. The token goes to curl through its config
+# on stdin, never in an argument list that ps shows.
+github_curl() {
+  local token method=$1 path=$2
+  shift 2
   token=$(security find-generic-password -s "$KEYCHAIN_SERVICE" -a github -w) || {
     log "no token in the keychain under $KEYCHAIN_SERVICE"
     return 1
   }
-  local args=(-sSf --retry 2 --config - -X "$1"
-    -H 'Accept: application/vnd.github+json'
-    -H 'X-GitHub-Api-Version: 2022-11-28')
-  if [ -n "${3:-}" ]; then
-    args+=(--data "$3")
-  fi
   printf 'header = "Authorization: Bearer %s"\n' "$token" |
-    curl "${args[@]}" "https://api.github.com/repos/$REPO/$2"
+    curl -sS --retry 2 --max-time 60 --config - -X "$method" \
+      -H 'Accept: application/vnd.github+json' \
+      -H 'X-GitHub-Api-Version: 2022-11-28' \
+      "$@" "https://api.github.com/repos/$REPO/$path"
 }
 
-remove_vm() {
-  "$TART" stop "$1" --timeout 10 >/dev/null 2>&1 || true
-  "$TART" delete "$1" >/dev/null 2>&1 || true
-}
-
-# Clones a crash or reboot left behind.
-for vm in $("$TART" list --quiet); do
-  case $vm in
-    mini-[0-9]*)
-      log "removing $vm, left from an earlier run"
-      remove_vm "$vm"
-      ;;
+# Removes a runner's registration. GitHub answers 404 for one that is
+# already gone, as a just-in-time runner is after its job.
+unregister() {
+  local status
+  status=$(github_curl DELETE "actions/runners/$1" -o /dev/null -w '%{http_code}') || status=
+  case $status in
+    204 | 404) return 0 ;;
   esac
-done
+  log "could not remove runner $1 (HTTP ${status:-error}); the next pass tries again"
+  return 1
+}
+
+# Registrations an interrupted pass left: the runner's VM is gone, but its
+# registration stays until it is removed. Runs only when no clone exists,
+# so none of these can be running a job.
+unregister_leftovers() {
+  local runners id
+  runners=$(github_curl GET 'actions/runners?per_page=100' -f) || {
+    log "could not list runners"
+    return 1
+  }
+  for id in $(printf '%s' "$runners" | /usr/bin/jq -r --arg p "$NAME_PATTERN" \
+    '.runners[] | select(.name | test($p)) | .id'); do
+    log "removing runner $id, left from an earlier pass"
+    unregister "$id"
+  done
+}
+
+# Waits up to 30 s for the given processes to exit, then ends them. They
+# are the tart processes of one clone.
+reap() {
+  local pid
+  for _ in $(seq 30); do
+    kill -0 "$@" 2>/dev/null || return 0
+    sleep 1
+  done
+  for pid in "$@"; do
+    kill -TERM "$pid" 2>/dev/null && log "ending tart process $pid"
+  done
+  sleep 10
+  for pid in "$@"; do
+    kill -KILL "$pid" 2>/dev/null
+  done
+  return 0
+}
+
+# Stops and deletes a clone, then checks that tart no longer lists it.
+# Further arguments are the clone's tart processes, which must exit before
+# the clone can be deleted.
+remove_vm() {
+  local name=$1 vms
+  shift
+  "$TART" stop "$name" --timeout 10 >/dev/null 2>&1
+  if [ $# -gt 0 ]; then
+    reap "$@"
+    wait "$@" 2>/dev/null
+  fi
+  "$TART" delete "$name" >/dev/null 2>&1
+  vms=$("$TART" list --quiet) || {
+    log "tart list failed after deleting $name"
+    return 1
+  }
+  if printf '%s\n' "$vms" | grep -qx "$name"; then
+    log "could not delete $name"
+    return 1
+  fi
+}
+
+# Deletes every clone this loop made. A crash, a reboot or a failed pass
+# can leave one. No job starts until all are gone.
+remove_leftovers() {
+  local vms vm left=0
+  vms=$("$TART" list --quiet) || {
+    log "tart list failed"
+    return 1
+  }
+  for vm in $(printf '%s\n' "$vms" | grep -E "$NAME_PATTERN"); do
+    log "removing $vm, left from an earlier pass"
+    remove_vm "$vm" || left=1
+  done
+  return "$left"
+}
 
 one_job() {
   local name response config id run_pid exec_pid runner_log started ready
+  local result=0
   name="mini-$(date '+%Y%m%d-%H%M%S')"
   runner_log="$LOG_DIR/$name.log"
 
-  response=$(github_api POST actions/runners/generate-jitconfig \
+  response=$(github_curl POST actions/runners/generate-jitconfig -f --data \
     "{\"name\":\"$name\",\"runner_group_id\":1,\"labels\":[\"self-hosted\",\"macOS\",\"ARM64\",\"$LABEL\"],\"work_folder\":\"_work\"}") || {
     log "GitHub gave no runner config"
     return 1
   }
-  if ! config=$(printf '%s' "$response" | plutil -extract encoded_jit_config raw -o - -) ||
-    ! id=$(printf '%s' "$response" | plutil -extract runner.id raw -o - -); then
+  # The id first: with it, a pass that stops later can still unregister.
+  if ! id=$(printf '%s' "$response" | plutil -extract runner.id raw -o - -); then
+    log "could not read the runner id GitHub sent"
+    return 1
+  fi
+  if ! config=$(printf '%s' "$response" | plutil -extract encoded_jit_config raw -o - -); then
     log "could not read the runner config GitHub sent"
+    unregister "$id"
     return 1
   fi
 
   if ! "$TART" clone "$BASE" "$name"; then
     log "could not clone $BASE"
-    github_api DELETE "actions/runners/$id" >/dev/null 2>&1
+    unregister "$id"
     return 1
   fi
-  "$TART" run --no-graphics ${net[@]+"${net[@]}"} "$name" >>"$runner_log" 2>&1 &
+  "$TART" run --no-graphics --net-softnet "--net-softnet-block=100.64.0.0/10" \
+    "$name" >>"$runner_log" 2>&1 &
   run_pid=$!
 
   ready=
@@ -110,8 +183,8 @@ one_job() {
   done
   if [ -z "$ready" ]; then
     log "$name did not boot"
-    remove_vm "$name"
-    github_api DELETE "actions/runners/$id" >/dev/null 2>&1
+    remove_vm "$name" "$run_pid"
+    unregister "$id"
     return 1
   fi
 
@@ -141,19 +214,20 @@ one_job() {
     sleep 10
   done
   log "$name: $(grep 'completed with result' "$runner_log" | tail -n 1)"
-  remove_vm "$name"
-  wait "$exec_pid" 2>/dev/null
-  wait "$run_pid" 2>/dev/null
-  # A runner that never took a job is still registered; GitHub answers 404
-  # for one that already left.
-  if [ -z "$started" ]; then
-    github_api DELETE "actions/runners/$id" >/dev/null 2>&1
-  fi
-  return 0
+  remove_vm "$name" "$exec_pid" "$run_pid" || result=1
+  # Also when the job ran: a runner whose VM stopped mid-job is still
+  # registered.
+  unregister "$id"
+  return "$result"
 }
 
 while :; do
-  # A failed pass waits a minute, so a missing token or a GitHub outage
-  # doesn't turn into a tight loop.
-  one_job || sleep 60
+  # A failed pass waits a minute, so a missing token, a GitHub outage or a
+  # clone that won't delete doesn't turn into a tight loop. While a clone
+  # is left, no new job starts.
+  if remove_leftovers; then
+    unregister_leftovers
+    one_job && continue
+  fi
+  sleep 60
 done

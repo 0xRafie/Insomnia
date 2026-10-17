@@ -35,6 +35,20 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Note which main this run tests
+        # The same note as ci.yml's. merge-gate.sh check needs one in each
+        # required check, so this job can become one without a change here.
+        if: github.event_name == 'pull_request'
+        run: |
+          parents=$(git cat-file -p HEAD | sed -n 's/^parent //p')
+          base=$(printf '%s\n' "$parents" | sed -n 1p)
+          head=$(printf '%s\n' "$parents" | sed -n 2p)
+          if [ -z "$head" ]; then
+            echo "::warning::HEAD is not a merge commit, so this run names no main"
+          else
+            echo "::notice title=Tested merge::main $base, pull request head $head"
+          fi
+
       - name: Print macOS and toolchain versions
         run: |
           sw_vers

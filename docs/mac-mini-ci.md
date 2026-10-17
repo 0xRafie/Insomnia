@@ -8,9 +8,11 @@ which contributors and the maintainer skip on their own Macs.
 
 It adds to the GitHub-hosted jobs in `ci.yml`; it doesn't replace them. It
 is not a required check. To make it one, add `Swift test (Mac mini, macOS 27
-VM)` to the main ruleset and to the required checks in
-`.github/scripts/merge-gate.sh`. Wait for a week of clean runs first. Once
-it is required, no pull request can merge while the mini is off.
+VM)` to the main ruleset and to `CI_CHECKS` in
+`.github/scripts/merge-gate.sh`. The job already writes the "Tested merge"
+note that `merge-gate.sh check` reads for each entry there. Wait for a week
+of clean runs first. Once it is required, no pull request can merge while
+the mini is off.
 
 ## How a job runs
 
@@ -24,8 +26,14 @@ it is required, no pull request can merge while the mini is off.
    disk.
 3. It starts the runner in the clone and waits for it to exit. One runner
    always waits for a job, so a job starts within seconds.
-4. It stops and deletes the clone. A job that runs 75 minutes from pickup is
-   stopped too.
+4. It stops and deletes the clone, checks that Tart no longer lists it, and
+   removes the runner's registration if GitHub still has it. A job that
+   runs 75 minutes from pickup is stopped too.
+
+Each pass starts by deleting any clone and runner registration an earlier
+pass left, after a crash or a reboot. If a clone won't delete, no new job
+starts; the loop logs it and tries again each minute. Run one loop at a
+time, since each pass deletes every clone the loop names.
 
 `.github/scripts/mini-base.sh` makes the base VM from Cirrus Labs'
 `macos-golden-gate-xcode:27` image. It adds the GitHub Actions runner
