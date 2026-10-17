@@ -91,7 +91,6 @@ sudo tee /Library/LaunchDaemons/org.insomnia.ci-pf.plist >/dev/null <<'PLIST'
 </dict>
 </plist>
 PLIST
-sudo /usr/sbin/softwareupdate --schedule off >/dev/null 2>&1 || true
 
 sw_vers
 xcodebuild -version
