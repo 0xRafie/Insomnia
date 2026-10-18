@@ -514,7 +514,7 @@ struct SettingsView: View {
         }
         switch releases.state {
         case .idle:
-            Text("Asks GitHub for the releases list when you click, and installs nothing. To upgrade, run the installer again.")
+            Text("Asks GitHub when you click, and installs nothing. To upgrade, run the installer again.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         case .checking:

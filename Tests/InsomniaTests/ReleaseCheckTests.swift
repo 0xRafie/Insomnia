@@ -130,14 +130,24 @@ final class ReleaseCheckTests: XCTestCase {
     }
 
     /// A nightly reports the version Info.plist has on main, which is above
-    /// the stable one once main bumps it. That is not an update.
-    func testAVersionAboveTheNewestStableIsNotBehind() {
-        let report = ReleaseReport(installed: AppBuild(version: "0.2.0", build: "1"), latest: release("v0.1.0", prerelease: false), releases: [
+    /// the stable one once main bumps it. That is not an update, and the
+    /// report does not guess where the build came from: the same line is
+    /// shown to someone on stable 0.2.0 after 0.1.1 was marked Latest.
+    func testAVersionAboveTheReleaseMarkedLatestIsNotBehind() {
+        let nightlyOfABumpedMain = ReleaseReport(installed: AppBuild(version: "0.2.0", build: "1"), latest: release("v0.1.0", prerelease: false), releases: [
             release("v0.1.0", prerelease: false),
         ])
+        let stableAboveAnOlderLatest = ReleaseReport(installed: AppBuild(version: "0.2.0", build: "1"), latest: release("v0.1.1", prerelease: false), releases: [
+            release("v0.1.1", prerelease: false),
+            release("v0.2.0", prerelease: false),
+        ])
 
-        XCTAssertEqual(report.standing, .aheadOfStable)
-        XCTAssertEqual(report.summary, "You have 0.2.0, above the newest stable release, 0.1.0. That is a nightly or a source build. No nightly is published.")
+        XCTAssertEqual(nightlyOfABumpedMain.standing, .aheadOfStable)
+        XCTAssertEqual(nightlyOfABumpedMain.summary, "You have 0.2.0, higher than the release marked Latest, 0.1.0. No nightly is published.")
+        XCTAssertEqual(stableAboveAnOlderLatest.standing, .aheadOfStable)
+        XCTAssertEqual(stableAboveAnOlderLatest.summary, "You have 0.2.0, higher than the release marked Latest, 0.1.1. No nightly is published.")
+        XCTAssertFalse(stableAboveAnOlderLatest.summary.contains("nightly or a source build"))
+        XCTAssertEqual(stableAboveAnOlderLatest.logLine, "installed 0.2.0 (1), newest stable 0.1.1, newest nightly none: higher than the release marked Latest")
     }
 
     func testALatestThatIsNotAStableReleaseCountsAsNone() {
@@ -252,6 +262,42 @@ final class ReleaseCheckTests: XCTestCase {
         XCTAssertEqual(GitHubReleaseFetcher.request(GitHubReleaseFetcher.listEndpoint, installed: AppBuild(version: nil, build: nil)).value(forHTTPHeaderField: "User-Agent"), "Insomnia/unpackaged")
     }
 
+    // MARK: The transport
+
+    /// The session refuses a redirect. The stub plays GitHub answering
+    /// `302` to another host, and that host answering `200` with a valid
+    /// list, so a session that followed the redirect would succeed. The
+    /// fetcher instead fails with the 302, and the other host sees no
+    /// request.
+    func testARedirectIsNotFollowedAndIsReportedAsItsStatus() async {
+        RedirectStub.script.reset(mode: .redirect)
+        let fetcher = GitHubReleaseFetcher(configuration: RedirectStub.configuration)
+
+        for call in ["releases", "latestRelease"] {
+            do {
+                if call == "releases" { _ = try await fetcher.releases() } else { _ = try await fetcher.latestRelease() }
+                XCTFail("\(call) followed the redirect and accepted the other host's answer")
+            } catch {
+                XCTAssertEqual(error as? ReleaseCheckError, .status(302), call)
+            }
+        }
+        XCTAssertEqual(RedirectStub.script.requests, [GitHubReleaseFetcher.listEndpoint, GitHubReleaseFetcher.latestEndpoint], "one request each, none to the redirect's host")
+    }
+
+    /// The same session, with GitHub answering directly: the list comes
+    /// back as sent, and a 404 for the latest release is nil, not an error.
+    func testDirectAnswersComeBackAsSent() async throws {
+        RedirectStub.script.reset(mode: .direct)
+        let fetcher = GitHubReleaseFetcher(configuration: RedirectStub.configuration)
+
+        let list = try await fetcher.releases()
+        let latest = try await fetcher.latestRelease()
+
+        XCTAssertEqual(list, RedirectStub.listBody)
+        XCTAssertNil(latest)
+        XCTAssertEqual(RedirectStub.script.requests, [GitHubReleaseFetcher.listEndpoint, GitHubReleaseFetcher.latestEndpoint])
+    }
+
     // MARK: The button
 
     private func json(_ object: Any) throws -> Data {
@@ -348,4 +394,82 @@ final class ReleaseCheckTests: XCTestCase {
         requests = await fake.requests
         XCTAssertEqual(requests, 4)
     }
+}
+
+
+/// Plays GitHub for one `URLSession`: in `.redirect` mode every request to
+/// api.github.com gets a 302 to `elsewhere`, and a request that reaches
+/// `elsewhere` gets a 200 with a valid list; in `.direct` mode the list
+/// endpoint gets `listBody` and the latest endpoint a 404. Every request
+/// is recorded in the order received.
+private final class RedirectStub: URLProtocol {
+    enum Mode { case redirect, direct }
+
+    final class Script: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _mode: Mode = .direct
+        private var _requests: [URL] = []
+
+        var mode: Mode { lock.withLock { _mode } }
+        var requests: [URL] { lock.withLock { _requests } }
+
+        func reset(mode: Mode) {
+            lock.withLock {
+                _mode = mode
+                _requests = []
+            }
+        }
+
+        func record(_ url: URL) { lock.withLock { _requests.append(url) } }
+    }
+
+    static let script = Script()
+    static let elsewhere = URL(string: "https://elsewhere.test/releases")!
+    static let listBody = Data("[{\"tag_name\": \"v0.1.0\", \"draft\": false, \"prerelease\": false}]".utf8)
+    static let elsewhereBody = Data("[{\"tag_name\": \"v9.9.9\", \"draft\": false, \"prerelease\": false}]".utf8)
+
+    static let configuration: @Sendable () -> URLSessionConfiguration = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [RedirectStub.self]
+        return configuration
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let url = request.url, let client else { return }
+        Self.script.record(url)
+        if url.host == "api.github.com", Self.script.mode == .redirect {
+            let response = HTTPURLResponse(url: url, statusCode: 302, httpVersion: "HTTP/1.1", headerFields: ["Location": Self.elsewhere.absoluteString])!
+            var next = request
+            next.url = Self.elsewhere
+            // The session asks its delegate about the redirect. A session
+            // that follows it starts a new load for `next`; one that
+            // refuses it finishes with the response delivered below.
+            client.urlProtocol(self, wasRedirectedTo: next, redirectResponse: response)
+            client.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client.urlProtocol(self, didLoad: Data())
+            client.urlProtocolDidFinishLoading(self)
+            return
+        }
+        let body: Data
+        let status: Int
+        if url.host != "api.github.com" {
+            body = Self.elsewhereBody
+            status = 200
+        } else if url == GitHubReleaseFetcher.latestEndpoint {
+            body = Data("{\"message\": \"Not Found\"}".utf8)
+            status = 404
+        } else {
+            body = Self.listBody
+            status = 200
+        }
+        let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
+        client.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client.urlProtocol(self, didLoad: body)
+        client.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }

@@ -136,8 +136,10 @@ struct ReleaseReport: Equatable, Sendable {
         case newerStableAvailable
         /// The installed version is the newest stable release's.
         case upToDate
-        /// The installed version is above the newest stable release's: a
-        /// nightly or a source build of a main that bumped the version.
+        /// The installed version is above the release marked Latest: a
+        /// nightly or a source build of a main that bumped the version, or
+        /// a stable release installed before an older line's release was
+        /// marked Latest. The report does not say which.
         case aheadOfStable
         case noStableRelease
         /// No version in Info.plist, or one that is not `major.minor.patch`.
@@ -191,7 +193,7 @@ struct ReleaseReport: Equatable, Sendable {
         case .upToDate:
             "You have the newest stable release, \(stable ?? "")."
         case .aheadOfStable:
-            "You have \(installed.version ?? ""), above the newest stable release, \(stable ?? ""). That is a nightly or a source build."
+            "You have \(installed.version ?? ""), higher than the release marked Latest, \(stable ?? "")."
         case .noStableRelease:
             "No stable release is published yet."
         case .installedVersionUnknown:
@@ -206,7 +208,7 @@ struct ReleaseReport: Equatable, Sendable {
         let outcome: String = switch standing {
         case .newerStableAvailable: "newer stable release available"
         case .upToDate: "up to date"
-        case .aheadOfStable: "ahead of the newest stable release"
+        case .aheadOfStable: "higher than the release marked Latest"
         case .noStableRelease: "no stable release published"
         case .installedVersionUnknown: "installed version unknown"
         }
@@ -239,14 +241,25 @@ protocol ReleaseFetching: Sendable {
 }
 
 /// Two unauthenticated GETs of this repository's releases: the one GitHub
-/// marks Latest, and the first page of the list. No token, no cache, no
-/// redirects to follow: the endpoints answer directly. Each request carries
-/// the installed version as its user agent and nothing else about the Mac.
+/// marks Latest, and the first page of the list. No token, no cache, and
+/// no redirect followed: the endpoints answer directly, and a 3xx is
+/// refused by `NoRedirects` and reported as its status, so the check never
+/// sends a request to, or accepts an answer from, a host the redirect
+/// names. Each request carries the installed version as its user agent and
+/// nothing else about the Mac.
 struct GitHubReleaseFetcher: ReleaseFetching {
     static let releasesPage = URL(string: "https://github.com/krishhgg/Insomnia/releases")!
     static let latestEndpoint = URL(string: "https://api.github.com/repos/krishhgg/Insomnia/releases/latest")!
     static let listEndpoint = URL(string: "https://api.github.com/repos/krishhgg/Insomnia/releases?per_page=30")!
     static let timeout: TimeInterval = 15
+
+    /// The session's configuration, made fresh for each request. Tests pass
+    /// one whose `protocolClasses` answer without a network.
+    private let configuration: @Sendable () -> URLSessionConfiguration
+
+    init(configuration: @escaping @Sendable () -> URLSessionConfiguration = { .ephemeral }) {
+        self.configuration = configuration
+    }
 
     static func request(_ url: URL, installed: AppBuild) -> URLRequest {
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: timeout)
@@ -267,13 +280,22 @@ struct GitHubReleaseFetcher: ReleaseFetching {
     }
 
     private func get(_ url: URL, noneOn404: Bool) async throws -> Data? {
-        let session = URLSession(configuration: .ephemeral)
+        let session = URLSession(configuration: configuration())
         defer { session.finishTasksAndInvalidate() }
-        let (data, response) = try await session.data(for: Self.request(url, installed: .current))
+        let (data, response) = try await session.data(for: Self.request(url, installed: .current), delegate: NoRedirects())
         guard let http = response as? HTTPURLResponse else { throw ReleaseCheckError.notHTTP }
         if http.statusCode == 404, noneOn404 { return nil }
         guard http.statusCode == 200 else { throw ReleaseCheckError.status(http.statusCode) }
         return data
+    }
+}
+
+/// Refuses every redirect. With nil for the new request, the session
+/// finishes the task with the 3xx answer itself, which `get` reports as
+/// that status; no request goes to the host the Location header names.
+final class NoRedirects: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest) async -> URLRequest? {
+        nil
     }
 }
 
