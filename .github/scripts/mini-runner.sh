@@ -94,12 +94,18 @@ unregister_leftovers() {
   done
 }
 
-# Waits up to 30 s for the given processes to exit, then ends them. They
-# are the tart processes of one clone.
+# Waits up to 30 s for all the given processes to exit, then ends the rest.
+# They are the tart processes of one clone. Each is checked on its own, so
+# the wait does not rest on what kill -0 returns for a mix of live and
+# exited processes.
 reap() {
-  local pid
+  local pid alive
   for _ in $(seq 30); do
-    kill -0 "$@" 2>/dev/null || return 0
+    alive=
+    for pid in "$@"; do
+      kill -0 "$pid" 2>/dev/null && alive=1
+    done
+    [ -n "$alive" ] || return 0
     sleep 1
   done
   for pid in "$@"; do
