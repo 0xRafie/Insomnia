@@ -53,18 +53,18 @@ gives the job a read-only token and no secrets. Three fences cover the rest:
 - **Softnet**, on the mini. With `tart run --net-softnet`, Softnet's
   documented default lets the VM reach the internet and its gateway address
   on the mini, and nothing else: no tailnet, no home network, no other VM.
-  `mini-runner.sh` also blocks the
-  tailnet's range, 100.64.0.0/10, by name. Without Softnet the loop refuses
-  to start. On the default shared network a VM reached the MacBook's SSH and
-  screen sharing ports over the tailnet (tested 2026-10-16).
+  `mini-runner.sh` also blocks the tailnet's range, 100.64.0.0/10, by name.
+  Without Softnet the loop refuses to start, since on Tart's default shared
+  network a VM reached other devices on the tailnet (tested 2026-10-16).
 - **pf in the VM.** The base VM blocks private and tailnet addresses itself.
   The job's first step fails if pf is off or the block is missing. Job code
   runs as the VM's admin user and can lift this one; it cannot lift
   Softnet's.
 
 The gateway address is the mini itself, so a job can reach any port the mini
-listens on from all interfaces. Keep the mini's SSH on keys only, and its
-screen sharing off.
+listens on from all interfaces. Check what it listens on with
+`sudo lsof -nP -iTCP -sTCP:LISTEN`, and turn off anything a job shouldn't
+reach.
 
 ## Setup on the mini
 
@@ -84,18 +84,9 @@ mini's administrator password.
    sudo install -o root -g wheel -m 4755 /tmp/softnet /usr/local/bin/softnet
    ```
 
-3. Turn off password logins for SSH (sudo), after checking that key login
-   works:
-
-   ```sh
-   printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\n' | sudo tee /etc/ssh/sshd_config.d/050-keys-only.conf
-   ```
-
-   macOS starts sshd for each connection, so the next login reads it.
-
-4. Make the base VM: `.github/scripts/mini-base.sh`. It pulls about 69 GB
+3. Make the base VM: `.github/scripts/mini-base.sh`. It pulls about 69 GB
    and needs about 90 GB free.
-5. Make a fine-grained token on GitHub: repository access "Only select
+4. Make a fine-grained token on GitHub: repository access "Only select
    repositories" with this repository, permission "Administration: Read and
    write" (registering a runner needs it), and an expiry. Put it in the
    keychain; the command asks for it:
@@ -104,9 +95,9 @@ mini's administrator password.
    security add-generic-password -s insomnia-mini-runner -a github -w
    ```
 
-6. On GitHub, set fork run approval to "Require approval for all external
+5. On GitHub, set fork run approval to "Require approval for all external
    contributors" (Settings > Actions > General).
-7. Start the loop from a LaunchAgent, so it restarts after a crash or a
+6. Start the loop from a LaunchAgent, so it restarts after a crash or a
    login. Save this as `~/Library/LaunchAgents/org.insomnia.mini-runner.plist`,
    with the path of your checkout of this repository on `main`:
 
