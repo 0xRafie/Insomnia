@@ -84,7 +84,8 @@ extension SessionManager {
         var reason: String? { failCount == fails ? nil : lastError }
         switch command {
         case let .start(seconds):
-            if session != nil { return SessionCommand.alreadyRunning }
+            // Decided in the queue, not here: an end queued earlier may be
+            // about to stop the session this start would be refused for.
             if await tryStart(duration: TimeInterval(seconds)) { return nil }
             if session != nil { return SessionCommand.alreadyRunning }
             return reason ?? "the session did not start; see the log"

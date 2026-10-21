@@ -155,6 +155,32 @@ final class SessionCommandTests: XCTestCase {
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
     }
 
+    // Requests run oldest first: a start sent after an end that still waits
+    // in the queue runs once that end has, and makes a new session, instead
+    // of being refused for the session the end is about to stop.
+    func testAStartSentAfterAQueuedEndStartsANewSession() async throws {
+        let m = h.makeManager()
+        let first = await m.run(.start(seconds: 3600))
+        XCTAssertNil(first)
+        let gate = AsyncGate()
+        h.backstop.armGate = gate
+
+        let extend = Task { await m.run(.extend(seconds: 600)) }
+        await gate.waitUntilStarted()
+        let end = await runUntilSuspended { await m.run(.end) }
+        let start = await runUntilSuspended { await m.run(.start(seconds: 7200)) }
+        await gate.open()
+
+        _ = await extend.value
+        let endAnswer = await end.value
+        let startAnswer = await start.value
+        XCTAssertNil(endAnswer)
+        XCTAssertNil(startAnswer, "the start runs after the end and makes the new session")
+        let session = try XCTUnwrap(m.session)
+        XCTAssertEqual(session.endsAt, h.clock.now.addingTimeInterval(7200))
+        XCTAssertEqual(try h.store.loadSession(), session)
+    }
+
     // A session.json that the app has not adopted (a launch recovery that is
     // still waiting, for example) is ended too, not answered as done.
     func testAnEndFinishesASessionTheManagerHasNotAdopted() async throws {
