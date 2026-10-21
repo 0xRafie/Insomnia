@@ -1184,7 +1184,7 @@ final class SessionManager {
             return false
         }
         guard pendingEnd == nil else {
-            fail("start refused: the previous session is still being ended; retrying shortly")
+            fail(Self.endPendingRefusal)
             return false
         }
         let ticket = endTicket
@@ -1203,6 +1203,12 @@ final class SessionManager {
         }
         guard endTicket == ticket, !quitRequested else {
             Log.info("start abandoned: an end was requested first")
+            return false
+        }
+        // An end queued ahead of this start may have left itself to its
+        // retry, which would stop a session started now.
+        guard pendingEnd == nil else {
+            fail(Self.endPendingRefusal)
             return false
         }
         let now = clock()
@@ -3152,6 +3158,7 @@ final class SessionManager {
     static let journalTitle = "Recovery journal unreadable"
     static let commandRunningTitle = "Power command still running"
     static let sessionFileTitle = "Session file unreadable"
+    static let endPendingRefusal = "start refused: the previous session is still being ended; retrying shortly"
     static let foreignSleepTitle = "Sleep is disabled by something else"
     static let foreignSleepCommand = "sudo pmset -a disablesleep 0"
     static let foreignSleepLine = "Sleep is disabled by something other than Insomnia; to re-enable it: \(foreignSleepCommand)"

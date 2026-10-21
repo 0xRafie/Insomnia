@@ -181,6 +181,37 @@ final class SessionCommandTests: XCTestCase {
         XCTAssertEqual(try h.store.loadSession(), session)
     }
 
+    // A start queued behind an end that is left to retry is refused, as one
+    // sent after that end would be: the retry would stop the new session.
+    func testAStartQueuedBehindAnEndLeftToRetryIsRefused() async throws {
+        let m = h.makeManager()
+        let first = await m.run(.start(seconds: 3600))
+        XCTAssertNil(first)
+        h.guardFake.throwOn = ["disablesleep 0"]
+        let endArm = AsyncGate()
+        h.backstop.armGate = endArm
+
+        let end = await runUntilSuspended { await m.run(.end) }
+        await endArm.waitUntilStarted()
+        let start = await runUntilSuspended { await m.run(.start(seconds: 7200)) }
+        // The end's arm fails, so the end is left to its retry; a later arm,
+        // the start's, would succeed.
+        let startArm = AsyncGate()
+        h.backstop.armGate = startArm
+        h.backstop.failArm = true
+        await endArm.open()
+        let endAnswer = await end.value
+        h.backstop.failArm = false
+        await startArm.open()
+        let startAnswer = await start.value
+
+        XCTAssertNotNil(endAnswer)
+        XCTAssertEqual(m.pendingEnd, .user)
+        XCTAssertNotNil(startAnswer, "a session started now would be stopped by the retry")
+        XCTAssertNil(m.session)
+        XCTAssertNil(try h.store.loadSession())
+    }
+
     // A session.json that the app has not adopted (a launch recovery that is
     // still waiting, for example) is ended too, not answered as done.
     func testAnEndFinishesASessionTheManagerHasNotAdopted() async throws {
